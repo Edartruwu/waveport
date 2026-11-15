@@ -91,6 +91,7 @@ waveport-ports = { path = "crates/core/waveport-ports", version = "0.1.0" }
 waveport-protocol = { path = "crates/core/waveport-protocol", version = "0.1.0" }
 waveport-runtime = { path = "crates/core/waveport-runtime", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
+waveport-store-journal = { path = "crates/adapters/store/journal", version = "0.1.0" }
 waveport-store-memory = { path = "crates/adapters/store/memory", version = "0.1.0" }
 waveport-stt-assemblyai = { path = "crates/adapters/stt/assemblyai", version = "0.1.0" }
 waveport-stt-deepgram = { path = "crates/adapters/stt/deepgram", version = "0.1.0" }

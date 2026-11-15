@@ -10,12 +10,17 @@
 //! hearing, thinking and speaking, a transport, a journal and two tools.
 //! Nothing here decides anything about a conversation.
 //!
+//! Calls are kept in a file, so that one that broke off can be gone on
+//! with: `--resume last`.
+//!
 //! Keys are read from the environment, and only the name of a variable
 //! is ever written on the command line.
 
 mod args;
 mod call;
 mod client;
+mod halt;
+mod kept;
 mod report;
 mod script;
 mod serve;
@@ -93,14 +98,14 @@ async fn at_the_desk(dev: Dev) -> Result<Outcome, Failure> {
     } else {
         println!("note: wear headphones, or the agent hears itself and stops speaking");
     }
-    call::run(&dev.agent, transport).await
+    call::run(&dev.agent, transport, dev.resume.as_ref()).await
 }
 
 /// A call whose caller follows a script.
 async fn scripted(run: Run) -> Result<Outcome, Failure> {
     let steps = script::read(&run.script).map_err(Failure)?;
     let (transport, recording) = LocalAudio::scripted(steps, Options::default());
-    let outcome = call::run(&run.agent, transport).await?;
+    let outcome = call::run(&run.agent, transport, run.resume.as_ref()).await?;
     if let Some(file) = &run.record {
         std::fs::write(file, recording.wav())
             .with(|| format!("the recording cannot be written to {}", file.display()))?;

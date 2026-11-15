@@ -25,6 +25,7 @@ waveport-llm-openai-compat = { workspace = true }
 waveport-models-onnx = { workspace = true }
 waveport-ports = { workspace = true }
 waveport-runtime = { workspace = true }
+waveport-store-journal = { workspace = true }
 waveport-store-memory = { workspace = true }
 waveport-stt-assemblyai = { workspace = true }
 waveport-stt-deepgram = { workspace = true }
@@ -41,6 +42,8 @@ tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"
 
 [dev-dependencies]
 waveport-testkit = { workspace = true }
+
+bytes = { workspace = true }
 
 [lints]
 workspace = true

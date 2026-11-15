@@ -2402,6 +2402,7 @@ dependencies = [
 name = "waveport-cli"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "jiff",
  "serde_json",
@@ -2412,6 +2413,7 @@ dependencies = [
  "waveport-models-onnx",
  "waveport-ports",
  "waveport-runtime",
+ "waveport-store-journal",
  "waveport-store-memory",
  "waveport-stt-assemblyai",
  "waveport-stt-deepgram",

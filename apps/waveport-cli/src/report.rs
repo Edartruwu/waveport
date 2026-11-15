@@ -106,19 +106,26 @@ impl Reporter {
                 outcome,
                 result,
             } => {
-                let found = notes.calls.iter().position(|(of, _, _)| *of == call)?;
-                let (_, tool, args) = notes.calls.remove(found);
-                let name = self
-                    .tools
-                    .get(usize::from(tool.0))
-                    .map_or("a tool nobody named", String::as_str);
                 let how = match outcome {
                     ToolOutcome::Completed => "",
                     ToolOutcome::Failed => " [failed]",
                     ToolOutcome::Cancelled => " [cancelled]",
                     ToolOutcome::InDoubt => " [in doubt]",
                 };
-                Some(format!("tool: {name}({args}) -> {}{how}", text.get(result)))
+                let result = text.get(result);
+                // A call that nobody here saw asked for was asked for
+                // before the call broke off and was gone on with.
+                let Some(found) = notes.calls.iter().position(|(of, _, _)| *of == call) else {
+                    return Some(format!(
+                        "tool: a call from before the call broke off -> {result}{how}"
+                    ));
+                };
+                let (_, tool, args) = notes.calls.remove(found);
+                let name = self
+                    .tools
+                    .get(usize::from(tool.0))
+                    .map_or("a tool nobody named", String::as_str);
+                Some(format!("tool: {name}({args}) -> {result}{how}"))
             }
             Fact::LifecycleChanged { to, reason } => {
                 notes.reason = reason.or(notes.reason);
@@ -302,6 +309,25 @@ mod tests {
         assert_eq!(
             printed.try_recv().unwrap(),
             "tool: end_call({}) -> No. [failed]"
+        );
+    }
+
+    #[test]
+    fn a_call_of_a_tool_from_before_the_call_broke_off_is_told_too() {
+        // A reporter that began with the process that went on with the
+        // call never saw the tool asked for.
+        let (reporter, mut printed) = reporter();
+        tell(&reporter, "nobody knows whether it took effect", |result| {
+            Fact::ToolFinished {
+                call: ToolCallId(9),
+                outcome: ToolOutcome::InDoubt,
+                result,
+            }
+        });
+        assert_eq!(
+            printed.try_recv().unwrap(),
+            "tool: a call from before the call broke off -> nobody knows whether it took \
+             effect [in doubt]"
         );
     }
 }
