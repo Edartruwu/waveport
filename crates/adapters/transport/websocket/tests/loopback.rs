@@ -14,6 +14,7 @@ use core::future::{Future, poll_fn};
 use core::pin::pin;
 use core::task::Poll;
 use core::time::Duration;
+use std::time::Instant;
 
 use bytes::Bytes;
 use waveport_adapter_kit::ws::{WsConn, WsMessage, WsRequest};
@@ -360,7 +361,11 @@ async fn a_client_that_is_still_talking_when_the_call_ends_is_told_how_it_ended(
     let leaving = poll_fn(|cx| session.transport.poll_close(cx));
     let talking = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        for _ in 0..40 {
+        // It goes on for a length of time and not for a number of
+        // pieces: a pause of 2 ms is 2 ms on one machine and 16 ms on
+        // another, and the transport waits for its client only so long.
+        let until = Instant::now() + Duration::from_millis(70);
+        while Instant::now() < until {
             // Not one piece of audio fails to be sent: the connection is
             // not let go of while the client is at it.
             client.audio(Bytes::from_static(&[1; 1_920])).await.unwrap();
