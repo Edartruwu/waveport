@@ -18,6 +18,7 @@ bench = false
 
 [dependencies]
 waveport-domain = { workspace = true }
+waveport-media = { workspace = true }
 waveport-sim = { workspace = true }
 
 [dev-dependencies]
@@ -41,6 +42,11 @@ harness = false
 [[bench]]
 name = "ir_kernel"
 path = "ir/kernel.rs"
+harness = false
+
+[[bench]]
+name = "ir_media"
+path = "ir/media.rs"
 harness = false
 
 [lints]

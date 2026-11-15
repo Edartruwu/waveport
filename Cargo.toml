@@ -78,6 +78,7 @@ allowed = ["waveport-alloc-counter"]
 waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", version = "0.1.0" }
 waveport-domain = { path = "crates/core/waveport-domain", version = "0.1.0" }
 waveport-kernel-sim = { path = "crates/testing/waveport-kernel-sim", version = "0.1.0" }
+waveport-media = { path = "crates/core/waveport-media", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
 
 opus = "0.4.0"

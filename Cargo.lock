@@ -702,6 +702,7 @@ dependencies = [
  "criterion",
  "gungraun",
  "waveport-domain",
+ "waveport-media",
  "waveport-sim",
 ]
 
