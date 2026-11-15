@@ -21,6 +21,9 @@ publish = false
 unsafe_code = "forbid"
 missing_docs = "warn"
 unreachable_pub = "warn"
+# Set for the build that tries every way the threads of the compute plane
+# can take turns; see `cargo xtask ci --only loom`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(waveport_loom)"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -89,6 +92,7 @@ waveport-testkit = { path = "crates/testing/waveport-testkit", version = "0.1.0"
 
 bytes = "1.12.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+loom = { version = "0.7.3", features = ["futures"] }
 opus = "0.4.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider"] }
 rtrb = "0.4.1"

@@ -34,6 +34,10 @@ waveport-kernel-sim = { workspace = true }
 waveport-sim = { workspace = true }
 waveport-testkit = { workspace = true }
 
+# The checker that tries every way threads can take turns. It is used by the
+# build that `cargo xtask ci` makes for its gate `loom` and by no other, and
+# is named here without that condition so that `cargo deny` sees it.
+loom = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [lints]

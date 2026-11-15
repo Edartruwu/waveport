@@ -27,16 +27,16 @@ use core::task::{Context, Poll};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle, Thread};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use futures_util::task::AtomicWaker;
-use rtrb::{Consumer, Producer, RingBuffer};
 use waveport_domain::event::OverlapVerdict;
 use waveport_domain::ids::{Prob, TurnId};
 use waveport_domain::time::{MediaDur, MediaTime};
 use waveport_ports::audio::Rate;
 use waveport_ports::model::{InterruptionClassifier, TurnModel, VadModel};
+
+use crate::handoff::{self, AnswerRx, AnswerTx, Bell, FrameRx, FrameTx, Late};
 
 /// How many frames of a stream wait for the model at most. With frames of
 /// 32 ms this is a little over 100 ms of audio.
@@ -132,34 +132,16 @@ impl fmt::Display for ComputeError {
 
 impl core::error::Error for ComputeError {}
 
-/// A frame handed over: where it begins. Its samples are in the ring
-/// beside it.
-#[derive(Clone, Copy, Debug)]
-struct Head {
-    at: MediaTime,
-}
-
-/// What a listener and the plane both hold of a stream.
-#[derive(Debug, Default)]
-struct Link {
-    /// Wakes the session when there is an answer.
-    waker: AtomicWaker,
-    /// Answers about whole turns. They come from another thread than the
-    /// answers about frames, and there are few of them.
-    late: Mutex<Vec<Sensed>>,
-}
-
 /// The plane's end of a stream.
 struct Stream {
-    heads: Consumer<Head>,
-    samples: Consumer<i16>,
-    answers: Producer<Sensed>,
-    link: Arc<Link>,
+    frames: FrameRx,
+    answers: AnswerTx<Sensed>,
 }
 
 /// A turn to be judged.
 struct Job {
-    link: Arc<Link>,
+    /// Where the answer goes.
+    late: Late<Sensed>,
     turn: TurnId,
     what: Asked,
     audio: Vec<i16>,
@@ -222,7 +204,7 @@ impl<V: VadModel> FrameLane for Frames<V> {
     fn round(&mut self, counters: &Counters) -> usize {
         // A stream whose listener is gone is forgotten.
         self.streams
-            .retain(|(stream, _)| !stream.heads.is_abandoned());
+            .retain(|(stream, _)| !stream.frames.is_abandoned());
         let count = self.streams.len();
         let batch = self.model.max_batch();
         self.picked.clear();
@@ -235,18 +217,14 @@ impl<V: VadModel> FrameLane for Frames<V> {
             let Some((stream, state)) = self.streams.get_mut(index) else {
                 continue;
             };
-            let Ok(head) = stream.heads.pop() else {
-                continue;
-            };
             let from = self.picked.len() * self.frame;
             let Some(room) = self.audio.get_mut(from..from + self.frame) else {
                 continue;
             };
-            // A head is written after its samples, so they are there.
-            if stream.samples.pop_entire_slice(room).is_err() {
+            let Some(at) = stream.frames.pop(room) else {
                 continue;
-            }
-            self.picked.push((index, head.at));
+            };
+            self.picked.push((index, at));
             self.states.push(core::mem::take(state));
         }
         if count > 0 {
@@ -280,9 +258,7 @@ impl<V: VadModel> FrameLane for Frames<V> {
                     length: self.length,
                     p: *p,
                 };
-                // A session that does not take its answers loses them.
-                let _ = stream.answers.push(answer);
-                stream.link.waker.wake();
+                stream.answers.give(answer);
             }
         }
         judged
@@ -348,8 +324,7 @@ impl Turns {
                 };
                 counters.turns.fetch_add(n as u64, Ordering::Relaxed);
                 for (job, answer) in group.iter().zip(answers) {
-                    lock(&job.link.late).push(answer);
-                    job.link.waker.wake();
+                    job.late.give(answer);
                 }
             }
         }
@@ -372,8 +347,8 @@ enum Mode {
     Inline(Mutex<(Box<dyn FrameLane>, Turns)>),
     /// On threads of the plane's own.
     Threads {
-        /// The thread of the frames, to be woken when there is one.
-        frames: Thread,
+        /// Wakes the thread of the frames, when there is one for it.
+        frames: Bell,
         /// Streams that have opened and that the thread has not taken.
         opened: Mutex<Vec<Stream>>,
         jobs: mpsc::Sender<Job>,
@@ -458,7 +433,7 @@ impl Compute {
         let shared = Arc::new(Shared {
             wants,
             mode: Mode::Threads {
-                frames: frames.thread().clone(),
+                frames: Bell::of(frames.thread().clone()),
                 opened: Mutex::new(Vec::new()),
                 jobs,
             },
@@ -491,29 +466,25 @@ impl Compute {
     #[must_use]
     pub fn listen(&self) -> Listener {
         let wants = self.shared.wants;
-        let (heads, heads_out) = RingBuffer::new(FRAMES_HELD);
-        let (samples, samples_out) = RingBuffer::new(FRAMES_HELD * wants.frame);
-        let (answers_in, answers) = RingBuffer::new(ANSWERS_HELD);
-        let link = Arc::new(Link::default());
+        let (frames_in, frames_out) = handoff::frames(FRAMES_HELD, wants.frame);
+        let (answers_in, answers) = handoff::answers(ANSWERS_HELD);
         let stream = Stream {
-            heads: heads_out,
-            samples: samples_out,
+            frames: frames_out,
             answers: answers_in,
-            link: Arc::clone(&link),
         };
         match &self.shared.mode {
             Mode::Inline(lanes) => lock(lanes).0.admit(stream),
             Mode::Threads { frames, opened, .. } => {
+                // The bell is rung after the stream is where the thread
+                // looks for it.
                 lock(opened).push(stream);
-                frames.unpark();
+                frames.ring();
             }
         }
         Listener {
             shared: Arc::clone(&self.shared),
-            heads,
-            samples,
+            frames: frames_in,
             answers,
-            link,
             partial: Vec::with_capacity(wants.frame),
             partial_at: MediaTime::from_ticks(0),
         }
@@ -537,7 +508,7 @@ impl Drop for Compute {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         if let Mode::Threads { frames, .. } = &self.shared.mode {
-            frames.unpark();
+            frames.ring();
         }
         for thread in self.threads.drain(..) {
             // A thread that panicked has stopped, which is all that is
@@ -580,10 +551,10 @@ fn frames_thread(lane: &mut dyn FrameLane, shared: &Shared) {
             lane.admit(stream);
         }
         if lane.round(&shared.counters) == 0 {
-            // Whoever hands over a frame wakes this thread, and a wake-up
-            // that comes before the thread sleeps is not lost: the sleep
-            // then ends at once.
-            thread::park_timeout(IDLE);
+            // Whoever hands over a frame rings for this thread, and a
+            // ring that comes before the thread sleeps is not lost: the
+            // sleep then ends at once.
+            handoff::doze(IDLE);
         }
     }
 }
@@ -606,10 +577,8 @@ fn turns_thread(turns: &mut Turns, asked: &mpsc::Receiver<Job>, shared: &Shared)
 /// is told what they make of it.
 pub struct Listener {
     shared: Arc<Shared>,
-    heads: Producer<Head>,
-    samples: Producer<i16>,
-    answers: Consumer<Sensed>,
-    link: Arc<Link>,
+    frames: FrameTx,
+    answers: AnswerRx<Sensed>,
     /// The beginning of a frame that is not whole yet.
     partial: Vec<i16>,
     /// Where `partial` begins on the media clock.
@@ -651,14 +620,10 @@ impl Listener {
             if self.partial.len() < wants.frame {
                 break;
             }
-            // The samples go first: a head says that they are there.
-            let head = Head {
-                at: self.partial_at,
-            };
-            if self.heads.is_full() || self.samples.push_entire_slice(&self.partial).is_err() {
-                self.shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
-            } else if self.heads.push(head).is_ok() {
+            if self.frames.push(self.partial_at, &self.partial) {
                 handed = true;
+            } else {
+                self.shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
             }
             self.partial.clear();
         }
@@ -668,7 +633,7 @@ impl Listener {
                     let mut lanes = lock(lanes);
                     while lanes.0.round(&self.shared.counters) > 0 {}
                 }
-                Mode::Threads { frames, .. } => frames.unpark(),
+                Mode::Threads { frames, .. } => frames.ring(),
             }
         }
     }
@@ -691,7 +656,7 @@ impl Listener {
 
     fn ask(&mut self, what: Asked, turn: TurnId, audio: Vec<i16>) {
         let job = Job {
-            link: Arc::clone(&self.link),
+            late: self.answers.late(),
             turn,
             what,
             audio,
@@ -711,30 +676,14 @@ impl Listener {
     /// The next answer of the models about this stream. The waker of `cx`
     /// is woken when there is one.
     pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Sensed> {
-        if let Some(answer) = self.take() {
-            return Poll::Ready(answer);
-        }
-        self.link.waker.register(cx.waker());
-        // An answer may have come while the waker was put in place.
-        self.take().map_or(Poll::Pending, Poll::Ready)
-    }
-
-    fn take(&mut self) -> Option<Sensed> {
-        if let Ok(answer) = self.answers.pop() {
-            return Some(answer);
-        }
-        let mut late = lock(&self.link.late);
-        if late.is_empty() {
-            None
-        } else {
-            Some(late.remove(0))
-        }
+        self.answers.poll(cx)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use core::future::poll_fn;
+    use core::task::{Context, Poll, Waker};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -902,8 +851,9 @@ mod tests {
 
     /// The answers that are there now.
     fn answers(listener: &mut Listener) -> Vec<Sensed> {
+        let mut cx = Context::from_waker(Waker::noop());
         let mut all = Vec::new();
-        while let Some(answer) = listener.take() {
+        while let Poll::Ready(answer) = listener.poll(&mut cx) {
             all.push(answer);
         }
         all
