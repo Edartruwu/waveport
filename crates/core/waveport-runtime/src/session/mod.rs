@@ -3,8 +3,8 @@
 //!
 //! A session is one task. Each time it runs it looks at every part once,
 //! in a fixed order, and collects what happened: how far playback has
-//! got, timers that are due, what the application asked for, what the
-//! transport brought, what the listening models and the recogniser heard,
+//! got, timers that are due, what the transport brought, what the
+//! application asked for, what the listening models and the recogniser heard,
 //! what the language model wrote, what the synthesiser spoke, what tools
 //! answered, and what the journal stored. Then it gives the kernel each
 //! of those as an event and carries out what the kernel asks, and hands
@@ -617,6 +617,12 @@ impl<P: Policies> Session<P> {
             self.queue.push(Event::Timer(id));
         }
 
+        // What the transport brought comes before what the application
+        // asks. A request is about the session as its world has made it:
+        // text typed for someone who is on the line already has to find
+        // them there, also when both are met in the same run.
+        self.poll_transport(cx, now);
+
         let mut follows = Vec::new();
         if let Some(inbox) = &mut self.inbox {
             loop {
@@ -635,7 +641,6 @@ impl<P: Policies> Session<P> {
             self.follow(from, to);
         }
 
-        self.poll_transport(cx, now);
         for ear in &mut self.ears {
             changed |= ear.poll(cx, now, &mut self.queue);
         }

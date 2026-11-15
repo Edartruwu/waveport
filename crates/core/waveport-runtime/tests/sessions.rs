@@ -833,6 +833,35 @@ async fn an_application_makes_the_agent_speak_stop_and_leave() {
 }
 
 /// The kind of each record, and for a change of lifecycle what to.
+#[tokio::test(start_paused = true)]
+async fn what_is_asked_as_a_caller_joins_finds_the_caller_there() {
+    let world = World::new(
+        &[],
+        ScriptedLlm::replies(vec![vec![LlmStep::say("Hello.")]]),
+    );
+    let transport = FakeTransport::sound_card().join(0, CALLER);
+    let mut running = Running::start(&world, transport).await;
+    // The caller is on the line when the session starts, and the text
+    // they typed is waiting when the session first runs: it meets both
+    // in the same run.
+    let (requests, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+    let typed = SessionInput::Text {
+        who: CALLER,
+        text: "hello".to_owned(),
+    };
+    requests.send(Request::Input(typed)).await.unwrap();
+    assert_eq!(running.until(3_000).await, None);
+
+    // The text is a turn of the caller's, and is answered. Taken before
+    // the caller was known to be there, it would have been dropped as
+    // the text of a stranger.
+    let asked = world.llm.asked();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].last_user(), Some("hello"));
+    assert_eq!(running.utterances(), [("Hello.".to_owned(), false)]);
+}
+
 fn kinds(records: &[bytes::Bytes]) -> Vec<String> {
     records
         .iter()
