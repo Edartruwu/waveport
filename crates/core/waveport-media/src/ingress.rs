@@ -1085,6 +1085,52 @@ mod tests {
     }
 
     #[test]
+    fn packets_that_cannot_be_decoded_are_made_up_no_longer_than_lost_ones() {
+        let mut line = Line::new(Codec::Opus);
+        for n in 0..5 {
+            line.on_time(n);
+        }
+        // Five in a row that say they hold frames and give none.
+        for n in 5..10_u32 {
+            let ms = 100 + 20 * u64::from(n);
+            let bad = Packet {
+                sequence: 65_500 + u16::try_from(n).unwrap(),
+                timestamp: 0xFFFF_F000_u32.wrapping_add(n * line.step),
+                payload: &[0x03, 0x00],
+            };
+            assert_eq!(
+                line.ingress.push(MonoTime::from_millis(ms), bad),
+                Taken::Held
+            );
+            line.poll(ms);
+        }
+        // 60 ms are made up, and then nothing is handed on.
+        let made_up: Vec<Piece> = line.pieces[5..].to_vec();
+        assert_eq!(
+            made_up,
+            [
+                piece(200, Source::MadeUp),
+                piece(220, Source::MadeUp),
+                piece(240, Source::MadeUp),
+            ]
+        );
+        // The next packet that can be decoded keeps its place: the rest of
+        // the gap is silence.
+        line.on_time(10);
+        let after: Vec<Piece> = line.pieces[8..].to_vec();
+        assert_eq!(
+            after,
+            [
+                piece(260, Source::Silence),
+                piece(280, Source::Silence),
+                piece(300, Source::Packet),
+            ]
+        );
+        let stats = line.stats();
+        assert_eq!((stats.undecodable, stats.made_up, stats.skipped), (5, 3, 2));
+    }
+
+    #[test]
     fn the_window_and_the_queue_hold_what_was_handed_on() {
         let config = IngressConfig {
             window: MediaDur::from_millis(100),
