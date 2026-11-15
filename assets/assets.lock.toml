@@ -4,6 +4,10 @@
 # checks it against the SHA-256 below. Every address is pinned to an immutable
 # revision, so a change of content is an error, never an update. To take a new
 # version, change the address, the digest and the size in one reviewed commit.
+#
+# An entry with a `platform` is fetched on that platform only. An entry with
+# an `[asset.archive]` is one file out of an archive: the archive is checked
+# against the digest given there, and the file against the entry's own.
 
 [[asset]]
 name = "silero-vad-v6.2.3.onnx"
@@ -31,3 +35,63 @@ sha256 = "2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f"
 size = 8679182
 license = "BSD-2-Clause"
 source = "huggingface.co/pipecat-ai/smart-turn-v3, revision f766f81"
+
+# ONNX Runtime, the library that runs the two models. It is loaded when the
+# program starts, from a file, and is not linked into it: the builds are the
+# project's own, from its release page, one for each platform the gates run
+# on. The version is the one the density spike measured.
+[[asset]]
+name = "libonnxruntime.so"
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-linux-x64-1.31.1.tgz"
+sha256 = "a96f132e5eb5ca04e23a7d2fc1078fb95aa591e8d71d0f237702ece3a1e0f4ea"
+size = 29345384
+license = "MIT"
+source = "github.com/microsoft/onnxruntime, release v1.31.1"
+platform = "linux-x86_64"
+
+[asset.archive]
+sha256 = "c849e36a1ef3e22d4ff217b9d1ce4a3cf5b9467b975610913ae959ad5b16bdc9"
+size = 11413655
+member = "onnxruntime-linux-x64-1.31.1/lib/libonnxruntime.so.1.31.1"
+
+[[asset]]
+name = "libonnxruntime.so"
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-linux-aarch64-1.31.1.tgz"
+sha256 = "7e17c55d675be73f67a218dbecb55522395f61dafb3da03ebc7ade56a4c2f813"
+size = 25266408
+license = "MIT"
+source = "github.com/microsoft/onnxruntime, release v1.31.1"
+platform = "linux-aarch64"
+
+[asset.archive]
+sha256 = "5317505e2da99be65f8e2775ba3c2afd6d2961fd78aba1bd8f56159f48820c78"
+size = 10332381
+member = "onnxruntime-linux-aarch64-1.31.1/lib/libonnxruntime.so.1.31.1"
+
+[[asset]]
+name = "libonnxruntime.dylib"
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-osx-arm64-1.31.1.tgz"
+sha256 = "17500d6b1e37e70f43a2c57d94233a1bc29fbcb297be0a5f8c7c13184f3307ba"
+size = 44797256
+license = "MIT"
+source = "github.com/microsoft/onnxruntime, release v1.31.1"
+platform = "macos-aarch64"
+
+[asset.archive]
+sha256 = "2e1344a1926ee50eb25b38153cb6992c3567515aef0e677a1a520a1798896d6f"
+size = 36936435
+member = "onnxruntime-osx-arm64-1.31.1/lib/libonnxruntime.1.31.1.dylib"
+
+[[asset]]
+name = "onnxruntime.dll"
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-win-x64-1.31.1.zip"
+sha256 = "cb2fa518b18356617f6f9f460c012501da2819ec7e5c1d80bd8f5de20492db0c"
+size = 17253728
+license = "MIT"
+source = "github.com/microsoft/onnxruntime, release v1.31.1"
+platform = "windows-x86_64"
+
+[asset.archive]
+sha256 = "5869e26bb25314375f2d5ef1877e3ea06b1543d6c710e6e4a1ec2f7177ab4b2c"
+size = 82929944
+member = "onnxruntime-win-x64-1.31.1/lib/onnxruntime.dll"
