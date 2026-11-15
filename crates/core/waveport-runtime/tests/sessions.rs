@@ -770,16 +770,57 @@ async fn a_transport_that_closes_ends_the_session() {
 
     let records = world.journal.records(SESSION);
     assert_eq!(
-        kinds(&records)[4..],
+        kinds(&records)[3..],
         [
-            "epoch_advanced",
             "lifecycle_changed draining",
+            "utterance_committed",
+            "epoch_advanced",
             "lifecycle_changed closing",
             "lifecycle_changed closed",
         ]
     );
     let last = String::from_utf8_lossy(records.last().unwrap()).into_owned();
     assert!(last.contains("\"reason\":\"abandoned\""), "{last}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_whose_transport_closed_says_nothing_more() {
+    let speech = [(1_000, 2_200, "what time is it please")];
+    // The model tells a story and asks for the time at once. The time is
+    // there while the story is told, and is owed to the caller after it.
+    let llm = ScriptedLlm::with(|asked| {
+        let has_result = asked
+            .messages
+            .iter()
+            .any(|said| matches!(said, Said::ToolResult { .. }));
+        if has_result {
+            vec![LlmStep::say("It is 09:15.")]
+        } else {
+            vec![LlmStep::say(STORY), LlmStep::call("get_time", "{}")]
+        }
+    });
+    let world = World::new(&speech, llm);
+    // The caller hangs up while the agent is telling the story.
+    let transport = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 4_000, &talks(&speech))
+        .then_closes();
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(30_000).await, Some(Ended::Closed));
+    // It closed when the line did, not after the time it would have
+    // taken to say what was owed.
+    let took = running.began.elapsed();
+    assert!(took < Duration::from_millis(4_100), "{took:?}");
+
+    // The tool was called, and the model was not asked what to say of
+    // its result: there was nobody left to say it to.
+    assert_eq!(world.tools.called().len(), 1);
+    assert_eq!(world.llm.asked().len(), 1);
+    let utterances = running.utterances();
+    assert_eq!(utterances.len(), 1, "{utterances:?}");
+    let (heard, truncated) = &utterances[0];
+    assert!(*truncated && STORY.starts_with(heard.as_str()), "{heard:?}");
+    assert_eq!(running.far_end.log().after_close, 0);
 }
 
 #[tokio::test(start_paused = true)]

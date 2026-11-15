@@ -699,16 +699,19 @@ impl<P: Policies> Session<P> {
                     self.queue.push(Event::Control(ControlInput::Attached));
                 }
                 // The transport is gone, and with it everyone the session
-                // could talk to. What the agent was saying is cut off
-                // where it was heard to, because nobody hears the rest.
+                // could talk to. The session is closed first, so that it
+                // starts nothing more, and then what the agent was saying
+                // is cut off where it was heard to: nobody hears the rest,
+                // and a response begun now would be heard by nobody at
+                // all.
                 None => {
                     self.transport_open = false;
                     self.transport = Box::new(Gone(self.transport.caps()));
                     self.queue.push(Event::Control(ControlInput::Detached));
-                    self.queue.push(Event::Control(ControlInput::Interrupt));
                     let reason = CloseReason::Abandoned;
                     self.queue
                         .push(Event::Control(ControlInput::Close { reason }));
+                    self.queue.push(Event::Control(ControlInput::Interrupt));
                 }
             }
         }
