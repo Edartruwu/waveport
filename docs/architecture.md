@@ -1,6 +1,6 @@
 # Waveport architecture and technical spec
 
-**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist; none of the product described here is implemented yet. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
+**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the kernel's public types (section 4) and its six scenarios (section 14) are written; the kernel itself does nothing yet. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
 
 See also the [roadmap](../ROADMAP.md) and the [ecosystem inventory](ecosystem.md).
 
@@ -99,29 +99,32 @@ Two alternatives were rejected. A chain of per-processor tasks joined by queues 
 
 | Identity | Meaning |
 |---|---|
-| `Seq(u64)` | Position in the session's total order of events |
-| `TurnId` | One user turn or one agent turn |
-| `Epoch(u32)` | Bumped whenever in-flight agent output becomes invalid: committed barge-in, superseded speculation, handoff, cancel |
+| `Seq(u64)` | Position of a fact in the session's journal, from 1 and without gaps. Only journaled facts are numbered; inputs and client events are separate orders |
+| `TurnId` | One user turn |
+| `Epoch(u32)` | Bumped whenever the agent output in flight for the floor becomes invalid: committed barge-in, superseded speculation, handoff, cancel, recovery |
 | `GenId` | One response, recording the epoch and context version it was computed from |
-| `OpTag { gen, epoch }` | Carried on every command and echoed on every result |
+| `OpTag { generation, epoch }` | Carried on every command that starts or steers agent output, and echoed on every result |
 | `ToolCallId` | One tool call; also its idempotency key |
-| `MediaTime` | Sample position on a track |
+| `MediaTime` | Sample position on a track, in ticks of 1/48,000 s |
+| `Prob(u16)` | A probability in hundredths of a percent. Kernel state holds no floating point, so two states can be hashed and compared exactly |
+
+**Liveness.** The kernel keeps a small table of the responses under way, and a result is acted on only while its generation is in that table. An epoch bump removes the generations that hold the floor. A generation that works on a tool call for another agent (section 10) is removed when its call ends, not when the epoch moves. Comparing a result's epoch with the kernel's would be simpler and wrong: a barge-in on the front agent would discard the work of the back agent it had delegated to.
 
 ### 4.4 Events and commands
 
 ```rust
 pub enum Event {
-    // Perception: facts about the world. Never epoch-checked, never flushed.
+    // Perception: facts about the world. Never dropped as stale, never flushed.
     Speech { who: ParticipantId, edge: VadEdge, at: MediaTime },
     Transcript { who: ParticipantId, span: MediaSpan, text: Text, is_final: bool },
-    Eou { turn: TurnId, p: f32 },
+    Eou { turn: TurnId, p: Prob },
     Overlap { turn: TurnId, verdict: OverlapVerdict }, // Backchannel | BargeIn | Noise
     TextIn { who: ParticipantId, text: Text },
 
-    // Results of agent output work. Dropped in one place if tag.epoch != kernel.epoch.
-    Op(OpTag, OpEvent), // LlmDelta, ToolProposed, TtsSegment, Played, Ack, Nack, Failed
+    // Results of agent output work. Dropped in one place if the tag's generation is not live.
+    Op(OpTag, OpEvent), // LlmDelta, ToolProposed, LlmDone, TtsSegment, Played, Failed
 
-    // Tool results. Keyed by call id, deliberately not epoch-checked.
+    // Tool results. Keyed by call id, and deliberately independent of the epoch.
     Tool(ToolCallId, ToolEvent),
 
     Timer(TimerId),
@@ -130,23 +133,28 @@ pub enum Event {
 }
 
 pub enum Command {
-    Llm(OpTag, LlmCmd),
-    Tts(OpTag, TtsCmd),
-    Realtime(OpTag, RtCmd),
-    Stt(SttCmd),
+    Llm(OpTag, LlmCmd),         // Start | Pause | Resume | Cancel
+    Tts(OpTag, TtsCmd),         // Speak { text } | Finish | Cancel
+    Realtime(OpTag, RtCmd),     // added with speech-to-speech models in phase 2
+    Stt(SttCmd),                // Finalize | Close
+    Sense(SenseCmd),            // EstimateEou { turn, who } | ClassifyOverlap { turn, who }
     Playout(OpTag, PlayoutCmd), // Start | Duck | Unduck | Stop { fade_ms }
-    Tool(ToolCallId, ToolCmd),  // Dispatch { args, idem_key } | Cancel
+    Tool(ToolCallId, ToolCmd),  // Dispatch { tool, args, attempt } | Cancel; the call id is the idempotency key
     SetTimer(TimerId, Option<MonoTime>),
     AwaitDurable(Seq),
     Emit(ClientEvent),
 }
 ```
 
+- `Sense` is how the kernel asks the compute plane for a judgement: an end-of-turn estimate when a speaker goes quiet, a classification when speech overlaps the agent. The answers, `Eou` and `Overlap`, name the turn they were asked about, so a late answer is matched to the right turn or ignored.
+- Text that arrives is owned by its event. Text that leaves is written once into the step's output buffer, and commands and facts refer to it by offset. A step clears that buffer first, so its output never mixes with the previous step's.
+- A step also emits **facts**: what became true, numbered by `Seq`. Facts are what the journal stores (section 9).
+
 ### 4.5 Why the incumbents' races cannot occur
 
 | Race reported against the incumbents | Why it cannot occur here |
 |---|---|
-| User input flushed by its own turn's interruption | An interruption is `epoch += 1`, and only `Event::Op` is epoch-checked. Perception has no flush path, and transcripts join turns by media span, not arrival order |
+| User input flushed by its own turn's interruption | An interruption is `epoch += 1`, which ends the responses that hold the floor, and only `Event::Op` is checked against the responses that are live. Perception has no flush path, and transcripts join turns by media span, not arrival order |
 | A backchannel cancels a tool whose side effect already happened | Barge-in is two-phase, and tool calls live outside the epoch (see 4.7 and 4.8) |
 | A tool call from an interrupted reply still executes | Dispatch is emitted in the same `step` that checks the generation is live |
 | The LLM runs twice after parallel tools | A tool batch moves `Open → Resolved` in one guarded transition, which starts the single continuation |
@@ -157,16 +165,17 @@ No priority lanes are needed. Pipecat has them because slow work sits in line; h
 
 ### 4.6 Spoken-text reconciliation
 
-- Text-to-speech and speech-to-speech adapters attach alignment marks `(text_offset, sample_offset)` to the audio they return.
-- `Playout` reports how far playback has got, and uses transport playout acknowledgements where they exist.
-- On completion or interruption the kernel commits exactly one assistant item: the planned text cut at the last mark at or before `played_upto − estimated_client_buffer`, flagged `truncated` when cut.
-- LLM deltas never touch the context.
+- Text-to-speech and speech-to-speech adapters attach alignment marks `(text_offset, sample_offset)` to the audio they return. The marks stay with the audio, in the media plane's playout ledger; the kernel stores none. A provider without word timing yields one mark per segment, and the ledger interpolates inside the segment by share of characters.
+- `Playout` reports how far playback has got: audio handed to the transport, audio acknowledged, and how much of the text has been heard in full, which is the last mark at or before `played_upto − estimated_client_buffer`. It uses transport playout acknowledgements where they exist.
+- The runtime delivers the latest report to the kernel ahead of any other event, so an interruption is decided on what had been heard by then. A final position sent after the stop would carry the tag of a response that is no longer live, and be dropped.
+- On completion or interruption the kernel commits exactly one assistant item: the planned text cut at the heard offset, flagged `truncated` when cut.
+- LLM deltas never touch the context. They pass through the kernel, which releases text to synthesis by the chunking policy and the credit rule of section 5, so committed text is a prefix of released text by construction.
 - `Playout::push(tag, chunk)` drops chunks whose tag is not current, so an adapter that keeps sending after a cancel is harmless.
 - When a speech-to-speech provider supports truncation it receives the same cut point. When it does not, the divergence between its server-side context and the kernel's is recorded explicitly.
 
 ### 4.7 Barge-in
 
-1. User speech that overlaps agent speech only **ducks** the agent (target: within 150 ms of speech onset).
+1. User speech that overlaps agent speech only **ducks** the agent (target: within 150 ms of speech onset, measured where audio leaves the server). Frames already handed to the transport cannot be ducked, which is why the send-ahead in section 5 is one frame.
 2. The interruption classifier answers `Backchannel`, `BargeIn` or `Noise`. A policy timeout answers for it if it is slow.
 3. `BargeIn` commits: the epoch is bumped, playout stops with a 5 to 10 ms fade, and the utterance is committed up to what was heard. Any other verdict un-ducks and the agent carries on.
 
@@ -178,8 +187,8 @@ A tool call moves through `Proposed → Authorized → Dispatched → Completed 
 
 - Each `ToolSpec` declares an **effect class**. After dispatch, a call can be cancelled only if it is declared `Pure`, or when the tool acknowledges its own rollback.
 - Each `ToolSpec` can declare a **gate**, for example "after the agent's own utterance has finished playing" for an end-call tool.
-- Before a side-effecting tool is dispatched, the kernel waits until the journal record proposing it is durable (see section 9).
-- A side-effecting call with no recorded result after a crash is `InDoubt`. It is retried only if the tool declares idempotency; otherwise the model is told the outcome is unknown.
+- Before a side-effecting tool is dispatched, the kernel waits until the journal record that authorises the dispatch is durable (see section 9). Waiting for the record that proposes the call is not enough: after a crash, recovery would find only the proposal, conclude that the call never ran, and report a failure for an effect that happened.
+- A side-effecting call that was authorised and has no recorded result after a crash is `InDoubt`. It is retried only if the tool declares idempotency; otherwise the model is told the outcome is unknown.
 - Tool results enter the context exactly once, whatever happened to the turn that requested them.
 
 ### 4.9 Shutdown
@@ -208,12 +217,12 @@ The principle is: **audio drops, text blocks, control coalesces.**
 | Kernel → adapter commands | 32 | `try_send`; full means unhealthy, so cancel and fail over |
 | LLM → text-to-speech | Credit: release text while synthesized-minus-played is 3 s or less | Hold text; stop reading the LLM stream above 8 KB pending |
 | Text-to-speech → playout buffer | 3 s of audio | The driver stops reading the provider socket |
-| Playout → transport | 20 ms frames, at most 40 ms send-ahead | Never queue beyond the lead |
+| Playout → transport | 20 ms frames; 20 ms send-ahead by default, 40 ms at most | Never queue beyond the lead |
 
 - High-rate signals (playback position, audio levels, interim transcripts) are latest-value slots, not queues.
 - The 3-second credit caps wasted text-to-speech spend at about 3 seconds per interruption.
 - Pacing uses absolute deadlines from one timer tick per shard; the first frame of an utterance goes out immediately.
-- On transports that cannot clear a remote buffer, up to 40 ms of audio is already on the wire when the server stops.
+- On transports that cannot clear a remote buffer, the send-ahead (20 ms by default) is already on the wire when the server stops or ducks.
 
 ## 6. One model for every session shape
 
@@ -357,7 +366,8 @@ Waveport stores a snapshot plus a journal of **domain events**, not inputs. Reco
 | Journaled | Turn commits, context items, utterance commits, tool-call transitions, agent and flow transitions, participant and configuration changes, and a playout checkpoint each second while speaking. Expect 5 to 30 records per turn |
 | Not journaled | Audio, token deltas, voice-activity edges, interim transcripts |
 | Hot-path cost | Serialisation into a shard buffer; group commit off-thread every 10 ms or less |
-| One synchronous barrier | Before dispatching a side-effecting tool, the kernel emits `AwaitDurable(seq)` and dispatches on `Durable` |
+| One synchronous barrier | Before dispatching a side-effecting tool, the kernel emits `AwaitDurable(seq)` for the record that authorises the dispatch, and dispatches on `Durable` |
+| Format | Facts and snapshots are versioned serde records defined in `waveport-protocol`. The domain crate stays free of serialisation: the runtime maps each fact to its record with an exhaustive match, so a new fact does not compile until it is mapped. Zero-copy archives (`rkyv`) were rejected for snapshots, because an archived layout cannot evolve and a newer build must read the state an older one wrote |
 | Fencing | Appends are conditional on `(lease epoch, expected seq)`, so a superseded owner can neither write nor speak |
 
 Three recovery levels:
@@ -386,9 +396,9 @@ Agents are participants of kind `Agent` on the stage. At most one holds the floo
 | Mode | Mechanism |
 |---|---|
 | In-process handoff | A handoff request arrives, usually from a tool result, carrying full context, a summary, a filtered context or none. At a safe point the kernel bumps the epoch, activates the new agent, recomputes the session plan and swaps drivers make-before-break |
-| Cross-process: remote brain | Session, media and floor stay put. The think role is filled by a bus-backed LLM adapter whose results carry the `OpTag`, so the same epoch rule discards stale remote output. Costs one bus round trip per turn |
+| Cross-process: remote brain | Session, media and floor stay put. The think role is filled by a bus-backed LLM adapter whose results carry the `OpTag`, so the same liveness rule discards stale remote output. Costs one bus round trip per turn |
 | Cross-node: session transfer | The migration from section 9 to a node hosting the target agent, followed by activation |
-| Background and parallel agents | A generation without playout, optionally parented by a tool call. Its output lands as a tool result or a notice. To speak, it requests the floor, and the policy that arbitrates humans arbitrates agents |
+| Background and parallel agents | A generation without playout, optionally parented by a tool call. One parented by a call ends with that call, and an interruption of the floor leaves it running. Its output lands as a tool result or a notice. To speak, it requests the floor, and the policy that arbitrates humans arbitrates agents |
 
 Bus envelopes are `{ session, lease, seq, tag, payload }`, delivered at least once and deduplicated on `(session, seq)`.
 
@@ -415,7 +425,7 @@ All are design targets, each enforced by a benchmark gate from phase 1.
 | Text-to-speech first byte → first packet on the wire | 2 ms | 10 ms |
 | End-of-turn decision → first audio packet (framework share) | ≤ 5 ms | ≤ 15 ms |
 | Barge-in decision → no more audio leaves the server | ≤ 10 ms | ≤ 30 ms |
-| Speech onset → duck | 100 ms | 150 ms |
+| Speech onset → duck, where audio leaves the server | 100 ms | 150 ms |
 | Memory, parked or text-only session | 64 KB | 150 KB |
 | Memory, idle connected voice session | 300 KB | 600 KB |
 | Memory, active voice session (8 s pre-roll, 3 s speech lead) | 1.5 MB | 4 MB |
@@ -430,15 +440,15 @@ All are design targets, each enforced by a benchmark gate from phase 1.
 These ten are stated formally and checked in simulation.
 
 1. The epoch is monotonic, and no playout start or tool dispatch is emitted for a generation that is not live.
-2. Every accepted perception event ends in exactly one user turn or an explicit backchannel or noise classification.
+2. Every accepted perception event ends in exactly one outcome: a committed user turn, or a turn dismissed for a stated reason (a backchannel, noise, no words, or the session closing while the turn was open).
 3. Each utterance commits exactly once; committed text is a prefix of planned text and never extends past the audio handed to the transport.
-4. A dispatched side-effecting call ends `Completed`, `Failed` or `InDoubt`; it is dispatched at most once per key, and its result enters the context exactly once.
+4. A dispatched side-effecting call ends `Completed`, `Failed` or `InDoubt`; it is dispatched at most once per key within one lease, and after a crash a call is dispatched again only if its tool is declared pure or idempotent; its result enters the context exactly once.
 5. Each tool batch starts at most one continuation.
 6. At most one generation holds playout per output track.
 7. From `Close`, `Closed` is reached within drain plus grace under any adapter behaviour.
 8. All queues are bounded; `step` is total and deterministic.
 9. `load(snapshot) ⊕ apply(tail)` equals live state.
-10. At most one lease epoch appends per session.
+10. The facts a kernel emits are numbered without gaps, and once told that its lease is lost it emits nothing more. That at most one lease appends per session is the journal's guarantee (section 9) and is checked with the journal, since a lease is not kernel state.
 
 Invariants 1 to 5 close the incumbents' race classes by construction. General robustness to adapter interleavings is established by exploration, not by construction.
 
@@ -446,6 +456,7 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 
 | Technique | Scope |
 |---|---|
+| Kernel scenarios | Six stories written before the kernel, each closing a race from section 4.5 or a session shape from section 6. A simulated world stands in for every adapter, and each story is run along every order in which its events could arrive. The scenario files are not edited to make them pass |
 | Deterministic simulation, level 1 | Seeded generators feed `Kernel::step` with a virtual clock; no executor needed |
 | Deterministic simulation, level 2 | The real actor loop and drivers on a simulated single-threaded executor. Fake adapters delay, reorder, stall, disconnect and crash at any journal offset. Every failure is a seed |
 | Property tests | The ten invariants over arbitrary interleavings |
@@ -476,7 +487,7 @@ waveport/
 │  │  └─ tools/       MCP · HTTP · WASM
 │  ├─ bindings/    python · node · wasm-host · c-abi
 │  ├─ client/      client-core (shared by every client SDK)
-│  └─ testing/     waveport-sim · -alloc-counter · -testkit · -evals
+│  └─ testing/     waveport-sim · -kernel-sim · -alloc-counter · -testkit · -evals
 ├─ apps/           waveportd · waveport-cli · console (web UI) · operator
 ├─ sdks/           js · react · swift · kotlin · react-native · flutter · embedded
 ├─ models/         training and evaluation code for the open models
@@ -520,7 +531,7 @@ Versions and licences were checked against crates.io on 14 November 2026.
 | WebSocket, HTTP, gRPC | `tokio-tungstenite` 0.30.0, `axum` 0.8.9, `hyper` 1.12.0, `reqwest` 0.13.5, `tonic` 0.14.9, `prost` 0.14.6 | A breaking `tonic` release is pending |
 | MCP | `rmcp` 3.10.0 | Official SDK |
 | Bus | `async-nats` 0.52.0, `redis` 1.8.2 | `fred` is dormant |
-| Stores | `sqlx` 0.9.0 (Postgres), `redb` 4.6.0 (local journal), `object_store` 0.14.2, `moka` 0.12.16, `rkyv` 0.8.18 (snapshots) | |
+| Stores | `sqlx` 0.9.0 (Postgres), `redb` 4.6.0 (local journal), `object_store` 0.14.2, `moka` 0.12.16 | Snapshots are versioned serde records, not `rkyv` archives; see section 9 |
 | Knowledge | `qdrant-client` 1.20.0, `lancedb` 0.41.0, `pgvector` 0.4.2, `fastembed` 7.7.0 | |
 | Observability | `tracing` 0.1.44, `opentelemetry` 0.33.1, `tracing-opentelemetry` 0.34.0, `metrics` 0.24.6, `dial9-tokio-telemetry` 0.5.8 | GenAI attribute names are defined in-repo; the upstream constants are deprecated |
 | Bindings and plugins | `pyo3` 0.30.1, `napi` 3.16.2, `uniffi` 0.32.2, `wasm-bindgen` 0.2.130, `wasmtime` 50.0.1 with `wit-bindgen` 0.63.0 | WASI 0.3 (June 2026) gives plugins native async streams |

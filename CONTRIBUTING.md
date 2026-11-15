@@ -152,6 +152,8 @@ WAVEPORT_SIM_SEEDS=100000 cargo nextest run -p <crate> <test>   # a larger sweep
 
 A scenario stays repeatable only if all its randomness comes from the context's generator and all its time from the context's clock.
 
+**Kernel scenarios.** `waveport-kernel-sim` runs a story about one session against the real kernel, with a simulated world in place of every adapter, along every path the story allows. The six scenarios in `crates/core/waveport-domain/tests/scenarios/` were written before the kernel. Do not edit one to make it pass: needing to is the sign that the kernel's design is wrong, and is settled in review. `tests/scenarios/main.rs` lists each scenario as `unstarted`, `pending` or `passes`, and the listing is checked both ways, so a scenario that starts to pass has to be promoted there in the same pull request. A failure prints the path that led to it, the check that did not hold and the last steps of the session.
+
 **Allocations.** `waveport-alloc-counter` proves a code path does not touch the heap. Install `CountingAllocator` as the global allocator of the test binary and wrap the code in `assert_no_alloc`. Without the allocator installed the assertion fails instead of passing silently.
 
 ## Benchmarks

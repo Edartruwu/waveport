@@ -161,8 +161,8 @@ Provider choices are proposals until the phase that builds them starts.
 
 | Tier | Speech-to-text | LLM | Text-to-speech | Speech-to-speech |
 |---|---|---|---|---|
-| First loop (phase 1) | One of Deepgram or AssemblyAI | OpenAI-compatible (also covers Groq, Together, OpenRouter, Ollama, vLLM and llama.cpp servers) | One of Cartesia or ElevenLabs | — |
-| Tier 1 (phase 2) | Deepgram, AssemblyAI | Anthropic, Google Gemini | Cartesia, ElevenLabs | OpenAI Realtime, Gemini Live |
+| First loop (phase 1) | OpenAI, Deepgram, AssemblyAI | OpenAI-compatible (also covers Groq, Together, OpenRouter, Ollama, vLLM and llama.cpp servers) | Cartesia, ElevenLabs | — |
+| Tier 1 (phase 2) | Those of phase 1 | Anthropic, Google Gemini | Those of phase 1 | OpenAI Realtime, Gemini Live |
 | Tier 2 (phase 4 onward) | Azure Speech, AWS Transcribe, Google Cloud, Speechmatics | AWS Bedrock | Azure Speech, AWS Polly, Google Cloud | AWS Nova Sonic |
 | Long tail | Through the adapter protocol and Python bridge (phase 8) | | | |
 
