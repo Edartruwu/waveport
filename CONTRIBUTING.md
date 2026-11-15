@@ -259,7 +259,7 @@ cargo xtask bench-ir --base main
 
 Only instruction counts gate a pull request: they repeat to within a fraction of a percent, where wall-clock time on a shared runner does not.
 
-The journal has one of each. `ir_journal` counts what a session pays to hand its journal the records of a step, with the thread that writes the journal held in a commit so that nothing it does is counted. `wall_journal` measures how long the records then take to be stored, which is what a tool with an effect waits for: for one session and for 64 at once, in one phase and in two, in a file under the target directory and in memory. That number is the disk's more than the journal's, so read it on the machine that matters:
+The journal has one of each. `ir_journal` counts what a record costs the session that makes it: a fact written as a record, and the records of a step handed to the journal, with the thread that writes the journal held in a commit so that nothing it does is counted. `wall_journal` measures how long the records then take to be stored, which is what a tool with an effect waits for: for one session and for 64 at once, in one phase and in two, in a file under the target directory and in memory. That number is the disk's more than the journal's, so read it on the machine that matters:
 
 ```sh
 cargo bench -p waveport-benches --bench wall_journal

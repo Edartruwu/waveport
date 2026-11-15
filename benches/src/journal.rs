@@ -1,12 +1,13 @@
 //! Workloads for the journal in a file.
 //!
 //! Two things are worth knowing about a journal. One is what a session
-//! pays to hand its records over, which it does on its own thread for
-//! every step that records anything: [`Enqueue`]. The other is how long
-//! the records then take to be stored, which is what a tool with an
-//! effect waits for before it may be called: [`Committing`]. The second
-//! is mostly the disk's doing, so it is measured by the clock and on the
-//! machine that asks.
+//! pays for a record, which it does on its own thread for every step
+//! that records anything: the fact is written as a record ([`Written`])
+//! and the records of the step are handed over ([`Enqueue`]). The other
+//! is how long the records then take to be stored, which is what a tool
+//! with an effect waits for before it may be called: [`Committing`].
+//! That is mostly the disk's doing, so it is measured by the clock and
+//! on the machine that asks.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use tokio::runtime::{Builder, Runtime};
+use waveport_domain::fact::{Fact, Stamped};
+use waveport_domain::ids::{ParticipantId, TurnId};
+use waveport_domain::text::TextArena;
+use waveport_domain::time::{MediaSpan, MediaTime};
 use waveport_ports::journal::{Batch, Journal, Lease, Seq, SessionId};
+use waveport_runtime::codec;
 use waveport_store_journal::{Config, LocalJournal, Probe, Seen, Storage};
 
 /// How many records a session hands over at a time here: what a turn
@@ -39,6 +45,45 @@ fn batch(session: SessionId, first: u64) -> Batch {
         records: (first..first + RECORDS)
             .map(|seq| record(session, seq))
             .collect(),
+    }
+}
+
+/// A fact about to be written as a journal record: the turn of a caller
+/// who said a sentence, which is the record a conversation has most
+/// text in.
+#[derive(Debug)]
+pub struct Written {
+    fact: Stamped,
+    text: TextArena,
+}
+
+impl Written {
+    /// The fact, with its text where the kernel would have put it.
+    #[must_use]
+    pub fn prepare() -> Box<Self> {
+        let mut text = TextArena::default();
+        let said = text
+            .push("I placed an order on Monday and it has not come. Can you tell me where it is?");
+        let fact = Fact::TurnCommitted {
+            turn: TurnId(12),
+            who: ParticipantId(1),
+            span: MediaSpan::new(
+                MediaTime::from_millis(61_000),
+                MediaTime::from_millis(65_400),
+            ),
+            text: said,
+            addressed: true,
+        };
+        Box::new(Self {
+            fact: Stamped { seq: Seq(57), fact },
+            text,
+        })
+    }
+
+    /// Writes the record, which is what is measured.
+    #[must_use]
+    pub fn write(&self) -> Option<Bytes> {
+        codec::encode(&self.fact, &self.text).ok()
     }
 }
 
@@ -331,7 +376,18 @@ impl Committing {
 
 #[cfg(test)]
 mod tests {
-    use super::{Committing, Enqueue};
+    use super::{Committing, Enqueue, Written};
+
+    #[test]
+    fn a_fact_is_written_as_the_record_the_journal_keeps() {
+        let record = Written::prepare().write().unwrap();
+        let record = core::str::from_utf8(&record).unwrap();
+        assert!(
+            record.starts_with(r#"{"v":1,"seq":57,"fact":{"kind":"turn_committed","#),
+            "{record}"
+        );
+        assert!(record.contains("Can you tell me where it is?"), "{record}");
+    }
 
     #[test]
     fn records_are_handed_over_while_a_commit_is_under_way() {

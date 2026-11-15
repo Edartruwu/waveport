@@ -20,6 +20,7 @@ bench = false
 waveport-domain = { workspace = true }
 waveport-media = { workspace = true }
 waveport-ports = { workspace = true }
+waveport-runtime = { workspace = true }
 waveport-sim = { workspace = true }
 waveport-store-journal = { workspace = true }
 

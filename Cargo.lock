@@ -2398,6 +2398,7 @@ dependencies = [
  "waveport-domain",
  "waveport-media",
  "waveport-ports",
+ "waveport-runtime",
  "waveport-sim",
  "waveport-store-journal",
 ]
