@@ -21,6 +21,9 @@
 //! - **Models** ([`model`]) are plain functions over batches, called from
 //!   the threads that own them.
 //!
+//! Those are what a session reaches the world through. [`control`] is the
+//! other way round: what an application reaches running sessions through.
+//!
 //! Nothing here names an async runtime, so an adapter is free in its
 //! choice and the simulation can drive every port by hand.
 //!
@@ -32,6 +35,7 @@
 //! before the session starts, or says why it cannot.
 
 pub mod audio;
+pub mod control;
 pub mod error;
 pub mod journal;
 pub mod llm;
