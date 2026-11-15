@@ -85,6 +85,11 @@ const RECENT: usize = 128;
 /// clock of a resumed session starts.
 const RESUME_GAP: Duration = Duration::from_secs(1);
 
+/// How long a session that has closed waits for its transport to have
+/// told the far end. A far end that does not answer a goodbye is not
+/// worth more: the session is over either way.
+const FAREWELL: Duration = Duration::from_millis(500);
+
 /// What a session is, beyond its parts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSpec {
@@ -310,6 +315,9 @@ pub struct Session<P: Policies = DefaultPolicies> {
     stage_reported: bool,
     taps: Vec<Box<dyn Tap>>,
     sleep: Pin<Box<Sleep>>,
+    /// Until when the session, which has closed, waits for its transport
+    /// to have said so to the far end.
+    leaving: Option<MonoTime>,
     stats: SessionStats,
 }
 
@@ -415,6 +423,7 @@ impl<P: Policies> Session<P> {
             stage_reported: false,
             taps: Vec::new(),
             sleep: Box::pin(tokio::time::sleep_until(origin)),
+            leaving: None,
             stats: SessionStats::default(),
         })
     }
@@ -531,8 +540,10 @@ impl<P: Policies> Session<P> {
             self.queue = queue;
             progressed |= self.send_frames(now);
             if let Some(ended) = self.ended() {
-                if matches!(ended, Ended::Lost(_)) {
-                    self.fall_silent(now);
+                match ended {
+                    Ended::Lost(_) => self.fall_silent(now),
+                    Ended::Closed if !self.farewell(cx, now) => return Poll::Pending,
+                    Ended::Closed => {}
                 }
                 return Poll::Ready(ended);
             }
@@ -569,6 +580,19 @@ impl<P: Policies> Session<P> {
         self.undoing.clear();
         self.ears.clear();
         self.timers.clear();
+    }
+
+    /// Has the transport tell the far end that the session, which has
+    /// closed, is over. Returns whether that is done with: it is said, or
+    /// it has been waited for long enough.
+    fn farewell(&mut self, cx: &mut Context<'_>, now: MonoTime) -> bool {
+        let until = *self.leaving.get_or_insert_with(|| now.after(FAREWELL));
+        if now >= until || self.transport.poll_close(cx).is_ready() {
+            return true;
+        }
+        let at = self.instant(until);
+        self.sleep.as_mut().reset(at);
+        self.sleep.as_mut().poll(cx).is_ready()
     }
 
     /// How the session has ended, if it has.

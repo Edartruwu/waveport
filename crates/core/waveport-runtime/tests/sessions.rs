@@ -874,6 +874,10 @@ async fn an_application_makes_the_agent_speak_stop_and_leave() {
     assert_eq!(log.heard(goodbye), MediaDur::from_millis(8 * 60));
     assert_eq!(log.cleared.len(), 1);
     assert_eq!(log.late, 0);
+    // The far end was told that the session is over, once, and nothing
+    // was sent after that.
+    assert_eq!(log.goodbyes, 1);
+    assert_eq!(log.after_close, 0);
 
     let kinds = kinds(&world.journal.records(SESSION));
     assert_eq!(
@@ -984,6 +988,8 @@ async fn a_transport_that_closes_ends_the_session() {
         "{heard:?}"
     );
     assert_eq!(running.far_end.log().after_close, 0);
+    // Nobody is there to be told that the session is over.
+    assert_eq!(running.far_end.log().goodbyes, 0);
 
     let records = world.journal.records(SESSION);
     assert_eq!(
@@ -1239,6 +1245,38 @@ async fn a_session_that_another_owner_took_stops_at_once() {
     assert!(log.sent(log.frames[0].tag) < MediaDur::from_millis(1_100));
     // Nothing of its was stored after the other took over.
     assert_eq!(world.journal.records(SESSION).len(), 2);
+    // The far end is not told that the session is over, because it is
+    // not: the other owner has it.
+    assert_eq!(log.goodbyes, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_far_end_that_does_not_answer_a_goodbye_is_not_waited_for() {
+    let world = World::new(&[], ScriptedLlm::replies(vec![]));
+    let transport = FakeTransport::sound_card()
+        .never_lets_go()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 20_000, &[]);
+    let mut running = Running::start(&world, transport).await;
+    let (ask, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+    assert_eq!(running.until(1_000).await, None);
+    ask.try_send(SessionInput::Close.into()).unwrap();
+
+    // Everything the session decided is in its journal at once. It is
+    // the goodbye that is waited for, and only for half a second.
+    assert_eq!(running.until(1_400).await, None);
+    assert_eq!(
+        kinds(&world.journal.records(SESSION)).last().unwrap(),
+        "lifecycle_changed closed"
+    );
+    assert_eq!(running.until(20_000).await, Some(Ended::Closed));
+    let took = running.began.elapsed();
+    assert!(
+        (Duration::from_millis(1_490)..Duration::from_millis(1_600)).contains(&took),
+        "{took:?}"
+    );
+    assert!(running.far_end.log().goodbyes >= 1);
 }
 
 impl World {

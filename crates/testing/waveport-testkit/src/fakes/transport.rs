@@ -62,6 +62,9 @@ pub struct TransportLog {
     /// How many frames and requests were sent after the transport had
     /// said that it was closed.
     pub after_close: usize,
+    /// How many times the transport was asked to tell the far end that
+    /// the session is over.
+    pub goodbyes: usize,
 }
 
 impl TransportLog {
@@ -140,6 +143,7 @@ pub struct FakeTransportBuilder {
     caps: TransportCaps,
     events: Vec<(Duration, TransportEvent)>,
     closes: bool,
+    clings: bool,
     holds: Duration,
 }
 
@@ -286,6 +290,14 @@ impl FakeTransportBuilder {
         self
     }
 
+    /// The far end never answers a goodbye: the transport is never done
+    /// telling it that the session is over.
+    #[must_use]
+    pub const fn never_lets_go(mut self) -> Self {
+        self.clings = true;
+        self
+    }
+
     /// The transport, and a look at what it will be asked to do. The
     /// script's clock starts now.
     #[must_use]
@@ -300,6 +312,7 @@ impl FakeTransportBuilder {
             start,
             script: self.events.into(),
             closes: self.closes,
+            clings: self.clings,
             closed: false,
             holds: self.holds,
             playing: None,
@@ -318,6 +331,8 @@ pub struct FakeTransport {
     start: Instant,
     script: VecDeque<(Duration, TransportEvent)>,
     closes: bool,
+    /// Whether it never finishes saying goodbye.
+    clings: bool,
     /// Whether it has said that it is closed.
     closed: bool,
     holds: Duration,
@@ -352,6 +367,7 @@ impl FakeTransport {
             caps,
             events: Vec::new(),
             closes: false,
+            clings: false,
             holds: Duration::ZERO,
         }
     }
@@ -518,5 +534,16 @@ impl Transport for FakeTransport {
             waker.wake();
         }
         Ok(())
+    }
+
+    fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<()> {
+        self.log().goodbyes += 1;
+        if self.clings {
+            // A far end that never answers. Nothing will wake whoever
+            // waits for it.
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
     }
 }
