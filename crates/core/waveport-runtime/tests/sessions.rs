@@ -37,8 +37,8 @@ use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::compute::Compute;
 use waveport_runtime::context::ToolDef;
 use waveport_runtime::session::{
-    Ended, Parts, Request, Session, SessionEvent, SessionInput, SessionSpec, StartError, StateRule,
-    StateStats, StoreBroken, Tap,
+    Ended, Parts, Rebuilt, Request, Session, SessionEvent, SessionInput, SessionSpec, StartError,
+    StateRule, StateStats, StoreBroken, Tap,
 };
 use waveport_testkit::fakes::{
     FakeTransport, FakeTransportBuilder, LlmStep, LoudVad, MemoryJournal, Said, ScriptedLlm,
@@ -1358,6 +1358,7 @@ async fn taken_up_again(states: StateRule, stored: Option<u64>) {
             .join(0, CALLER)
             .microphone(CALLER, 0, 12_000, &talks(&speech));
     let mut running = Running::start_as(spec(), &world, transport).await;
+    assert_eq!(running.session.rebuilt(), None);
     // The process dies in the middle of the story.
     assert_eq!(running.until(5_000).await, None);
     let before = running.far_end.log();
@@ -1398,6 +1399,14 @@ async fn taken_up_again(states: StateRule, stored: Option<u64>) {
             .join(0, CALLER)
             .microphone(CALLER, 0, 12_000, &talks(&speech));
     let mut running = Running::start_as(spec(), &world, transport).await;
+    // It says what it was rebuilt from.
+    assert_eq!(
+        running.session.rebuilt(),
+        Some(Rebuilt {
+            state: stored.map(Seq),
+            records: 4 - stored.unwrap_or(0),
+        })
+    );
     assert_eq!(running.until(12_000).await, None);
 
     // The conversation has the story as far as it is known to have been

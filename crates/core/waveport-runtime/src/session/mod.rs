@@ -284,6 +284,16 @@ impl fmt::Display for StartError {
 
 impl core::error::Error for StartError {}
 
+/// What a session that goes on after an earlier life was rebuilt from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// The record the stored state it began from is as of, if its
+    /// journal held a state.
+    pub state: Option<Seq>,
+    /// How many records after that it read.
+    pub records: u64,
+}
+
 /// How a session ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ended {
@@ -387,6 +397,9 @@ pub struct Session<P: Policies = DefaultPolicies> {
     /// The last fact the newest state includes, and when it was taken.
     state_upto: Seq,
     state_at: MonoTime,
+    /// What the session was rebuilt from, if it goes on after an earlier
+    /// life.
+    rebuilt: Option<Rebuilt>,
     stats: SessionStats,
 }
 
@@ -441,12 +454,10 @@ impl<P: Policies> Session<P> {
             .await
             .map_err(StartError::Journal)?;
         let mut next = Vec::new();
-        let state_upto = recovered
-            .snapshot
-            .as_ref()
-            .map_or(Seq(0), |state| state.upto);
-        let (kernel, heard_until) = rebuild(&spec.kernel, policies, &recovered)?;
-        if heard_until.is_some() {
+        let (kernel, earlier) = rebuild(&spec.kernel, policies, &recovered)?;
+        let rebuilt = earlier.map(|earlier| earlier.from);
+        let heard_until = earlier.map(|earlier| earlier.heard);
+        if earlier.is_some() {
             // The first step of a session that was rebuilt deals with
             // what its earlier life left unfinished. This makes sure
             // there is one.
@@ -499,8 +510,9 @@ impl<P: Policies> Session<P> {
             far_end_told: false,
             rule: spec.states,
             heard_until: heard_until.unwrap_or(MediaTime::from_ticks(0)),
-            state_upto,
+            state_upto: rebuilt.and_then(|from| from.state).unwrap_or(Seq(0)),
             state_at: began,
+            rebuilt,
             stats: SessionStats::default(),
         })
     }
@@ -516,6 +528,13 @@ impl<P: Policies> Session<P> {
     #[must_use]
     pub const fn plan(&self) -> &CascadePlan {
         &self.plan
+    }
+
+    /// What the session was rebuilt from, if its journal held anything of
+    /// it when it was started.
+    #[must_use]
+    pub const fn rebuilt(&self) -> Option<Rebuilt> {
+        self.rebuilt
     }
 
     /// A read-only look at the session.
@@ -1212,16 +1231,26 @@ fn mark(sink: Option<&Arc<dyn EventSink>>, session: SessionId, at: MonoTime, sta
     }
 }
 
+/// What is known of the earlier life of a session that was rebuilt.
+#[derive(Clone, Copy)]
+struct Earlier {
+    /// Where the last audio ends that a turn of the session was spoken
+    /// in.
+    heard: MediaTime,
+    /// What the session was rebuilt from.
+    from: Rebuilt,
+}
+
 /// The kernel of a session as its journal has it. For a session the
 /// journal holds nothing of, a new one. Otherwise the one that the
 /// journal's state of the session and the records after it add up to,
-/// and where the last audio ends that a turn of the session was spoken
-/// in.
+/// where the last audio ends that a turn of the session was spoken in,
+/// and what it was rebuilt from.
 fn rebuild<P: Policies>(
     config: &KernelConfig,
     policies: P,
     recovered: &Recovered,
-) -> Result<(Kernel<P>, Option<MediaTime>), StartError> {
+) -> Result<(Kernel<P>, Option<Earlier>), StartError> {
     if recovered.is_new() {
         let kernel = Kernel::new(config.clone(), policies).map_err(StartError::Config)?;
         return Ok((kernel, None));
@@ -1251,7 +1280,14 @@ fn rebuild<P: Policies>(
     };
     let kernel = Kernel::restore(config.clone(), policies, &from, &facts, &text)
         .map_err(StartError::Restore)?;
-    Ok((kernel, Some(heard.max(heard_until(&facts)))))
+    let earlier = Earlier {
+        heard: heard.max(heard_until(&facts)),
+        from: Rebuilt {
+            state: recovered.snapshot.as_ref().map(|state| state.upto),
+            records: facts.len() as u64,
+        },
+    };
+    Ok((kernel, Some(earlier)))
 }
 
 /// The last of the records of a journal whose next record has the number
