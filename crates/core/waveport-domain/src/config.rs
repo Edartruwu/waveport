@@ -62,6 +62,7 @@ impl KernelConfig {
             ("generations", limits.generations),
             ("open_calls", limits.open_calls),
             ("pending_text", limits.pending_text),
+            ("response_text", limits.response_text),
         ] {
             if value == 0 {
                 return Err(ConfigError::ZeroLimit(name));
@@ -117,8 +118,12 @@ pub struct Limits {
     /// Tool calls that have not ended.
     pub open_calls: usize,
     /// Bytes of language-model text waiting to be spoken before the kernel
-    /// stops reading the model's output.
+    /// tells the model to wait. A model that goes on to twice this is
+    /// stopped, and what it wrote is said.
     pub pending_text: usize,
+    /// Bytes reserved for the text of each response when it starts. A
+    /// longer response grows its buffer.
+    pub response_text: usize,
 }
 
 impl Default for Limits {
@@ -129,6 +134,7 @@ impl Default for Limits {
             generations: 4,
             open_calls: 16,
             pending_text: 8192,
+            response_text: 2048,
         }
     }
 }
@@ -138,6 +144,10 @@ impl Default for Limits {
 pub struct Timing {
     /// How long a turn that has ended waits for its final transcript.
     pub transcript_wait: Duration,
+    /// How far before the end of a turn's speech its final transcript may
+    /// stop and still count as complete. Recognisers time the last word,
+    /// and voice activity ends some time after it.
+    pub transcript_slack: MediaDur,
     /// The longest a user turn may last.
     pub turn_max: Duration,
     /// The longest a response may go without producing anything.
@@ -161,6 +171,7 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             transcript_wait: Duration::from_secs(2),
+            transcript_slack: MediaDur::from_millis(600),
             turn_max: Duration::from_secs(120),
             generation_max: Duration::from_secs(60),
             checkpoint_every: Duration::from_secs(1),

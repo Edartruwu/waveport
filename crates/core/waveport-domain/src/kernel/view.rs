@@ -3,6 +3,7 @@
 use core::iter;
 
 use super::State;
+use super::response::Playback;
 use crate::config::KernelConfig;
 use crate::fact::{Lifecycle, NoticeKind, ToolOutcome};
 use crate::ids::{
@@ -57,8 +58,8 @@ impl<'a> View<'a> {
     /// The version of the conversation: how many times an item has been
     /// appended.
     #[must_use]
-    pub const fn context_version(&self) -> ContextVersion {
-        self.state.context
+    pub fn context_version(&self) -> ContextVersion {
+        self.state.conversation.version()
     }
 
     /// The configuration the session was started with.
@@ -76,12 +77,25 @@ impl<'a> View<'a> {
 
     /// The responses under way.
     pub fn generations(&self) -> impl Iterator<Item = GenerationView> + use<'a> {
-        iter::empty()
+        self.state.generations.iter().map(|running| GenerationView {
+            tag: running.tag,
+            agent: running.agent,
+            role: running.role,
+            context: running.context,
+            speaking: running.is_audible(),
+            lowered: running.playback == Playback::Ducked,
+        })
     }
 
     /// The user turns that have begun and not ended.
     pub fn turns(&self) -> impl Iterator<Item = TurnView> + use<'a> {
-        iter::empty()
+        self.state.turns.iter().map(|open| TurnView {
+            turn: open.id,
+            who: open.who,
+            span: open.span,
+            speaking: open.speaking,
+            ducking: open.overlap.map(|overlap| overlap.generation),
+        })
     }
 
     /// The tool calls that have not ended.
@@ -91,13 +105,23 @@ impl<'a> View<'a> {
 
     /// The humans in the session.
     pub fn participants(&self) -> impl Iterator<Item = ParticipantId> + use<'a> {
-        iter::empty()
+        self.state.participants.iter().copied()
     }
 
     /// The conversation, oldest item first. This is what a language model
     /// is shown.
     pub fn items(&self) -> impl Iterator<Item = ItemView<'a>> + use<'a> {
-        iter::empty()
+        self.state.conversation.iter()
+    }
+
+    /// Whether a response is owed and has not been started: the
+    /// conversation holds a turn meant for the agent that no response has
+    /// been computed from.
+    #[must_use]
+    pub fn reply_owed(&self) -> bool {
+        self.state
+            .owed
+            .is_some_and(|(needs, _)| needs > self.state.answered)
     }
 }
 
@@ -114,6 +138,9 @@ pub struct GenerationView {
     pub context: ContextVersion,
     /// Whether its speech is being played.
     pub speaking: bool,
+    /// Whether it is played at a lowered volume, because someone is
+    /// speaking over it and it is not decided yet who keeps the floor.
+    pub lowered: bool,
 }
 
 /// What a response is for, which decides what ends it.

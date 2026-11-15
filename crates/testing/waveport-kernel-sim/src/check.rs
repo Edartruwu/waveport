@@ -27,7 +27,7 @@ use crate::failure::Verdict;
 /// Why a scenario does not stand where its listing says. A test returns it,
 /// and the test harness prints it.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Report(String);
+pub struct Report(pub(crate) String);
 
 impl fmt::Debug for Report {
     /// The report as written, so that a failing test shows it as text.
@@ -100,8 +100,10 @@ pub fn unstarted(scenario: impl Fn(&mut Lab) -> Verdict) -> Result<(), Report> {
 #[cfg(test)]
 mod tests {
     use super::{passes, pending, unstarted};
+    use crate::expect::Ending;
     use crate::explore::Lab;
     use crate::failure::Verdict;
+    use crate::script::say;
     use crate::setup::Setup;
 
     /// Holds: nothing is said and nothing is expected.
@@ -111,12 +113,13 @@ mod tests {
         sim.finish()
     }
 
-    /// Fails at its first check: the kernel does not commit turns yet.
+    /// Fails at its first check: it expects words the caller never said.
     fn first(lab: &mut Lab) -> Verdict {
         let mut sim = lab.sim(Setup::new());
         let caller = sim.caller();
+        sim.agent_will(say("Hi."));
         sim.says(caller, "hello");
-        sim.expect_turn(caller, "hello")?;
+        sim.expect_turn(caller, "goodbye")?;
         sim.finish()
     }
 
@@ -124,15 +127,29 @@ mod tests {
     fn second(lab: &mut Lab) -> Verdict {
         let mut sim = lab.sim(Setup::new());
         let caller = sim.caller();
+        sim.agent_will(say("Hi."));
         sim.expect_context(&[])?;
         sim.says(caller, "hello");
-        sim.expect_turn(caller, "hello")?;
+        sim.expect_turn(caller, "goodbye")?;
+        sim.finish()
+    }
+
+    /// Holds, with a turn and a reply in it.
+    fn greeting(lab: &mut Lab) -> Verdict {
+        let mut sim = lab.sim(Setup::new());
+        let caller = sim.caller();
+        sim.agent_will(say("Hi."));
+        sim.says(caller, "hello");
+        let turn = sim.expect_turn(caller, "hello")?;
+        let reply = sim.expect_reply(turn)?;
+        sim.expect_spoken(reply, "Hi.", Ending::Complete)?;
         sim.finish()
     }
 
     #[test]
     fn each_listing_accepts_only_the_state_it_names() {
         assert!(passes(quiet).is_ok());
+        assert_eq!(passes(greeting), Ok(()));
         assert!(passes(first).is_err());
         assert!(passes(second).is_err());
 
@@ -153,6 +170,6 @@ mod tests {
         assert!(moved.to_string().contains("list it with `pending`"));
         let failed = format!("{:?}", passes(first).unwrap_err());
         assert!(failed.starts_with("\ncheck 1 failed at"), "{failed}");
-        assert!(failed.contains("a committed turn in which the caller says \"hello\""));
+        assert!(failed.contains("a committed turn in which the caller says \"goodbye\""));
     }
 }

@@ -270,6 +270,14 @@ impl Sim {
 
     // ---- Machinery ---------------------------------------------------------
 
+    /// Takes the session's lease away, after which the kernel emits
+    /// nothing. Tests of the expectations use this to decide for
+    /// themselves what a kernel emitted.
+    #[cfg(test)]
+    pub(crate) fn silence_kernel(&mut self) {
+        self.step(&Event::Control(ControlInput::LeaseLost));
+    }
+
     pub(crate) fn kernel(&self) -> &Kernel<BoxedPolicies> {
         &self.kernel
     }
@@ -287,8 +295,8 @@ impl Sim {
                 "the session took {MAX_STEPS} steps without coming to rest"
             ));
         }
-        self.kernel
-            .step(MonoTime::from_millis(self.now), event, &mut self.out);
+        let now = MonoTime::from_millis(self.now);
+        self.kernel.step(now, event, &mut self.out);
         self.note(&format!("<- {event:?}"));
 
         for index in 0..self.out.facts.len() {
