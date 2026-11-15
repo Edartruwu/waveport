@@ -104,15 +104,21 @@ impl Store {
         self.again.as_ref().map(|(at, _)| *at)
     }
 
-    /// Queues a fact for the journal. `text` is the arena of the step
-    /// that emitted it.
-    pub(crate) fn record(&mut self, stamped: &Stamped, text: &TextArena) {
+    /// Queues a fact for the journal, and returns it as the record that
+    /// was queued. `text` is the arena of the step that emitted it.
+    pub(crate) fn record(&mut self, stamped: &Stamped, text: &TextArena) -> Option<Bytes> {
         if self.broken.is_some() {
-            return;
+            return None;
         }
         match codec::encode(stamped, text) {
-            Ok(record) => self.queued.push(record),
-            Err(error) => self.broken = Some(StoreBroken::Record(error)),
+            Ok(record) => {
+                self.queued.push(record.clone());
+                Some(record)
+            }
+            Err(error) => {
+                self.broken = Some(StoreBroken::Record(error));
+                None
+            }
         }
     }
 

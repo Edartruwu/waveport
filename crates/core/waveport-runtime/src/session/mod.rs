@@ -29,17 +29,17 @@ use core::fmt;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
 use waveport_domain::command::{Command, LlmCmd, PlayoutCmd, SenseCmd, SttCmd, ToolCmd, TtsCmd};
 use waveport_domain::config::{ConfigError, KernelConfig};
-use waveport_domain::event::{
-    CloseReason, ControlInput, Event, HandoffContext, TimerId, ToolEvent,
-};
+use waveport_domain::event::{CloseReason, ControlInput, Event, TimerId, ToolEvent};
 use waveport_domain::fact::{Fact, Lifecycle, Stamped};
-use waveport_domain::ids::{AgentId, ParticipantId, Seq, ToolCallId, TurnId};
+use waveport_domain::ids::{ParticipantId, Seq, ToolCallId, ToolId, TurnId};
 use waveport_domain::kernel::{Kernel, RestoreError, View};
 use waveport_domain::out::Out;
 use waveport_domain::policy::{DefaultPolicies, Policies};
@@ -48,6 +48,7 @@ use waveport_domain::time::{MediaTime, MonoTime};
 use waveport_media::codec::CodecError as MediaError;
 use waveport_media::ingress::Packet;
 use waveport_ports::audio::Rate;
+pub use waveport_ports::control::{SessionEvent, SessionInput};
 use waveport_ports::error::{BoxFuture, Full};
 use waveport_ports::journal::{Journal, JournalError, SessionId};
 use waveport_ports::llm::Llm;
@@ -75,6 +76,10 @@ use crate::edges::EdgeConfig;
 /// How many times a session looks at its parts before it lets other
 /// sessions run, when each look finds more to do.
 const SWEEPS: usize = 32;
+
+/// How many of the last records a session holds for those who start to
+/// follow it, or come back to it.
+const RECENT: usize = 128;
 
 /// How far past the end of what an earlier life of the session heard the
 /// clock of a resumed session starts.
@@ -141,33 +146,26 @@ impl fmt::Debug for Parts {
     }
 }
 
-/// What an application asks of a session that is running.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SessionInput {
-    /// A participant typed instead of speaking.
-    Text {
-        /// Who.
-        who: ParticipantId,
-        /// What they typed.
-        text: String,
+/// What reaches a session from outside it while it runs.
+#[derive(Debug)]
+pub enum Request {
+    /// Something is asked of it.
+    Input(SessionInput),
+    /// Someone wants to be told what happens in it, from the fact
+    /// numbered `from` on.
+    Follow {
+        /// The number of the first fact wanted.
+        from: Seq,
+        /// Where to. A follower that has no room for what it is told is
+        /// let go, and comes back for what it missed.
+        to: mpsc::Sender<SessionEvent>,
     },
-    /// The agent is to say this, whatever it was doing.
-    Say {
-        /// What to say.
-        text: String,
-    },
-    /// The agent is to stop speaking.
-    Interrupt,
-    /// Another agent is to take the floor.
-    Handoff {
-        /// The agent.
-        to: AgentId,
-        /// What it is told of the conversation so far.
-        context: HandoffContext,
-    },
-    /// The session is to end, once the agent has finished what it is
-    /// saying.
-    Close,
+}
+
+impl From<SessionInput> for Request {
+    fn from(input: SessionInput) -> Self {
+        Self::Input(input)
+    }
 }
 
 /// Why a session could not be started.
@@ -298,7 +296,10 @@ pub struct Session<P: Policies = DefaultPolicies> {
     undoing: Vec<(ToolCallId, Undoing)>,
     timers: Vec<(TimerId, MonoTime)>,
     store: Store,
-    inbox: Option<mpsc::Receiver<SessionInput>>,
+    inbox: Option<mpsc::Receiver<Request>>,
+    /// The last records, with their numbers.
+    recent: VecDeque<(Seq, Bytes)>,
+    followers: Vec<mpsc::Sender<SessionEvent>>,
 
     /// What happened, for the kernel to be told, in the order it is told.
     queue: Vec<Event>,
@@ -370,25 +371,14 @@ impl<P: Policies> Session<P> {
             let kernel = Kernel::new(spec.kernel.clone(), policies).map_err(StartError::Config)?;
             (kernel, Duration::ZERO)
         } else {
-            let mut text = TextArena::default();
-            let mut facts: Vec<Stamped> = Vec::with_capacity(recovered.tail.len());
-            for record in &recovered.tail {
-                facts.push(codec::decode(record, &mut text).map_err(StartError::Record)?);
-            }
-            // What a new session would be is what the first record was
-            // added to.
-            let blank = Kernel::new(spec.kernel.clone(), DefaultPolicies::default())
-                .map_err(StartError::Config)?
-                .snapshot();
-            let kernel = Kernel::restore(spec.kernel.clone(), policies, &blank, &facts, &text)
-                .map_err(StartError::Restore)?;
             // The first step of a session that was rebuilt deals with
             // what its earlier life left unfinished. This makes sure
             // there is one.
             next.push(Event::Durable(Seq(recovered.next.get().saturating_sub(1))));
-            (kernel, heard_until(&facts) + RESUME_GAP)
+            rebuild(&spec.kernel, policies, &recovered.tail)?
         };
         let store = Store::new(parts.journal, spec.id, recovered.lease, recovered.next);
+        let recent = last_of(recovered.tail, recovered.next);
         Ok(Self {
             id: spec.id,
             origin,
@@ -418,6 +408,8 @@ impl<P: Policies> Session<P> {
             timers: Vec::new(),
             store,
             inbox: None,
+            recent,
+            followers: Vec::new(),
             queue: Vec::new(),
             next,
             stage_reported: false,
@@ -464,9 +456,42 @@ impl<P: Policies> Session<P> {
         self.taps.push(tap);
     }
 
-    /// Takes what an application asks of the session from `inbox`.
-    pub fn listen_to(&mut self, inbox: mpsc::Receiver<SessionInput>) {
+    /// Takes what is asked of the session from `inbox`.
+    pub fn listen_to(&mut self, inbox: mpsc::Receiver<Request>) {
         self.inbox = Some(inbox);
+    }
+
+    /// Tells `to` what happens in the session from now on, after the
+    /// facts from the one numbered `from` that it still holds. If it
+    /// holds them no longer, `to` is told first where what follows
+    /// begins.
+    pub fn follow(&mut self, from: Seq, to: mpsc::Sender<SessionEvent>) {
+        if let Some((oldest, _)) = self.recent.front()
+            && from < *oldest
+            && to.try_send(SessionEvent::Gap { resumes: *oldest }).is_err()
+        {
+            return;
+        }
+        for (seq, record) in &self.recent {
+            if *seq < from {
+                continue;
+            }
+            let fact = SessionEvent::Fact {
+                seq: *seq,
+                record: record.clone(),
+            };
+            if to.try_send(fact).is_err() {
+                return;
+            }
+        }
+        self.followers.push(to);
+    }
+
+    /// Tells every follower something. One that has no room for it, or
+    /// has gone, is let go.
+    fn tell(&mut self, event: &SessionEvent) {
+        self.followers
+            .retain(|to| to.try_send(event.clone()).is_ok());
     }
 
     /// Runs the session to its end.
@@ -585,10 +610,12 @@ impl<P: Policies> Session<P> {
             self.queue.push(Event::Timer(id));
         }
 
+        let mut follows = Vec::new();
         if let Some(inbox) = &mut self.inbox {
             loop {
                 match inbox.poll_recv(cx) {
-                    Poll::Ready(Some(input)) => self.queue.push(asked(input)),
+                    Poll::Ready(Some(Request::Input(input))) => self.queue.push(asked(input)),
+                    Poll::Ready(Some(Request::Follow { from, to })) => follows.push((from, to)),
                     Poll::Ready(None) => {
                         self.inbox = None;
                         break;
@@ -596,6 +623,9 @@ impl<P: Policies> Session<P> {
                     Poll::Pending => break,
                 }
             }
+        }
+        for (from, to) in follows {
+            self.follow(from, to);
         }
 
         self.poll_transport(cx, now);
@@ -779,7 +809,14 @@ impl<P: Policies> Session<P> {
         }
         if !out.facts.is_empty() {
             for stamped in &out.facts {
-                self.store.record(stamped, &out.text);
+                if let Some(record) = self.store.record(stamped, &out.text) {
+                    if self.recent.len() >= RECENT {
+                        self.recent.pop_front();
+                    }
+                    self.recent.push_back((stamped.seq, record.clone()));
+                    let seq = stamped.seq;
+                    self.tell(&SessionEvent::Fact { seq, record });
+                }
                 if let Fact::TurnCommitted { turn, .. } = stamped.fact {
                     mark(self.sink.as_ref(), self.id, now, Stage::TurnEnded(turn));
                 }
@@ -876,22 +913,7 @@ impl<P: Policies> Session<P> {
                     args,
                     attempt,
                 },
-            ) => {
-                let args = text.get(args).to_owned();
-                let (tools, session) = (Arc::clone(&self.tools), self.id);
-                let calling = async move {
-                    let request = ToolRequest {
-                        session,
-                        call,
-                        tool,
-                        args: &args,
-                        attempt,
-                    };
-                    tools.call(request).await
-                };
-                self.calls.push((call, Box::pin(calling)));
-                mark(self.sink.as_ref(), self.id, now, Stage::ToolSent(call));
-            }
+            ) => self.dispatch(now, call, tool, text.get(args).to_owned(), attempt),
             Command::Tool(call, ToolCmd::Cancel) => {
                 // The call is dropped, which stops waiting for it, and the
                 // tool is asked to take back what it may have done.
@@ -906,10 +928,35 @@ impl<P: Policies> Session<P> {
                     self.timers.push((id, at));
                 }
             }
+            Command::Emit(event) => self.tell(&SessionEvent::Told(event)),
             // The store tells the kernel of every fact that is safe, so
             // there is nothing to do for the one it waits for.
-            Command::AwaitDurable(_) | Command::Emit(_) => {}
+            Command::AwaitDurable(_) => {}
         }
+    }
+
+    /// Sends a call to its tool.
+    fn dispatch(
+        &mut self,
+        now: MonoTime,
+        call: ToolCallId,
+        tool: ToolId,
+        args: String,
+        attempt: u8,
+    ) {
+        let (tools, session) = (Arc::clone(&self.tools), self.id);
+        let calling = async move {
+            let request = ToolRequest {
+                session,
+                call,
+                tool,
+                args: &args,
+                attempt,
+            };
+            tools.call(request).await
+        };
+        self.calls.push((call, Box::pin(calling)));
+        mark(self.sink.as_ref(), self.id, now, Stage::ToolSent(call));
     }
 
     /// Asks the listening models about a turn.
@@ -983,6 +1030,42 @@ fn mark(sink: Option<&Arc<dyn EventSink>>, session: SessionId, at: MonoTime, sta
     if let Some(sink) = sink {
         sink.stage(session, StageMark { at, stage });
     }
+}
+
+/// The kernel that the records of a journal add up to, and the time on
+/// the session's clock at which its next life starts.
+fn rebuild<P: Policies>(
+    config: &KernelConfig,
+    policies: P,
+    records: &[Bytes],
+) -> Result<(Kernel<P>, Duration), StartError> {
+    let mut text = TextArena::default();
+    let mut facts: Vec<Stamped> = Vec::with_capacity(records.len());
+    for record in records {
+        facts.push(codec::decode(record, &mut text).map_err(StartError::Record)?);
+    }
+    // What a new session would be is what the first record was added to.
+    let blank = Kernel::new(config.clone(), DefaultPolicies::default())
+        .map_err(StartError::Config)?
+        .snapshot();
+    let kernel = Kernel::restore(config.clone(), policies, &blank, &facts, &text)
+        .map_err(StartError::Restore)?;
+    Ok((kernel, heard_until(&facts) + RESUME_GAP))
+}
+
+/// The last of the records of a journal whose next record has the number
+/// `next`, with their numbers: what whoever follows a session that was
+/// rebuilt can ask for of its earlier life.
+fn last_of(records: Vec<Bytes>, next: Seq) -> VecDeque<(Seq, Bytes)> {
+    let held = records.len().min(RECENT);
+    let first = next.get().saturating_sub(held as u64);
+    let skipped = records.len() - held;
+    records
+        .into_iter()
+        .skip(skipped)
+        .zip(first..)
+        .map(|(record, seq)| (Seq(seq), record))
+        .collect()
 }
 
 /// The session's time at the end of the last audio the facts speak of.

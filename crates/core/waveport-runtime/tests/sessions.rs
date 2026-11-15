@@ -15,11 +15,11 @@ use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use tokio::time::Instant;
-use waveport_domain::command::{ClientEvent, Command};
+use waveport_domain::command::{Activity, ClientEvent, Command};
 use waveport_domain::config::{AgentSpec, Effect, KernelConfig, ToolSpec};
 use waveport_domain::event::Event;
 use waveport_domain::fact::Lifecycle;
-use waveport_domain::ids::{ParticipantId, ToolId};
+use waveport_domain::ids::{ParticipantId, Seq, ToolId};
 use waveport_domain::kernel::{ItemView, View};
 use waveport_domain::out::Out;
 use waveport_domain::policy::DefaultPolicies;
@@ -35,7 +35,7 @@ use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::compute::Compute;
 use waveport_runtime::context::ToolDef;
 use waveport_runtime::session::{
-    Ended, Parts, Session, SessionInput, SessionSpec, StoreBroken, Tap,
+    Ended, Parts, Request, Session, SessionEvent, SessionInput, SessionSpec, StoreBroken, Tap,
 };
 use waveport_testkit::fakes::{
     FakeTransport, FakeTransportBuilder, LlmStep, LoudVad, MemoryJournal, Said, ScriptedLlm,
@@ -618,18 +618,18 @@ async fn an_application_makes_the_agent_speak_stop_and_leave() {
     let (ask, inbox) = tokio::sync::mpsc::channel(8);
     running.session.listen_to(inbox);
 
-    ask.try_send(SessionInput::Say {
+    ask.try_send(Request::Input(SessionInput::Say {
         text: "Welcome. This call may be recorded for training purposes.".to_owned(),
-    })
+    }))
     .unwrap();
     assert_eq!(running.until(1_500).await, None);
-    ask.try_send(SessionInput::Interrupt).unwrap();
+    ask.try_send(SessionInput::Interrupt.into()).unwrap();
     assert_eq!(running.until(3_000).await, None);
-    ask.try_send(SessionInput::Say {
+    ask.try_send(Request::Input(SessionInput::Say {
         text: "Goodbye.".to_owned(),
-    })
+    }))
     .unwrap();
-    ask.try_send(SessionInput::Close).unwrap();
+    ask.try_send(SessionInput::Close.into()).unwrap();
     // The agent finishes what it is saying, and then the session ends
     // with everything it decided in the journal.
     assert_eq!(running.until(20_000).await, Some(Ended::Closed));
@@ -1134,4 +1134,113 @@ async fn a_tool_that_was_running_when_the_process_died_is_not_run_twice() {
     );
     assert!(matches!(asked[1].messages[3], Said::Notice { .. }));
     assert_eq!(running.utterances(), [("Done.".to_owned(), false)]);
+}
+
+/// Everything a follower has been told and not yet taken.
+fn told(following: &mut tokio::sync::mpsc::Receiver<SessionEvent>) -> Vec<SessionEvent> {
+    core::iter::from_fn(|| following.try_recv().ok()).collect()
+}
+
+/// The numbers of the facts among what a follower was told.
+fn facts(events: &[SessionEvent]) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Fact { seq, .. } => Some(seq.get()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_follower_is_told_what_happens_and_can_come_back_for_what_it_missed() {
+    let speech = [(1_000, 2_200, "what time is it please")];
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say("It is late.")]]);
+    let world = World::new(&speech, llm);
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 8_000, &talks(&speech));
+    let mut running = Running::start(&world, transport).await;
+    let (ask, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+
+    // One follows from the start and keeps up. One has room for two
+    // things only.
+    let (to, mut first) = tokio::sync::mpsc::channel(64);
+    ask.try_send(Request::Follow { from: Seq(1), to }).unwrap();
+    let (to, mut slow) = tokio::sync::mpsc::channel(2);
+    ask.try_send(Request::Follow { from: Seq(1), to }).unwrap();
+    assert_eq!(running.until(8_000).await, None);
+
+    // The first was told every fact, in order and as the journal has it,
+    // and the news in between.
+    let records = world.journal.records(SESSION);
+    let heard = told(&mut first);
+    let recorded: Vec<_> = heard
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Fact { record, .. } => Some(record.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recorded, records);
+    assert_eq!(facts(&heard), [1, 2, 3]);
+    let news: Vec<_> = heard
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Told(ClientEvent::Agent { activity, .. }) => Some(*activity),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        news,
+        [Activity::Thinking, Activity::Speaking, Activity::Listening]
+    );
+    assert!(matches!(
+        heard[1],
+        SessionEvent::Told(ClientEvent::UserSpeaking { speaking: true, .. })
+    ));
+
+    // The slow one was told two things and then let go, without holding
+    // the session up.
+    let heard = told(&mut slow);
+    assert_eq!(heard.len(), 2);
+    assert_eq!(facts(&heard), [1]);
+    assert!(slow.is_closed());
+
+    // It comes back for the rest: the facts after the last it saw.
+    let (to, mut back) = tokio::sync::mpsc::channel(64);
+    ask.try_send(Request::Follow { from: Seq(2), to }).unwrap();
+    assert_eq!(running.until(8_100).await, None);
+    assert_eq!(facts(&told(&mut back)), [2, 3]);
+    assert!(!back.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_follower_that_asks_for_more_than_is_held_is_told_where_it_begins() {
+    let world = World::new(&[], ScriptedLlm::replies(vec![]));
+    let transport = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 100, &[]);
+    let mut running = Running::start(&world, transport).await;
+    let (ask, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+    // The agent says 140 things, each of which is a fact.
+    for n in 0..140 {
+        let text = "Hi.".to_owned();
+        ask.try_send(SessionInput::Say { text }.into()).unwrap();
+        assert_eq!(running.until(400 * (n + 1)).await, None);
+    }
+
+    let (to, mut late) = tokio::sync::mpsc::channel(256);
+    ask.try_send(Request::Follow { from: Seq(1), to }).unwrap();
+    assert_eq!(running.until(60_000).await, None);
+    let heard = told(&mut late);
+    let last = u64::try_from(world.journal.records(SESSION).len()).unwrap();
+    assert!(last > 128, "{last}");
+    // The last 128 are held.
+    let resumes = Seq(last - 127);
+    assert_eq!(heard[0], SessionEvent::Gap { resumes });
+    assert_eq!(facts(&heard), (last - 127..=last).collect::<Vec<u64>>());
 }
