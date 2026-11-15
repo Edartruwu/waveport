@@ -1815,10 +1815,21 @@ dependencies = [
 [[package]]
 name = "waveport-protocol"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "waveport-runtime"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "serde_json",
+ "waveport-domain",
+ "waveport-protocol",
+]
 
 [[package]]
 name = "waveport-sim"

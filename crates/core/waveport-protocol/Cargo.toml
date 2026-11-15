@@ -16,5 +16,11 @@ stability = "experimental"
 [lib]
 bench = false
 
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+
 [lints]
 workspace = true
