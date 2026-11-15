@@ -8,6 +8,7 @@
 
 mod arch;
 mod args;
+mod assets;
 mod bench;
 mod ci;
 mod error;
@@ -34,6 +35,10 @@ Gates:
   semver         Check for breaking API changes:
                  --self-test | --baseline-rev <rev> [--title <title> | --title-env <VARIABLE>]
   bench-ir       Run instruction-count benchmarks: [--base <rev>]
+
+Setup:
+  fetch-assets   Download the model files pinned in assets/assets.lock.toml
+                 into target/assets: [--check] verifies without downloading
 
 Everything at once:
   ci             Run every gate, cheapest first
@@ -65,6 +70,7 @@ fn run(args: &[String]) -> Result<bool> {
         "check-title" => title::run(rest),
         "semver" => semver::run(rest),
         "bench-ir" => bench::run(rest),
+        "fetch-assets" => assets::run(rest),
         "ci" => ci::run(rest),
         "help" | "--help" | "-h" => {
             print!("{HELP}");

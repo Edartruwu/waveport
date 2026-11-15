@@ -1,0 +1,32 @@
+# Files the build and tests need that the repository does not carry.
+#
+# `cargo xtask fetch-assets` downloads each one into `target/assets/` and
+# checks it against the SHA-256 below. Every address is pinned to an immutable
+# revision, so a change of content is an error, never an update. To take a new
+# version, change the address, the digest and the size in one reviewed commit.
+
+[[asset]]
+name = "silero-vad-v6.2.3.onnx"
+url = "https://raw.githubusercontent.com/snakers4/silero-vad/5cd7945676eb32225748052e2e6a0580e4686a08/src/silero_vad/data/silero_vad.onnx"
+sha256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+size = 2327524
+license = "MIT"
+source = "github.com/snakers4/silero-vad, tag v6.2.3"
+
+# The same model exported without `If` nodes, for inference engines that do
+# not run control flow.
+[[asset]]
+name = "silero-vad-v6.2.3-ifless.onnx"
+url = "https://raw.githubusercontent.com/snakers4/silero-vad/5cd7945676eb32225748052e2e6a0580e4686a08/src/silero_vad/data/silero_vad_op18_ifless.onnx"
+sha256 = "7671cd04b004e9076da0d4a7b1a5aec36adf161c39230c1cb94a4fd5db6bbd28"
+size = 2845718
+license = "MIT"
+source = "github.com/snakers4/silero-vad, tag v6.2.3"
+
+[[asset]]
+name = "smart-turn-v3.2-cpu.onnx"
+url = "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/f766f81d3cfdf7737ac64aad813d91bbfd56bf93/smart-turn-v3.2-cpu.onnx"
+sha256 = "2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f"
+size = 8679182
+license = "BSD-2-Clause"
+source = "huggingface.co/pipecat-ai/smart-turn-v3, revision f766f81"

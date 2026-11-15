@@ -30,10 +30,21 @@ impl Violation {
     }
 }
 
-/// Prints the outcome of one gate and returns whether it passed.
+/// Prints the outcome of one gate over workspace packages and returns
+/// whether it passed.
 pub(crate) fn finish(gate: &str, violations: &[Violation], checked: usize) -> bool {
+    finish_with(gate, violations, checked, "workspace packages")
+}
+
+/// Like [`finish`], for a gate that checks something other than packages.
+pub(crate) fn finish_with(
+    gate: &str,
+    violations: &[Violation],
+    checked: usize,
+    unit: &str,
+) -> bool {
     if violations.is_empty() {
-        println!("{gate}: ok ({checked} workspace packages)");
+        println!("{gate}: ok ({checked} {unit})");
         return true;
     }
     let annotate = std::env::var("GITHUB_ACTIONS").is_ok_and(|value| value == "true");
@@ -56,9 +67,6 @@ pub(crate) fn finish(gate: &str, violations: &[Violation], checked: usize) -> bo
     } else {
         "violations"
     };
-    eprintln!(
-        "{gate}: {} {plural} in {checked} workspace packages",
-        violations.len()
-    );
+    eprintln!("{gate}: {} {plural} in {checked} {unit}", violations.len());
     false
 }
