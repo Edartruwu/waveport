@@ -65,7 +65,8 @@ nondeterminism-crates = ["getrandom", "socket2"]
 [workspace.metadata.waveport.arch.allowed-external]
 # `opus` is for `waveport-media` alone: the kernel crate has no dependencies.
 domain = ["opus"]
-ports = []
+# `bytes` lets a port hand audio and records over without copying them.
+ports = ["bytes"]
 protocol = []
 
 # Crates allowed to contain `unsafe` code, read by `cargo xtask lint-sync`.
@@ -81,6 +82,7 @@ waveport-kernel-sim = { path = "crates/testing/waveport-kernel-sim", version = "
 waveport-media = { path = "crates/core/waveport-media", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
 
+bytes = "1.12.1"
 opus = "0.4.0"
 serde = { version = "1.0.229", default-features = false }
 serde_json = { version = "1.0.154", default-features = false }
