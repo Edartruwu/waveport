@@ -1,0 +1,34 @@
+[package]
+name = "waveport-tts-elevenlabs"
+description = "Waveport adapter: speech synthesis by ElevenLabs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "adapter"
+stability = "experimental"
+
+[lib]
+bench = false
+
+[dependencies]
+waveport-adapter-kit = { workspace = true }
+waveport-domain = { workspace = true }
+waveport-ports = { workspace = true }
+
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+waveport-testkit = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+
+[lints]
+workspace = true
