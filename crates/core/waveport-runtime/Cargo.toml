@@ -16,5 +16,13 @@ stability = "experimental"
 [lib]
 bench = false
 
+[dependencies]
+waveport-domain = { workspace = true }
+waveport-protocol = { workspace = true }
+
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
 [lints]
 workspace = true

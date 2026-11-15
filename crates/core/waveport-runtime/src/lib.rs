@@ -6,3 +6,5 @@
 //! actor that drives the kernel, the drivers that translate kernel commands
 //! into port calls, and the compute plane that batches local models across
 //! sessions. It depends on the domain and the ports, never on an adapter.
+
+pub mod codec;
