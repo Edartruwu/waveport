@@ -2514,6 +2514,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "waveport-stt-assemblyai"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
 name = "waveport-stt-deepgram"
 version = "0.1.0"
 dependencies = [
