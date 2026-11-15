@@ -8,6 +8,7 @@ use core::time::Duration;
 use waveport_adapter_kit::stream::{Either, first};
 use waveport_domain::ids::{Epoch, GenId, OpTag};
 use waveport_domain::time::MediaDur;
+use waveport_ports::error::PortError;
 use waveport_ports::transport::{FrameOut, Transport, TransportControl, TransportEvent};
 use waveport_transport_local_audio::{Choice, LocalAudio, Options, RATE};
 use waveport_transport_websocket::{Client, Heard};
@@ -18,6 +19,10 @@ use crate::{Context, Failure, script};
 
 /// How long the agent's server has to answer a call.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
+
+/// How long an agent's side that takes nothing more is still read for
+/// what it had said.
+const LAST_WORDS: Duration = Duration::from_secs(1);
 
 /// How a call came to its end, seen from the caller's side.
 enum Over {
@@ -92,6 +97,27 @@ pub(crate) async fn call(args: Args) -> Result<Outcome, Failure> {
     }
 }
 
+/// The agent's side takes nothing more: sending to it failed with
+/// `error`. It may have said how the call ended before it stopped
+/// listening, so what it sent is read to its end. A call that was said
+/// to be over is over, and not broken off.
+async fn last_words(mut far: Client, error: &PortError) -> Over {
+    let reading = async {
+        loop {
+            match far.next().await {
+                Ok(Some(Heard::Line(line))) => println!("{line}"),
+                Ok(Some(Heard::Bye(_))) => return true,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return false,
+            }
+        }
+    };
+    match tokio::time::timeout(LAST_WORDS, reading).await {
+        Ok(true) => Over::Ended,
+        Ok(false) | Err(_) => Over::Gone(error.to_string()),
+    }
+}
+
 /// Carries the call: what the microphone hears goes to the agent, what
 /// the agent says goes to the loudspeaker, and the agent is told how
 /// much of it has been played.
@@ -99,31 +125,34 @@ async fn stay(near: &mut LocalAudio, mut far: Client) -> Over {
     // The response whose audio arrives, and how many samples of it have.
     let mut open: Option<(u32, usize)> = None;
     loop {
+        // What the agent's side says comes before what the microphone
+        // hears: a caller who is told that the call is over has nothing
+        // more to send.
         let here = poll_fn(|cx| near.poll_event(cx));
-        let heard = match first(here, far.next()).await {
-            Either::Left(Some(TransportEvent::Audio { payload, .. })) => {
+        let heard = match first(far.next(), here).await {
+            Either::Right(Some(TransportEvent::Audio { payload, .. })) => {
                 if let Err(error) = far.audio(payload).await {
-                    return Over::Gone(error.to_string());
+                    return last_words(far, &error).await;
                 }
                 continue;
             }
-            Either::Left(Some(TransportEvent::Played { tag, played })) => {
+            Either::Right(Some(TransportEvent::Played { tag, played })) => {
                 let samples = u32::try_from(RATE.samples_in(played)).unwrap_or(u32::MAX);
                 if let Err(error) = far.played(tag.generation.0, samples).await {
-                    return Over::Gone(error.to_string());
+                    return last_words(far, &error).await;
                 }
                 continue;
             }
-            Either::Left(Some(TransportEvent::Left { .. }) | None) => {
+            Either::Right(Some(TransportEvent::Left { .. }) | None) => {
                 far.bye().await;
                 return Over::Left;
             }
-            Either::Left(Some(_)) => continue,
-            Either::Right(Ok(Some(heard))) => heard,
-            Either::Right(Ok(None)) => {
+            Either::Right(Some(_)) => continue,
+            Either::Left(Ok(Some(heard))) => heard,
+            Either::Left(Ok(None)) => {
                 return Over::Gone("its connection closed with no goodbye".to_owned());
             }
-            Either::Right(Err(error)) => return Over::Gone(error.to_string()),
+            Either::Left(Err(error)) => return Over::Gone(error.to_string()),
         };
         match heard {
             Heard::Begins(run) => open = Some((run, 0)),
