@@ -40,7 +40,7 @@ impl Calls {
 /// Takes calls until it is told to stop, or has taken as many as it was
 /// told to.
 pub(crate) async fn serve(args: Serve) -> Result<Outcome, Failure> {
-    let stack = Stack::build(&args.agent).await?;
+    let stack = Stack::build(&args.agent, false).await?;
     for note in &stack.notes {
         println!("note: {note}");
     }

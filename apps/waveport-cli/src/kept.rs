@@ -7,9 +7,11 @@
 //! take a call over, so that file is its owner's alone where the system
 //! has such a thing, and nothing prints a token.
 
+use core::time::Duration;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use waveport_ports::journal::{Journal, SessionId};
 use waveport_store_journal::{Config, LocalJournal, OpenError, ResumeToken};
@@ -18,6 +20,12 @@ use waveport_store_memory::MemoryJournal;
 use crate::args::{Agent, JOURNAL, Resume};
 use crate::halt::Halt;
 use crate::{Context, Failure};
+
+/// How long the command waits for a journal that another process has
+/// open, when it cannot do without it. A process that was killed has let
+/// go of the file by the time it is gone on most systems, and a moment
+/// later on some.
+const PATIENCE: Duration = Duration::from_secs(3);
 
 /// A journal in a file, and the file next to it.
 struct InFile {
@@ -79,11 +87,28 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 
 impl Kept {
     /// Opens what `agent` says calls are kept in. Returns it, and what
-    /// whoever ran the command should know about it.
+    /// whoever ran the command should know about it. `needed` is whether
+    /// the command cannot do without the file: it is to go on with a
+    /// call that is in it.
     ///
     /// A file that cannot be read is left as it is: the command stops,
     /// and says which file it was.
-    pub(crate) fn open(agent: &Agent, halt: &Halt) -> Result<(Self, Vec<String>), Failure> {
+    pub(crate) fn open(
+        agent: &Agent,
+        halt: &Halt,
+        needed: bool,
+    ) -> Result<(Self, Vec<String>), Failure> {
+        Self::open_within(agent, halt, needed, PATIENCE)
+    }
+
+    /// As [`open`](Self::open), waiting no longer than `patience` for a
+    /// file that another process has open.
+    fn open_within(
+        agent: &Agent,
+        halt: &Halt,
+        needed: bool,
+        patience: Duration,
+    ) -> Result<(Self, Vec<String>), Failure> {
         if agent.no_journal {
             return Ok((Self::in_memory(), Vec::new()));
         }
@@ -95,11 +120,23 @@ impl Kept {
         if !named && let Some(folder) = path.parent() {
             make_folder(folder).with(|| format!("{} cannot be made", folder.display()))?;
         }
-        let config = Config {
-            probe: halt.probe(),
-            ..Config::default()
+        // A file that the command was told to use, or needs, is waited
+        // for a little: the process that had it may only just have
+        // died. The usual file of a command that can do without is not.
+        let until = Instant::now() + patience;
+        let opened = loop {
+            let config = Config {
+                probe: halt.probe(),
+                ..Config::default()
+            };
+            match LocalJournal::open(&path, config) {
+                Err(OpenError::InUse) if (named || needed) && Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                opened => break opened,
+            }
         };
-        match LocalJournal::open(&path, config) {
+        match opened {
             Ok(journal) => {
                 let journal = Arc::new(journal);
                 let kept = Self {
@@ -114,7 +151,7 @@ impl Kept {
             }
             // Two calls at once from one folder are both taken. The
             // second is told what it does without.
-            Err(OpenError::InUse) if !named => {
+            Err(OpenError::InUse) if !named && !needed => {
                 let note = format!(
                     "another waveport has {} open: this one keeps its calls in memory, and one \
                      that breaks off is gone (--journal names another file)",
@@ -270,7 +307,9 @@ impl Kept {
 
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
     use std::path::{Path, PathBuf};
+    use std::time::Instant;
 
     use clap::Parser;
     use waveport_ports::journal::SessionId;
@@ -299,7 +338,7 @@ mod tests {
 
     fn kept_in(journal: &Path) -> Kept {
         let agent = agent(&["--journal", journal.to_str().unwrap()]);
-        let (kept, notes) = Kept::open(&agent, &Halt::Nowhere).unwrap();
+        let (kept, notes) = Kept::open(&agent, &Halt::Nowhere, false).unwrap();
         assert!(notes.is_empty(), "{notes:?}");
         kept
     }
@@ -408,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn calls_in_memory_are_not_gone_on_with() {
-        let (kept, notes) = Kept::open(&agent(&["--no-journal"]), &Halt::Nowhere).unwrap();
+        let (kept, notes) = Kept::open(&agent(&["--no-journal"]), &Halt::Nowhere, false).unwrap();
         assert!(notes.is_empty() && !kept.outlasts_the_command());
         assert_eq!(kept.earlier().await, None);
         assert_eq!(kept.issue(SessionId(1)).await.unwrap(), None);
@@ -425,25 +464,58 @@ mod tests {
         let journal = folder.join("calls.redb");
         let text = "Not a journal: a letter that was saved under the wrong name.\n".repeat(200);
         std::fs::write(&journal, &text).unwrap();
-        let agent = agent(&["--journal", journal.to_str().unwrap()]);
-        let Err(failure) = Kept::open(&agent, &Halt::Nowhere).map(|_| ()) else {
+        let letter = agent(&["--journal", journal.to_str().unwrap()]);
+        let Err(failure) = Kept::open(&letter, &Halt::Nowhere, false).map(|_| ()) else {
             panic!("it is not a journal");
         };
         assert!(failure.0.contains("was left as it is"), "{}", failure.0);
         assert!(failure.0.contains("calls.redb"), "{}", failure.0);
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), text);
 
-        // A file that another command has open, when it was named.
+        // A file that another command has open, when it was named: it
+        // is waited for, and not for long.
         let journal = folder.join("busy.redb");
         let first = kept_in(&journal);
-        let Err(failure) = Kept::open(
-            &super::tests::agent(&["--journal", journal.to_str().unwrap()]),
-            &Halt::Nowhere,
-        )
-        .map(|_| ()) else {
+        let named = agent(&["--journal", journal.to_str().unwrap()]);
+        let began = Instant::now();
+        let patience = Duration::from_millis(300);
+        let Err(failure) = Kept::open_within(&named, &Halt::Nowhere, false, patience).map(|_| ())
+        else {
             panic!("the file is in use");
         };
         assert!(failure.0.contains("cannot be opened"), "{}", failure.0);
+        assert!(began.elapsed() >= patience, "{:?}", began.elapsed());
+
+        // It is there once the other command has let go of it, which a
+        // command that was killed does a moment after it is gone.
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(first);
+        });
+        let patience = Duration::from_secs(20);
+        let (kept, notes) = Kept::open_within(&named, &Halt::Nowhere, false, patience).unwrap();
+        assert!(notes.is_empty() && kept.outlasts_the_command());
+        letting_go.join().unwrap();
+    }
+
+    #[test]
+    fn the_usual_file_is_done_without_unless_it_is_needed() {
+        // A command that is told nothing keeps its calls where it is
+        // run, which a test cannot choose. So the usual file is stood in
+        // for by one that is named, and the rule is asked directly: a
+        // file in use is an error when it is named or needed.
+        let folder = folder("usual");
+        let journal = folder.join("calls.redb");
+        let first = kept_in(&journal);
+        let named = agent(&["--journal", journal.to_str().unwrap()]);
+        let none = Duration::ZERO;
+        for needed in [false, true] {
+            let Err(failure) = Kept::open_within(&named, &Halt::Nowhere, needed, none).map(|_| ())
+            else {
+                panic!("the file is in use");
+            };
+            assert!(failure.0.contains("in use"), "{}", failure.0);
+        }
         drop(first);
     }
 }

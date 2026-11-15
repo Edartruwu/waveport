@@ -222,12 +222,14 @@ impl Call {
 }
 
 impl Stack {
-    /// Puts the parts together as `agent` says.
-    pub(crate) async fn build(agent: &Agent) -> Result<Self, Failure> {
+    /// Puts the parts together as `agent` says. `resuming` is whether a
+    /// call is to be gone on with, which the calls that were kept are
+    /// needed for.
+    pub(crate) async fn build(agent: &Agent, resuming: bool) -> Result<Self, Failure> {
         let halt = Halt::from_env().map_err(Failure)?;
         // First, so that a file of calls that cannot be used is said
         // before anything is waited for.
-        let (kept, mut notes) = Kept::open(agent, &halt)?;
+        let (kept, mut notes) = Kept::open(agent, &halt, resuming)?;
         notes.extend(kept.earlier().await);
         let instructions = instructions(agent)?;
         let llm_key = key(&agent.llm_key_env, &agent.llm_url, LLM_URL)?;
@@ -388,7 +390,7 @@ pub(crate) async fn run(
     resume: Option<&Resume>,
 ) -> Result<Outcome, Failure> {
     let health = transport.health();
-    let stack = Stack::build(agent).await?;
+    let stack = Stack::build(agent, resume.is_some()).await?;
     for note in &stack.notes {
         println!("note: {note}");
     }
