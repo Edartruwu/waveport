@@ -34,8 +34,10 @@
 //!   audio sent at once is heard. A minute sent at once comes back with
 //!   no words in it, and no complaint. Whoever feeds a stream must not
 //!   run far ahead of the clock.
-//! - A session lasts an hour. The provider then says so and closes, and
-//!   the stream ends with a failure that is worth another try.
+//! - A session lasts an hour, whether or not anything is sent on it. The
+//!   provider then says so, under the name it gives a request that was
+//!   wrong, and closes two seconds later. The stream ends with a failure
+//!   that is worth another try.
 //! - It charges for the seconds of audio it is sent, silence too.
 //!
 //! The adapter starts no task. The receiving half of a stream is the loop

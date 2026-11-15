@@ -42,6 +42,7 @@ const AT_ONCE: &str = include_str!("fixtures/at_once.ws");
 const TOO_LITTLE: &str = include_str!("fixtures/too_little.ws");
 const UNKNOWN_LANGUAGE: &str = include_str!("fixtures/unknown_language.ws");
 const WRONG_KEY: &str = include_str!("fixtures/wrong_key.ws");
+const EXPIRED: &str = include_str!("fixtures/expired.ws");
 
 const RATE: Rate = Rate::Hz24000;
 const MODEL: &str = "gpt-live-transcribe";
@@ -475,6 +476,21 @@ async fn a_provider_that_says_it_failed_ends_the_stream() {
     let error = next_stt(&mut stream.rx).await.unwrap().unwrap_err();
     assert_eq!(error.class, RetryClass::Transient, "{error}");
     assert!(error.message.contains("The server had an error"), "{error}");
+}
+
+#[tokio::test]
+async fn a_session_the_provider_ends_after_its_hour_is_worth_another() {
+    // The provider calls it a request that was wrong. It was not: the
+    // next session is as good as this one was.
+    let server = server(EXPIRED).await;
+    let stt = adapter(&server);
+    let mut stream = open(&stt).await;
+    let error = next_stt(&mut stream.rx).await.unwrap().unwrap_err();
+    assert_eq!(error.class, RetryClass::Transient, "{error}");
+    assert!(error.message.contains("session_expired"), "{error}");
+    assert!(error.message.contains("60 minutes"), "{error}");
+    // That was the last of the stream.
+    assert!(next_stt(&mut stream.rx).await.is_none());
 }
 
 #[tokio::test]
