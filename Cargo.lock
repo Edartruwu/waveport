@@ -1837,8 +1837,10 @@ dependencies = [
  "serde_json",
  "tokio",
  "waveport-domain",
+ "waveport-media",
  "waveport-ports",
  "waveport-protocol",
+ "waveport-testkit",
 ]
 
 [[package]]

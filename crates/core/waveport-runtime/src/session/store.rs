@@ -1,0 +1,211 @@
+//! How a session's facts reach its journal.
+//!
+//! Every fact the kernel emits is written as a record and queued. One
+//! request to the journal is under way at a time, and everything that was
+//! queued while it was goes into the next: the journal commits in groups
+//! without being asked to. When a request comes back the kernel is told
+//! which fact is safe, which is what it waits for before it lets a tool
+//! with side effects run.
+//!
+//! A store that fails for a while is tried again, with the same records:
+//! none is skipped and none is sent twice under another number. A journal
+//! that says the session has another owner is believed at once.
+
+use core::task::{Context, Poll};
+use core::time::Duration;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use waveport_domain::event::{ControlInput, Event};
+use waveport_domain::fact::Stamped;
+use waveport_domain::ids::Seq;
+use waveport_domain::text::TextArena;
+use waveport_domain::time::MonoTime;
+use waveport_ports::error::BoxFuture;
+use waveport_ports::journal::{Batch, Journal, JournalError, Lease, SessionId};
+
+use crate::codec::{self, CodecError};
+
+/// How long after a failure the journal is asked again. The wait doubles
+/// with each failure that follows, up to [`LONGEST_WAIT`].
+const FIRST_WAIT: Duration = Duration::from_millis(50);
+const LONGEST_WAIT: Duration = Duration::from_secs(2);
+
+type Appending = BoxFuture<'static, Result<Seq, JournalError>>;
+
+/// Why a session can write no more facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreBroken {
+    /// Another owner has taken the session over.
+    Fenced,
+    /// The journal and the session disagree about the number of the next
+    /// record.
+    OutOfOrder,
+    /// A fact could not be written as a record.
+    Record(CodecError),
+    /// The journal failed in a way that trying again does not mend.
+    Failed(String),
+}
+
+/// A session's way to its journal.
+pub(crate) struct Store {
+    journal: Arc<dyn Journal>,
+    session: SessionId,
+    lease: Lease,
+    /// Records that no request has carried yet, and the number of the
+    /// first of them.
+    queued: Vec<Bytes>,
+    first: Seq,
+    /// The request under way, and what it carries.
+    appending: Option<(Appending, Batch)>,
+    /// Records the journal failed to store, and when to send them again.
+    again: Option<(MonoTime, Batch)>,
+    failures: u32,
+    /// The number of the last fact that is safe.
+    durable: Seq,
+    broken: Option<StoreBroken>,
+}
+
+impl Store {
+    /// A store for a session whose next fact has the number `next`.
+    pub(crate) fn new(
+        journal: Arc<dyn Journal>,
+        session: SessionId,
+        lease: Lease,
+        next: Seq,
+    ) -> Self {
+        Self {
+            journal,
+            session,
+            lease,
+            queued: Vec::new(),
+            first: next,
+            appending: None,
+            again: None,
+            failures: 0,
+            durable: Seq(next.get().saturating_sub(1)),
+            broken: None,
+        }
+    }
+
+    /// Why nothing more can be written, if that is so.
+    pub(crate) const fn broken(&self) -> Option<&StoreBroken> {
+        self.broken.as_ref()
+    }
+
+    /// Whether every fact that was recorded is safe.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.queued.is_empty() && self.appending.is_none() && self.again.is_none()
+    }
+
+    /// When to look at the store again if nothing wakes the session
+    /// before.
+    pub(crate) fn deadline(&self) -> Option<MonoTime> {
+        self.again.as_ref().map(|(at, _)| *at)
+    }
+
+    /// Queues a fact for the journal. `text` is the arena of the step
+    /// that emitted it.
+    pub(crate) fn record(&mut self, stamped: &Stamped, text: &TextArena) {
+        if self.broken.is_some() {
+            return;
+        }
+        match codec::encode(stamped, text) {
+            Ok(record) => self.queued.push(record),
+            Err(error) => self.broken = Some(StoreBroken::Record(error)),
+        }
+    }
+
+    /// Moves the journal on. Adds to `events` what the kernel is to be
+    /// told: that facts are safe, or that the session has another owner.
+    /// Returns whether anything changed that may have made more work.
+    pub(crate) fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+        now: MonoTime,
+        events: &mut Vec<Event>,
+    ) -> bool {
+        if self.broken.is_some() {
+            return false;
+        }
+        let mut changed = false;
+        loop {
+            if self.appending.is_none() {
+                let batch = match self.again.take() {
+                    Some((at, batch)) if at <= now => batch,
+                    Some(waiting) => {
+                        self.again = Some(waiting);
+                        return changed;
+                    }
+                    None if self.queued.is_empty() => return changed,
+                    None => {
+                        let records = core::mem::take(&mut self.queued);
+                        let batch = Batch {
+                            first: self.first,
+                            records,
+                        };
+                        let count = u64::try_from(batch.records.len()).unwrap_or(u64::MAX);
+                        self.first = Seq(self.first.get().saturating_add(count));
+                        batch
+                    }
+                };
+                let (journal, session, lease) =
+                    (Arc::clone(&self.journal), self.session, self.lease);
+                let sent = batch.clone();
+                let appending = async move { journal.append(session, lease, sent).await };
+                self.appending = Some((Box::pin(appending), batch));
+            }
+            let Some((appending, _)) = &mut self.appending else {
+                return changed;
+            };
+            let Poll::Ready(stored) = appending.as_mut().poll(cx) else {
+                return changed;
+            };
+            changed = true;
+            let batch = self.appending.take().map(|(_, batch)| batch);
+            match stored {
+                Ok(upto) => {
+                    self.failures = 0;
+                    if upto > self.durable {
+                        self.durable = upto;
+                        events.push(Event::Durable(upto));
+                    }
+                }
+                Err(JournalError::Fenced) => {
+                    self.broken = Some(StoreBroken::Fenced);
+                    events.push(Event::Control(ControlInput::LeaseLost));
+                    return true;
+                }
+                Err(JournalError::OutOfOrder { .. }) => {
+                    self.broken = Some(StoreBroken::OutOfOrder);
+                    events.push(Event::Control(ControlInput::LeaseLost));
+                    return true;
+                }
+                Err(JournalError::Store(error)) if error.is_retryable() => {
+                    self.failures += 1;
+                    let doublings = self.failures.saturating_sub(1).min(16);
+                    let wait = FIRST_WAIT.saturating_mul(1 << doublings).min(LONGEST_WAIT);
+                    if let Some(batch) = batch {
+                        self.again = Some((now.after(wait), batch));
+                    }
+                }
+                Err(JournalError::Store(error)) => {
+                    self.broken = Some(StoreBroken::Failed(error.to_string()));
+                    events.push(Event::Control(ControlInput::LeaseLost));
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for Store {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Store")
+            .field("session", &self.session)
+            .field("queued", &self.queued.len())
+            .field("durable", &self.durable)
+            .field("broken", &self.broken)
+            .finish_non_exhaustive()
+    }
+}

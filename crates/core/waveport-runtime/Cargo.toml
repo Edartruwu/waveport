@@ -18,6 +18,7 @@ bench = false
 
 [dependencies]
 waveport-domain = { workspace = true }
+waveport-media = { workspace = true }
 waveport-ports = { workspace = true }
 waveport-protocol = { workspace = true }
 
@@ -26,9 +27,12 @@ futures-util = { workspace = true }
 rtrb = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "time"] }
+waveport-testkit = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [lints]
 workspace = true

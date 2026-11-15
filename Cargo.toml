@@ -85,6 +85,7 @@ waveport-media = { path = "crates/core/waveport-media", version = "0.1.0" }
 waveport-ports = { path = "crates/core/waveport-ports", version = "0.1.0" }
 waveport-protocol = { path = "crates/core/waveport-protocol", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
+waveport-testkit = { path = "crates/testing/waveport-testkit", version = "0.1.0" }
 
 bytes = "1.12.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
