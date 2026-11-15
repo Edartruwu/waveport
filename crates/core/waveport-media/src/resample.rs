@@ -35,7 +35,11 @@ const KAISER_BETA: f64 = 5.653;
 const TRANSITION: f64 = 3.625;
 
 /// One, as a coefficient.
-const ONE: i32 = 1 << 15;
+///
+/// A coefficient has 14 bits after the point and a sample has 16 bits, so
+/// that the products of one set always add up within 32 bits, which the
+/// compiler can then do eight at a time. A test holds the sets to that.
+const ONE: i32 = 1 << 14;
 
 /// The longest piece of input worked on at once.
 const PIECE: usize = 960;
@@ -77,7 +81,7 @@ fn bessel_i0(x: f64) -> f64 {
 /// exactly one.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "a coefficient is at most one, which is 32,768"
+    reason = "a coefficient is at most one, which is 16,384"
 )]
 #[expect(
     clippy::cast_precision_loss,
@@ -302,12 +306,12 @@ impl Resampler {
             let (Some(window), Some(set)) = (window, set) else {
                 break;
             };
-            let sum: i64 = window
+            let sum: i32 = window
                 .iter()
                 .zip(set)
-                .map(|(&x, &c)| i64::from(i32::from(x) * i32::from(c)))
+                .map(|(&x, &c)| i32::from(x) * i32::from(c))
                 .sum();
-            let rounded = (sum + i64::from(ONE / 2)) >> 15;
+            let rounded = (sum + ONE / 2) >> 14;
             *sample =
                 i16::try_from(rounded).unwrap_or(if rounded < 0 { i16::MIN } else { i16::MAX });
             self.position += self.down;
@@ -383,6 +387,20 @@ mod tests {
             for set in resampler.coefficients.chunks(resampler.taps) {
                 let sum: i32 = set.iter().map(|&c| i32::from(c)).sum();
                 assert_eq!(sum, ONE, "{from:?} to {to:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_loudest_input_adds_up_within_32_bits() {
+        for (from, to) in conversions() {
+            let resampler = Resampler::new(from, to);
+            for set in resampler.coefficients.chunks(resampler.taps) {
+                // The most a set can add up to: every sample at the far
+                // end of its range, with the sign of its coefficient.
+                let reach: i64 = set.iter().map(|&c| i64::from(c).abs()).sum();
+                let most = reach * 32_768 + i64::from(ONE / 2);
+                assert!(most <= i64::from(i32::MAX), "{from:?} to {to:?}: {most}");
             }
         }
     }
