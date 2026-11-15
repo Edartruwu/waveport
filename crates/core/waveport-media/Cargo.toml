@@ -16,5 +16,15 @@ stability = "experimental"
 [lib]
 bench = false
 
+[dependencies]
+waveport-domain = { workspace = true }
+
+# libopus, built from source by its `-sys` crate. Building needs `cmake` and a
+# C compiler.
+opus = { workspace = true }
+
+[dev-dependencies]
+waveport-alloc-counter = { workspace = true }
+
 [lints]
 workspace = true

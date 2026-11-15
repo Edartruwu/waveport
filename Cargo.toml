@@ -63,7 +63,8 @@ nondeterminism-crates = ["getrandom", "socket2"]
 # Third-party crates each inner layer may depend on directly. Adding one is a
 # reviewed change to this file.
 [workspace.metadata.waveport.arch.allowed-external]
-domain = []
+# `opus` is for `waveport-media` alone: the kernel crate has no dependencies.
+domain = ["opus"]
 ports = []
 protocol = []
 
@@ -79,6 +80,7 @@ waveport-domain = { path = "crates/core/waveport-domain", version = "0.1.0" }
 waveport-kernel-sim = { path = "crates/testing/waveport-kernel-sim", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
 
+opus = "0.4.0"
 serde = { version = "1.0.229", default-features = false }
 serde_json = { version = "1.0.154", default-features = false }
 sha2 = { version = "0.11.1", default-features = false }

@@ -9,3 +9,12 @@
 //! Unlike the domain it links `std`, because it wraps DSP libraries that need
 //! it. The purity rule is therefore enforced by the Clippy bans in this
 //! crate's `clippy.toml` instead of by the compiler.
+//!
+//! Audio in this crate is one channel of 16-bit samples at one of four
+//! [rates](rate::Rate). Time is always an argument.
+
+pub mod codec;
+pub mod rate;
+
+#[cfg(test)]
+mod testing;
