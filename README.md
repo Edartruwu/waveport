@@ -4,9 +4,9 @@ Waveport is an open-source platform for real-time voice and multimodal AI agents
 
 ## Status
 
-**Foundations, and the first measurements.** The repository holds the workspace, the quality gates and the test and benchmark harnesses. There is no product code yet: nothing here runs a voice session.
+**Foundations, the first measurements, and half a kernel.** The repository holds the workspace, the quality gates, the test and benchmark harnesses, and the first product code: the session kernel, which decides who has the floor, what the agent says and how much of it was heard. It is a library with no I/O. Nothing here runs a voice session yet.
 
-Phase 1 of the [roadmap](ROADMAP.md) has started. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The session kernel and the first voice loop come next.
+Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel's tools, agents and crash recovery come next, then audio, providers and the first voice loop.
 
 ## Documents
 

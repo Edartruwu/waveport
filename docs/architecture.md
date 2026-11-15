@@ -1,6 +1,6 @@
 # Waveport architecture and technical spec
 
-**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the kernel's public types (section 4) and its six scenarios (section 14) are written; the kernel itself does nothing yet. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
+**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the session kernel (section 4) takes turns, speaks, keeps the conversation and closes; tools, agents and recovery are not in it yet. Four of its six scenarios (section 14) pass, and the invariants that concern turns and speech (section 13) are checked on random sessions in every test run. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
 
 See also the [roadmap](../ROADMAP.md) and the [ecosystem inventory](ecosystem.md).
 
@@ -149,6 +149,8 @@ pub enum Command {
 - `Sense` is how the kernel asks the compute plane for a judgement: an end-of-turn estimate when a speaker goes quiet, a classification when speech overlaps the agent. The answers, `Eou` and `Overlap`, name the turn they were asked about, so a late answer is matched to the right turn or ignored.
 - Text that arrives is owned by its event. Text that leaves is written once into the step's output buffer, and commands and facts refer to it by offset. A step clears that buffer first, so its output never mixes with the previous step's.
 - A step also emits **facts**: what became true, numbered by `Seq`. Facts are what the journal stores (section 9).
+- A timer only wakes the kernel. When one fires, the kernel reads from its own state and from `now` whether the thing it was set for is due, so a timer that fires late, twice, or after it was cancelled does no harm.
+- Speech edges are ordered by where they are in the audio, not by when they arrive: a start from before speech that has already ended, or an end from before the stretch under way, is a repeat and is ignored.
 
 ### 4.5 Why the incumbents' races cannot occur
 
@@ -168,7 +170,7 @@ No priority lanes are needed. Pipecat has them because slow work sits in line; h
 - Text-to-speech and speech-to-speech adapters attach alignment marks `(text_offset, sample_offset)` to the audio they return. The marks stay with the audio, in the media plane's playout ledger; the kernel stores none. A provider without word timing yields one mark per segment, and the ledger interpolates inside the segment by share of characters.
 - `Playout` reports how far playback has got: audio handed to the transport, audio acknowledged, and how much of the text has been heard in full, which is the last mark at or before `played_upto − estimated_client_buffer`. It uses transport playout acknowledgements where they exist.
 - The runtime delivers the latest report to the kernel ahead of any other event, so an interruption is decided on what had been heard by then. A final position sent after the stop would carry the tag of a response that is no longer live, and be dropped.
-- On completion or interruption the kernel commits exactly one assistant item: the planned text cut at the heard offset, flagged `truncated` when cut.
+- On completion or interruption the kernel commits exactly one assistant item: the planned text cut at the heard offset, flagged `truncated` when cut. A response of which nothing was heard commits nothing.
 - LLM deltas never touch the context. They pass through the kernel, which releases text to synthesis by the chunking policy and the credit rule of section 5, so committed text is a prefix of released text by construction.
 - `Playout::push(tag, chunk)` drops chunks whose tag is not current, so an adapter that keeps sending after a cancel is harmless.
 - When a speech-to-speech provider supports truncation it receives the same cut point. When it does not, the divergence between its server-side context and the kernel's is recorded explicitly.
@@ -180,6 +182,12 @@ No priority lanes are needed. Pipecat has them because slow work sits in line; h
 3. `BargeIn` commits: the epoch is bumped, playout stops with a 5 to 10 ms fade, and the utterance is committed up to what was heard. Any other verdict un-ducks and the agent carries on.
 
 The classifier is a port. Phase 1 ships a voice-activity-only policy; phase 5 ships an open-weights model.
+
+Around these three steps the kernel keeps to a few rules:
+
+- A turn does not end while it is undecided what its speech over the agent was. Speech taken for a backchannel or for noise is dismissed with its words, for that stated reason. A `BargeIn` verdict that arrives after the timeout still counts for as long as the turn is open.
+- A response is not played while a user turn is open: the agent waits for a gap. If a newer turn meant for the agent is committed before anyone has heard the response, the response is replaced; once it is being heard, the next one waits for it.
+- What the application asks the agent to say takes the floor at once, is never replaced by a response, and is not an answer: a turn that was owed a response is still owed one afterwards.
 
 ### 4.8 Tools
 
@@ -193,7 +201,7 @@ A tool call moves through `Proposed → Authorized → Dispatched → Completed 
 
 ### 4.9 Shutdown
 
-The lifecycle is `Running → Draining → Closing → Closed`, advanced by timer events. Commands are sent with `try_send`. Adapter tasks sit in a join set and are aborted when the grace timer fires. `Closed` is reached within drain time plus grace time whatever any adapter does.
+The lifecycle is `Running → Draining → Closing → Closed`. A session that is draining lets the agent finish what it is saying and starts nothing new; it moves on as soon as nothing is under way, or at the first step after the drain time has passed, whichever event that step is for. Two timers, for the drain and for the grace time, make sure such a step happens even if one of them is lost. Commands are sent with `try_send`. Adapter tasks sit in a join set and are aborted when the grace timer fires. `Closed` is reached within drain time plus grace time whatever any adapter does.
 
 ### 4.10 Extension points
 
@@ -215,7 +223,7 @@ The principle is: **audio drops, text blocks, control coalesces.**
 | Ingress → speech-to-text | 2 s ring | Drop oldest, mark the session degraded, fail over |
 | Adapter → kernel mailbox | 256 events | The sender awaits, so pressure reaches the provider socket |
 | Kernel → adapter commands | 32 | `try_send`; full means unhealthy, so cancel and fail over |
-| LLM → text-to-speech | Credit: release text while synthesized-minus-played is 3 s or less | Hold text; stop reading the LLM stream above 8 KB pending |
+| LLM → text-to-speech | Credit: release text while synthesized-minus-played is 3 s or less | Hold text; stop reading the LLM stream above 8 KB pending. A model that writes on to twice that is cancelled, and what it wrote is spoken |
 | Text-to-speech → playout buffer | 3 s of audio | The driver stops reading the provider socket |
 | Playout → transport | 20 ms frames; 20 ms send-ahead by default, 40 ms at most | Never queue beyond the lead |
 
@@ -457,7 +465,7 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 | Technique | Scope |
 |---|---|
 | Kernel scenarios | Six stories written before the kernel, each closing a race from section 4.5 or a session shape from section 6. A simulated world stands in for every adapter, and each story is run along every order in which its events could arrive. The scenario files are not edited to make them pass |
-| Deterministic simulation, level 1 | Seeded generators feed `Kernel::step` with a virtual clock; no executor needed |
+| Deterministic simulation, level 1 | A seed makes up a session: who is in it, when they speak, what the model writes, and how each adapter answers. Five profiles decide how the adapters misbehave: calm, chaos, stalls, duplicates and shutdown. `Kernel::step` is driven with a virtual clock, no executor needed, and a monitor that keeps its own account of the session checks the invariants after every step and that nothing is left unfinished at the end. Each session runs twice to show the kernel is deterministic |
 | Deterministic simulation, level 2 | The real actor loop and drivers on a simulated single-threaded executor. Fake adapters delay, reorder, stall, disconnect and crash at any journal offset. Every failure is a seed |
 | Property tests | The ten invariants over arbitrary interleavings |
 | Small-scope model check | Floor × generation × tool call × lifecycle with 2 participants, 3 turns, 2 tools |
