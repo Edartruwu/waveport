@@ -3,16 +3,91 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
-
-/// Where OpenAI transcribes speech as it is spoken.
-pub(crate) const STT_URL: &str = "wss://api.openai.com/v1/realtime";
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Where OpenAI's language models are.
 pub(crate) const LLM_URL: &str = "https://api.openai.com/v1";
 
-/// Where Cartesia synthesises speech.
-pub(crate) const TTS_URL: &str = "wss://api.cartesia.ai/tts/websocket";
+/// What a provider is asked for when the command line says nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Usual {
+    /// Where the provider listens.
+    pub url: &'static str,
+    pub model: &'static str,
+    /// The voice, of a provider that speaks.
+    pub voice: &'static str,
+    /// The environment variable that holds the key.
+    pub key_env: &'static str,
+}
+
+/// Who recognises speech.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Hears {
+    /// OpenAI's realtime transcription.
+    #[value(name = "openai")]
+    OpenAi,
+    /// Deepgram's live transcription.
+    #[value(name = "deepgram")]
+    Deepgram,
+    /// AssemblyAI's streaming transcription.
+    #[value(name = "assemblyai")]
+    AssemblyAi,
+}
+
+impl Hears {
+    pub(crate) const fn usual(self) -> Usual {
+        match self {
+            Self::OpenAi => Usual {
+                url: "wss://api.openai.com/v1/realtime",
+                model: "gpt-live-transcribe",
+                voice: "",
+                key_env: "OPENAI_API_KEY",
+            },
+            Self::Deepgram => Usual {
+                url: "wss://api.deepgram.com/v1/listen",
+                model: "nova-3",
+                voice: "",
+                key_env: "DEEPGRAM_API_KEY",
+            },
+            Self::AssemblyAi => Usual {
+                url: "wss://streaming.assemblyai.com/v3/ws",
+                model: "universal-3-6-pro",
+                voice: "",
+                key_env: "ASSEMBLYAI_API_KEY",
+            },
+        }
+    }
+}
+
+/// Who synthesises speech.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Speaks {
+    /// Cartesia.
+    #[value(name = "cartesia")]
+    Cartesia,
+    /// ElevenLabs.
+    #[value(name = "elevenlabs")]
+    ElevenLabs,
+}
+
+impl Speaks {
+    pub(crate) const fn usual(self) -> Usual {
+        match self {
+            Self::Cartesia => Usual {
+                url: "wss://api.cartesia.ai/tts/websocket",
+                model: "sonic-3.6",
+                voice: "228fca29-3a0a-435c-8728-5cb483251068",
+                key_env: "CARTESIA_API_KEY",
+            },
+            Self::ElevenLabs => Usual {
+                url: "wss://api.elevenlabs.io/v1/text-to-speech",
+                model: "eleven_flash_v2_5",
+                voice: "Xb7hH8MSUJpSbSDYk0k2",
+                key_env: "ELEVENLABS_API_KEY",
+            },
+        }
+    }
+}
 
 /// Where calls are taken over a WebSocket unless told otherwise: on this
 /// machine alone.
@@ -168,16 +243,29 @@ pub(crate) struct Agent {
     )]
     pub assets: PathBuf,
 
-    /// Where speech is recognised: OpenAI's realtime transcription, or a
-    /// server that speaks as it does.
-    #[arg(long, value_name = "URL", default_value = STT_URL)]
-    pub stt_url: String,
+    /// Who recognises speech.
+    #[arg(long, value_name = "PROVIDER", value_enum, default_value = "openai")]
+    pub stt: Hears,
+    /// Where speech is recognised, if not at the provider itself: a
+    /// server that speaks as the provider does.
+    #[arg(long, value_name = "URL")]
+    pub stt_url: Option<String>,
     /// The model that recognises speech.
-    #[arg(long, value_name = "MODEL", default_value = "gpt-live-transcribe")]
-    pub stt_model: String,
+    #[arg(
+        long,
+        value_name = "MODEL",
+        help = "The model that recognises speech [default: gpt-live-transcribe, nova-3 or \
+                universal-3-6-pro, by the provider]"
+    )]
+    pub stt_model: Option<String>,
     /// The environment variable that holds the key for it.
-    #[arg(long, value_name = "VARIABLE", default_value = "OPENAI_API_KEY")]
-    pub stt_key_env: String,
+    #[arg(
+        long,
+        value_name = "VARIABLE",
+        help = "The environment variable that holds the key for it [default: OPENAI_API_KEY, \
+                DEEPGRAM_API_KEY or ASSEMBLYAI_API_KEY, by the provider]"
+    )]
+    pub stt_key_env: Option<String>,
 
     /// Where the language model is: OpenAI, or any server that speaks
     /// the chat completions protocol.
@@ -190,30 +278,104 @@ pub(crate) struct Agent {
     #[arg(long, value_name = "VARIABLE", default_value = "OPENAI_API_KEY")]
     pub llm_key_env: String,
 
-    /// Where speech is synthesised: Cartesia, or a server that speaks as
-    /// it does.
-    #[arg(long, value_name = "URL", default_value = TTS_URL)]
-    pub tts_url: String,
+    /// Who synthesises speech.
+    #[arg(long, value_name = "PROVIDER", value_enum, default_value = "cartesia")]
+    pub tts: Speaks,
+    /// Where speech is synthesised, if not at the provider itself: a
+    /// server that speaks as the provider does.
+    #[arg(long, value_name = "URL")]
+    pub tts_url: Option<String>,
     /// The model that synthesises speech.
-    #[arg(long, value_name = "MODEL", default_value = "sonic-3.6")]
-    pub tts_model: String,
-    /// The voice.
+    #[arg(
+        long,
+        value_name = "MODEL",
+        help = "The model that synthesises speech [default: sonic-3.6 or eleven_flash_v2_5, by \
+                the provider]"
+    )]
+    pub tts_model: Option<String>,
+    /// The voice, by the provider's name for it.
     #[arg(
         long,
         value_name = "ID",
-        default_value = "228fca29-3a0a-435c-8728-5cb483251068"
+        help = "The voice, by the provider's name for it [default: one from the provider's own \
+                examples]"
     )]
-    pub tts_voice: String,
+    pub tts_voice: Option<String>,
     /// The environment variable that holds the key for it.
-    #[arg(long, value_name = "VARIABLE", default_value = "CARTESIA_API_KEY")]
-    pub tts_key_env: String,
+    #[arg(
+        long,
+        value_name = "VARIABLE",
+        help = "The environment variable that holds the key for it [default: CARTESIA_API_KEY \
+                or ELEVENLABS_API_KEY, by the provider]"
+    )]
+    pub tts_key_env: Option<String>,
+}
+
+/// A provider as an agent uses it: what the command line says, and for
+/// the rest what is usual.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Chosen {
+    pub url: String,
+    pub model: String,
+    pub voice: String,
+    pub key_env: String,
+    /// Whether the address is the provider's own, which gives nothing
+    /// away without a key.
+    pub own: bool,
+}
+
+impl Chosen {
+    fn new(
+        usual: Usual,
+        url: Option<&String>,
+        model: Option<&String>,
+        key: Option<&String>,
+    ) -> Self {
+        let or = |said: Option<&String>, usual: &str| {
+            said.map_or_else(|| usual.to_owned(), Clone::clone)
+        };
+        let url = or(url, usual.url);
+        Self {
+            own: url == usual.url,
+            url,
+            model: or(model, usual.model),
+            voice: usual.voice.to_owned(),
+            key_env: or(key, usual.key_env),
+        }
+    }
+}
+
+impl Agent {
+    /// The provider that recognises speech.
+    pub(crate) fn hears(&self) -> Chosen {
+        Chosen::new(
+            self.stt.usual(),
+            self.stt_url.as_ref(),
+            self.stt_model.as_ref(),
+            self.stt_key_env.as_ref(),
+        )
+    }
+
+    /// The provider that synthesises speech.
+    pub(crate) fn speaks(&self) -> Chosen {
+        let chosen = Chosen::new(
+            self.tts.usual(),
+            self.tts_url.as_ref(),
+            self.tts_model.as_ref(),
+            self.tts_key_env.as_ref(),
+        );
+        Chosen {
+            voice: self.tts_voice.clone().unwrap_or(chosen.voice.clone()),
+            ..chosen
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, LLM_URL};
+    use super::{Cli, Command, Hears, LLM_URL, Speaks};
 
     #[test]
     fn the_command_line_is_one_clap_can_build() {
@@ -229,6 +391,73 @@ mod tests {
         assert_eq!(dev.agent.llm_url, LLM_URL);
         assert_eq!(dev.agent.language, "en");
         assert!(!dev.half_duplex && dev.microphone.is_none());
+    }
+
+    #[test]
+    fn a_provider_is_asked_for_what_is_usual_for_it_unless_told() {
+        let agent = |arguments: &[&str]| {
+            let all = ["waveport", "dev"].iter().chain(arguments).copied();
+            let Command::Dev(dev) = Cli::try_parse_from(all).unwrap().command else {
+                panic!("dev is dev");
+            };
+            dev.agent
+        };
+        // Told nothing: the providers of the first voice loop.
+        let told_nothing = agent(&[]);
+        assert_eq!(
+            (told_nothing.stt, told_nothing.tts),
+            (Hears::OpenAi, Speaks::Cartesia)
+        );
+        let hears = told_nothing.hears();
+        assert_eq!(hears.url, "wss://api.openai.com/v1/realtime");
+        assert_eq!(hears.key_env, "OPENAI_API_KEY");
+        assert!(hears.own);
+        assert_eq!(told_nothing.speaks().key_env, "CARTESIA_API_KEY");
+
+        // Another provider brings its own address, model, voice and the
+        // name of the variable that holds its key.
+        let others = agent(&["--stt", "deepgram", "--tts", "elevenlabs"]);
+        let hears = others.hears();
+        assert_eq!(hears.url, "wss://api.deepgram.com/v1/listen");
+        assert_eq!(
+            (hears.model.as_str(), hears.key_env.as_str()),
+            ("nova-3", "DEEPGRAM_API_KEY")
+        );
+        let speaks = others.speaks();
+        assert_eq!(speaks.url, "wss://api.elevenlabs.io/v1/text-to-speech");
+        assert_eq!(speaks.model, "eleven_flash_v2_5");
+        assert_eq!(speaks.key_env, "ELEVENLABS_API_KEY");
+        assert!(speaks.own && !speaks.voice.is_empty());
+        let third = agent(&["--stt", "assemblyai"]).hears();
+        assert_eq!(third.model, "universal-3-6-pro");
+        assert_eq!(third.key_env, "ASSEMBLYAI_API_KEY");
+
+        // What the command line says stands.
+        let told = agent(&[
+            "--stt",
+            "deepgram",
+            "--stt-url",
+            "ws://127.0.0.1:9/v1/listen",
+            "--stt-model",
+            "nova-3-medical",
+            "--tts-voice",
+            "my-voice",
+            "--tts-key-env",
+            "MY_KEY",
+        ]);
+        let hears = told.hears();
+        assert!(!hears.own);
+        assert_eq!(hears.model, "nova-3-medical");
+        assert_eq!(hears.key_env, "DEEPGRAM_API_KEY");
+        let speaks = told.speaks();
+        assert_eq!(
+            (speaks.voice.as_str(), speaks.key_env.as_str()),
+            ("my-voice", "MY_KEY")
+        );
+        assert_eq!(speaks.model, "sonic-3.6");
+
+        // A provider there is no adapter for is not taken.
+        assert!(Cli::try_parse_from(["waveport", "dev", "--stt", "whisper"]).is_err());
     }
 
     #[test]

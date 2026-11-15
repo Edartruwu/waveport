@@ -37,11 +37,40 @@ use std::time::Instant;
 use waveport_adapter_kit::pcm::write_base64;
 use waveport_adapter_kit::wav;
 use waveport_ports::audio::Rate;
-use waveport_testkit::servers::{HttpAnswer, HttpServer, WsServer, WsStep};
+use waveport_testkit::servers::{HttpAnswer, HttpServer, WsHeard, WsSeen, WsServer, WsStep};
 use waveport_testkit::speech;
 
 /// What the recogniser said when it was sent this question.
 const HEARD: &str = include_str!("../../../crates/adapters/stt/openai/tests/fixtures/question.ws");
+
+/// What a stand-in for Deepgram says in a call with one question:
+/// nothing until it is asked what it has heard, and then the question
+/// with where its words were. Made up, in the shapes of the provider's
+/// documentation.
+const HEARD_BY_DEEPGRAM: &str = "> \"type\":\"Finalize\"\n\
+    < {\"type\":\"Results\",\"channel_index\":[0,1],\"duration\":2.5,\"start\":0.0,\
+    \"is_final\":true,\"speech_final\":true,\"from_finalize\":true,\"channel\":\
+    {\"alternatives\":[{\"transcript\":\"What time is it right now?\",\"confidence\":0.99,\
+    \"words\":[{\"word\":\"what\",\"start\":0.6,\"end\":0.8,\"confidence\":0.99},\
+    {\"word\":\"now\",\"start\":1.7,\"end\":2.0,\"confidence\":0.99}]}]}}\n\
+    > \"type\":\"CloseStream\"\n\
+    < {\"type\":\"Metadata\",\"request_id\":\"made-up\",\"duration\":9.0,\"channels\":1}\n\
+    ! 1000 ";
+
+/// The same of a stand-in for AssemblyAI, which begins a session, ends
+/// the turn when it is asked to, and says when the session is over.
+const HEARD_BY_ASSEMBLYAI: &str = "< {\"type\":\"Begin\",\"id\":\"made-up\",\
+    \"expires_at\":1772570132,\"configuration\":{\"model\":\"universal-3-6-pro\"}}\n\
+    > \"type\":\"ForceEndpoint\"\n\
+    < {\"turn_order\":0,\"turn_is_formatted\":true,\"end_of_turn\":true,\
+    \"transcript\":\"What time is it right now?\",\"end_of_turn_confidence\":1,\
+    \"words\":[{\"start\":600,\"end\":800,\"text\":\"What\",\"confidence\":0.99,\
+    \"word_is_final\":true},{\"start\":1700,\"end\":2000,\"text\":\"now?\",\
+    \"confidence\":0.99,\"word_is_final\":true}],\"utterance\":\"\",\"type\":\"Turn\"}\n\
+    > \"type\":\"Terminate\"\n\
+    < {\"type\":\"Termination\",\"audio_duration_seconds\":9,\
+    \"session_duration_seconds\":9}\n\
+    ! 1000 ";
 
 /// What the agent says once it knows the time.
 const ANSWER: [&str; 3] = ["It is", " ten past three.", " Goodbye!"];
@@ -125,6 +154,47 @@ fn spoken() -> Vec<WsStep> {
         // And once the adapter has said that no more text follows.
         "> \"continue\":false",
         done,
+    ]
+    .join("\n");
+    WsStep::script(&script)
+}
+
+/// The same answer as a stand-in for ElevenLabs gives it: the same
+/// 1.2 s of a tone in three pieces, each with the characters spoken in
+/// it, timed from where that piece begins.
+fn spoken_by_characters() -> Vec<WsStep> {
+    let tone: Vec<i16> = (0..Rate::Hz24000.samples_in_millis(400))
+        .map(|n| if n % 48 < 24 { 3_000 } else { -3_000 })
+        .collect();
+    let mut data = String::new();
+    write_base64(&tone, &mut data);
+    let piece = |text: &str| {
+        let count = u32::try_from(text.chars().count()).unwrap();
+        let each = 400 / count;
+        let chars: Vec<String> = text.chars().map(|c| format!("\"{c}\"")).collect();
+        let starts: Vec<String> = (0..count).map(|n| (n * each).to_string()).collect();
+        let lengths = vec![each.to_string(); chars.len()];
+        format!(
+            "< {{\"audio\":\"{data}\",\"contextId\":\"{{{{context_id}}}}\",\"alignment\":\
+             {{\"chars\":[{}],\"charStartTimesMs\":[{}],\"charDurationsMs\":[{}]}},\
+             \"normalizedAlignment\":null}}",
+            chars.join(","),
+            starts.join(","),
+            lengths.join(",")
+        )
+    };
+    let script = [
+        // The first sentence. The space a response is begun with is
+        // among its characters.
+        "> \"text\":\"It is".to_owned(),
+        piece(" It is ten"),
+        piece(" past three."),
+        // The second, which is given once the first has its audio.
+        "> Goodbye!".to_owned(),
+        piece(" Goodbye!"),
+        // And once the adapter has said that no more text follows.
+        "> \"close_context\":true".to_owned(),
+        "< {\"isFinal\":true,\"contextId\":\"{{context_id}}\"}".to_owned(),
     ]
     .join("\n");
     WsStep::script(&script)
@@ -303,60 +373,139 @@ fn everything(output: &Output, stt: &WsServer, llm: &HttpServer, tts: &WsServer)
     all
 }
 
+/// Who recognises speech in a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hears {
+    OpenAi,
+    Deepgram,
+    AssemblyAi,
+}
+
+/// Who synthesises it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Speaks {
+    Cartesia,
+    ElevenLabs,
+}
+
 /// The three providers of a call in which the caller asks the time,
-/// each a server on this machine.
+/// each a server on this machine. The recogniser replays what OpenAI
+/// once said, or says what the documentation of another provider has it
+/// say. The model and the synthesiser are made up.
 struct Providers {
+    hears: Hears,
+    speaks: Speaks,
     stt: WsServer,
     llm: HttpServer,
     tts: WsServer,
 }
 
+/// How many messages of audio a connection was sent.
+fn pieces_of_audio(seen: &WsSeen) -> usize {
+    seen.messages
+        .iter()
+        .filter(|message| matches!(message, WsHeard::Bytes(_)))
+        .count()
+}
+
 impl Providers {
+    /// The providers of the first voice loop.
     async fn start() -> Self {
+        Self::of(Hears::OpenAi, Speaks::Cartesia).await
+    }
+
+    async fn of(hears: Hears, speaks: Speaks) -> Self {
+        let recognised = match hears {
+            Hears::OpenAi => HEARD,
+            Hears::Deepgram => HEARD_BY_DEEPGRAM,
+            Hears::AssemblyAi => HEARD_BY_ASSEMBLYAI,
+        };
+        let spoken = match speaks {
+            Speaks::Cartesia => spoken(),
+            Speaks::ElevenLabs => spoken_by_characters(),
+        };
         Self {
-            stt: WsServer::start(vec![WsStep::script(HEARD)]).await,
+            hears,
+            speaks,
+            stt: WsServer::start(vec![WsStep::script(recognised)]).await,
             llm: HttpServer::start(vec![
                 answer(&[], Some("get_time")),
                 answer(&ANSWER, Some("end_call")),
                 answer(&[], None),
             ])
             .await,
-            tts: WsServer::start(vec![spoken()]).await,
+            tts: WsServer::start(vec![spoken]).await,
         }
     }
 
-    /// What tells the command where its providers and its models are.
+    /// What tells the command who its providers are, and where they and
+    /// its models are.
     fn arguments(&self) -> Vec<String> {
+        let (hears, heard_at) = match self.hears {
+            Hears::OpenAi => ("openai", "/v1/realtime"),
+            Hears::Deepgram => ("deepgram", "/v1/listen"),
+            Hears::AssemblyAi => ("assemblyai", "/v3/ws"),
+        };
+        let (speaks, spoken_at) = match self.speaks {
+            Speaks::Cartesia => ("cartesia", "/tts/websocket"),
+            Speaks::ElevenLabs => ("elevenlabs", "/v1/text-to-speech"),
+        };
         vec![
             "--assets".to_owned(),
             assets().to_str().unwrap().to_owned(),
+            "--stt".to_owned(),
+            hears.to_owned(),
             "--stt-url".to_owned(),
-            self.stt.url("/v1/realtime"),
+            self.stt.url(heard_at),
             "--llm-url".to_owned(),
             self.llm.url("/v1"),
+            "--tts".to_owned(),
+            speaks.to_owned(),
             "--tts-url".to_owned(),
-            self.tts.url("/tts/websocket"),
+            self.tts.url(spoken_at),
         ]
     }
 
     /// Checks what each provider was asked. `all` is what to show if it
     /// was not what a call with one question asks.
     fn were_asked_as_one_question_asks(&self, all: &str) {
-        // The recogniser was set up as a transcriber, sent audio, and
-        // asked once for what it had heard.
+        // The recogniser was set up for the caller's language, sent
+        // audio all the while, asked once for what it had heard, and
+        // given no key: there is none.
         let heard = self.stt.connections();
         assert_eq!(heard.len(), 1, "{all}");
-        assert!(
-            heard[0]
-                .path
-                .starts_with("/v1/realtime?intent=transcription")
-        );
-        assert_eq!(heard[0].header("authorization"), None);
-        let sent: Vec<&str> = heard[0].texts().collect();
-        assert!(sent[0].contains("\"languages\":[\"en\"]"), "{}", sent[0]);
+        let heard = &heard[0];
+        assert_eq!(heard.header("authorization"), None);
+        let sent: Vec<&str> = heard.texts().collect();
         let count = |what: &str| sent.iter().filter(|text| text.contains(what)).count();
-        assert!(count("input_audio_buffer.append") > 20);
-        assert_eq!(count("input_audio_buffer.commit"), 1, "{all}");
+        match self.hears {
+            Hears::OpenAi => {
+                assert!(heard.path.starts_with("/v1/realtime?intent=transcription"));
+                assert!(sent[0].contains("\"languages\":[\"en\"]"), "{}", sent[0]);
+                assert!(count("input_audio_buffer.append") > 20);
+                assert_eq!(count("input_audio_buffer.commit"), 1, "{all}");
+            }
+            Hears::Deepgram => {
+                assert_eq!(
+                    heard.path,
+                    "/v1/listen?model=nova-3&language=en&encoding=linear16&sample_rate=16000\
+                     &channels=1&interim_results=true&smart_format=true"
+                );
+                assert!(pieces_of_audio(heard) > 20);
+                assert_eq!(count("Finalize"), 1, "{all}");
+                assert_eq!(sent.last(), Some(&"{\"type\":\"CloseStream\"}"), "{all}");
+            }
+            Hears::AssemblyAi => {
+                assert_eq!(
+                    heard.path,
+                    "/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro\
+                     &language_codes=%5B%22en%22%5D"
+                );
+                assert!(pieces_of_audio(heard) > 20);
+                assert_eq!(count("ForceEndpoint"), 1, "{all}");
+                assert_eq!(sent.last(), Some(&"{\"type\":\"Terminate\"}"), "{all}");
+            }
+        }
 
         // The model was asked twice: with the question and the two
         // tools, and then with the time as well.
@@ -370,14 +519,33 @@ impl Providers {
 
         // The synthesiser was given the answer, whole and once.
         let spoke = self.tts.connections();
-        let given: String = spoke
-            .iter()
-            .flat_map(waveport_testkit::servers::WsSeen::texts)
-            .filter_map(|text| {
-                let (_, rest) = text.split_once("\"transcript\":\"")?;
-                Some(rest.split_once('"')?.0.to_owned())
-            })
-            .collect();
+        let texts = spoke.iter().flat_map(WsSeen::texts);
+        let given: String = match self.speaks {
+            Speaks::Cartesia => texts
+                .filter_map(|text| {
+                    let (_, rest) = text.split_once("\"transcript\":\"")?;
+                    Some(rest.split_once('"')?.0.to_owned())
+                })
+                .collect(),
+            Speaks::ElevenLabs => {
+                assert!(
+                    spoke[0].path.starts_with(
+                        "/v1/text-to-speech/Xb7hH8MSUJpSbSDYk0k2/multi-stream-input\
+                         ?model_id=eleven_flash_v2_5&output_format=pcm_24000"
+                    ),
+                    "{}",
+                    spoke[0].path
+                );
+                texts
+                    // Not the space a response is begun with.
+                    .filter(|text| text.contains("\"flush\":true"))
+                    .filter_map(|text| {
+                        let (_, rest) = text.split_once("\"text\":\"")?;
+                        Some(rest.split_once('"')?.0.to_owned())
+                    })
+                    .collect()
+            }
+        };
         assert_eq!(given, ANSWER.concat(), "{all}");
     }
 }
@@ -426,12 +594,14 @@ fn holds_the_answer(recording: &Path, all: &str) {
     );
 }
 
-#[tokio::test]
-async fn a_caller_asks_the_time_is_told_it_and_the_agent_hangs_up() {
-    let folder = folder("asks-the-time");
+/// Runs the call in which a caller asks the time, with these providers,
+/// and checks all of it: what the command told, what each provider was
+/// asked, and what the caller was played.
+async fn a_caller_asks_the_time_of(hears: Hears, speaks: Speaks, name: &str) {
+    let folder = folder(name);
     let script = one_question(&folder);
     let recording = folder.join("agent.wav");
-    let providers = Providers::start().await;
+    let providers = Providers::of(hears, speaks).await;
 
     let mut arguments = vec![
         "run".to_owned(),
@@ -450,6 +620,21 @@ async fn a_caller_asks_the_time_is_told_it_and_the_agent_hangs_up() {
     tells_the_call(&told, "", &all);
     providers.were_asked_as_one_question_asks(&all);
     holds_the_answer(&recording, &all);
+}
+
+#[tokio::test]
+async fn a_caller_asks_the_time_is_told_it_and_the_agent_hangs_up() {
+    a_caller_asks_the_time_of(Hears::OpenAi, Speaks::Cartesia, "asks-the-time").await;
+}
+
+#[tokio::test]
+async fn the_call_goes_the_same_with_deepgram_and_elevenlabs() {
+    a_caller_asks_the_time_of(Hears::Deepgram, Speaks::ElevenLabs, "asks-the-others").await;
+}
+
+#[tokio::test]
+async fn the_call_goes_the_same_with_assemblyai() {
+    a_caller_asks_the_time_of(Hears::AssemblyAi, Speaks::Cartesia, "asks-the-third").await;
 }
 
 #[tokio::test]

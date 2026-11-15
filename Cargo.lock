@@ -2404,11 +2404,14 @@ dependencies = [
  "waveport-ports",
  "waveport-runtime",
  "waveport-store-memory",
+ "waveport-stt-assemblyai",
+ "waveport-stt-deepgram",
  "waveport-stt-openai",
  "waveport-testkit",
  "waveport-transport-local-audio",
  "waveport-transport-websocket",
  "waveport-tts-cartesia",
+ "waveport-tts-elevenlabs",
 ]
 
 [[package]]

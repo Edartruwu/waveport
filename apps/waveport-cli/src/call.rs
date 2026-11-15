@@ -12,17 +12,22 @@ use waveport_llm_openai_compat::{Config as LlmConfig, Dialect, OpenAiCompat};
 use waveport_models_onnx::{Runtime as Models, SileroVad, SmartTurn, TURN_MODEL, VAD_MODEL};
 use waveport_ports::control::{SessionControl, SessionInput};
 use waveport_ports::journal::SessionId;
+use waveport_ports::stt::Stt;
 use waveport_ports::transport::Transport;
+use waveport_ports::tts::Tts;
 use waveport_runtime::compute::Compute;
 use waveport_runtime::session::{Ended, Parts, SessionSpec};
 use waveport_runtime::shard::{Exit, Runtime, RuntimeConfig, Started};
 use waveport_runtime::tools::Registry;
 use waveport_store_memory::MemoryJournal;
-use waveport_stt_openai::{Config as SttConfig, OpenAiStt};
+use waveport_stt_assemblyai::AssemblyAiStt;
+use waveport_stt_deepgram::DeepgramStt;
+use waveport_stt_openai::OpenAiStt;
 use waveport_transport_local_audio::{Health, LocalAudio};
-use waveport_tts_cartesia::{CartesiaTts, Config as TtsConfig};
+use waveport_tts_cartesia::CartesiaTts;
+use waveport_tts_elevenlabs::ElevenLabsTts;
 
-use crate::args::{Agent, INSTRUCTIONS, LLM_URL, STT_URL, TTS_URL};
+use crate::args::{Agent, Chosen, Hears, INSTRUCTIONS, LLM_URL, Speaks};
 use crate::report::{Reporter, Tell};
 use crate::{Context, Failure, tools};
 
@@ -50,6 +55,70 @@ fn key(variable: &str, url: &str, provider: &str) -> Result<Option<Secret>, Fail
         ))),
         _ => Ok(None),
     }
+}
+
+/// The key of a provider that was chosen on the command line.
+fn key_of(chosen: &Chosen) -> Result<Option<Secret>, Failure> {
+    let own = if chosen.own { chosen.url.as_str() } else { "" };
+    key(&chosen.key_env, &chosen.url, own)
+}
+
+/// The part that recognises speech.
+fn recogniser(agent: &Agent) -> Result<Arc<dyn Stt>, Failure> {
+    let chosen = agent.hears();
+    let key = key_of(&chosen)?;
+    let Chosen { url, model, .. } = chosen;
+    Ok(match agent.stt {
+        Hears::OpenAi => Arc::new(OpenAiStt::new(waveport_stt_openai::Config {
+            url,
+            ..waveport_stt_openai::Config::new(&model, key)
+        })),
+        Hears::Deepgram => Arc::new(DeepgramStt::new(waveport_stt_deepgram::Config {
+            url,
+            ..waveport_stt_deepgram::Config::new(&model, key)
+        })),
+        Hears::AssemblyAi => Arc::new(AssemblyAiStt::new(waveport_stt_assemblyai::Config {
+            url,
+            ..waveport_stt_assemblyai::Config::new(&model, key)
+        })),
+    })
+}
+
+/// The part that synthesises speech, with a connection made ahead: the
+/// first answer does not then wait for one to be made. If none can be
+/// made the call says so itself, at its first answer.
+async fn synthesiser(agent: &Agent) -> Result<Arc<dyn Tts>, Failure> {
+    let chosen = agent.speaks();
+    let key = key_of(&chosen)?;
+    let Chosen {
+        url, model, voice, ..
+    } = chosen;
+    let (tts, warmed): (Arc<dyn Tts>, _) = match agent.tts {
+        Speaks::Cartesia => {
+            let tts = Arc::new(CartesiaTts::new(waveport_tts_cartesia::Config {
+                url,
+                language: agent.language.clone(),
+                ..waveport_tts_cartesia::Config::new(&model, &voice, key)
+            }));
+            let warmed = tts.warm().await;
+            (tts, warmed)
+        }
+        Speaks::ElevenLabs => {
+            let config = waveport_tts_elevenlabs::Config {
+                url,
+                ..waveport_tts_elevenlabs::Config::new(&model, &voice, key)
+            };
+            let tts = ElevenLabsTts::new(config)
+                .with(|| "speech cannot be synthesised as the command line says".to_owned())?;
+            let tts = Arc::new(tts);
+            let warmed = tts.warm().await;
+            (tts, warmed)
+        }
+    };
+    if let Err(error) = warmed {
+        eprintln!("waveport: speech synthesis could not be reached yet: {error}");
+    }
+    Ok(tts)
 }
 
 /// What the agent is told before the call.
@@ -91,9 +160,9 @@ pub(crate) fn name() -> SessionId {
 /// that listen, the providers, the tools and the journal.
 pub(crate) struct Stack {
     runtime: Arc<Runtime>,
-    stt: Arc<OpenAiStt>,
+    stt: Arc<dyn Stt>,
     llm: Arc<OpenAiCompat>,
-    tts: Arc<CartesiaTts>,
+    tts: Arc<dyn Tts>,
     tools: Arc<Registry>,
     journal: Arc<MemoryJournal>,
     compute: Arc<Compute>,
@@ -122,15 +191,10 @@ impl Stack {
     /// Puts the parts together as `agent` says.
     pub(crate) async fn build(agent: &Agent) -> Result<Self, Failure> {
         let instructions = instructions(agent)?;
-        let stt_key = key(&agent.stt_key_env, &agent.stt_url, STT_URL)?;
         let llm_key = key(&agent.llm_key_env, &agent.llm_url, LLM_URL)?;
-        let tts_key = key(&agent.tts_key_env, &agent.tts_url, TTS_URL)?;
+        let stt = recogniser(agent)?;
 
         let compute = models(&agent.assets)?;
-        let stt = OpenAiStt::new(SttConfig {
-            url: agent.stt_url.clone(),
-            ..SttConfig::new(&agent.stt_model, stt_key)
-        });
         // What only OpenAI itself understands is asked of nobody else.
         let llm = if agent.llm_url == LLM_URL {
             LlmConfig::openai(&agent.llm_model, llm_key)
@@ -143,17 +207,7 @@ impl Stack {
         };
         let llm =
             OpenAiCompat::new(llm).with(|| "the language model cannot be reached".to_owned())?;
-        let tts = Arc::new(CartesiaTts::new(TtsConfig {
-            url: agent.tts_url.clone(),
-            language: agent.language.clone(),
-            ..TtsConfig::new(&agent.tts_model, &agent.tts_voice, tts_key)
-        }));
-        // The first answer does not then wait for a connection to be
-        // made. If none can be made the call says so itself, at its first
-        // answer.
-        if let Err(error) = tts.warm().await {
-            eprintln!("waveport: speech synthesis could not be reached yet: {error}");
-        }
+        let tts = synthesiser(agent).await?;
 
         let runtime = Arc::new(
             Runtime::new(RuntimeConfig::default()).with(|| "no session can run".to_owned())?,
@@ -163,7 +217,7 @@ impl Stack {
         tools::add(&mut registry, sessions);
         Ok(Self {
             runtime,
-            stt: Arc::new(stt),
+            stt,
             llm: Arc::new(llm),
             tts,
             tools: Arc::new(registry),
