@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core/*", "xtask"]
+members = ["crates/core/*", "crates/testing/*", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -66,11 +66,13 @@ protocol = []
 
 # Crates allowed to contain `unsafe` code, read by `cargo xtask lint-sync`.
 [workspace.metadata.waveport.unsafe]
-allowed = []
+allowed = ["waveport-alloc-counter"]
 
 # Only what the workspace uses today. `default-features = false` here lets
 # each member opt in, which also works on the minimum supported Cargo.
 [workspace.dependencies]
+waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", version = "0.1.0" }
+
 serde = { version = "1.0.229", default-features = false }
 serde_json = { version = "1.0.154", default-features = false }
 toml = "1.2.1"

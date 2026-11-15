@@ -163,6 +163,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "waveport-alloc-counter"
+version = "0.1.0"
+
+[[package]]
 name = "waveport-control"
 version = "0.1.0"
 
@@ -185,6 +189,17 @@ version = "0.1.0"
 [[package]]
 name = "waveport-runtime"
 version = "0.1.0"
+
+[[package]]
+name = "waveport-sim"
+version = "0.1.0"
+
+[[package]]
+name = "waveport-testkit"
+version = "0.1.0"
+dependencies = [
+ "waveport-alloc-counter",
+]
 
 [[package]]
 name = "winnow"
