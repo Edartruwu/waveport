@@ -9,16 +9,13 @@ pub mod opus;
 
 use core::fmt;
 
+use waveport_domain::audio::Law;
+pub use waveport_domain::audio::{Codec, MAX_PLAIN_PACKET_MS};
 use waveport_domain::time::MediaDur;
 
-use self::g711::Law;
 use self::opus::{OpusDecoder, OpusEncoder, OpusSettings};
 use crate::rate::{FRAME_MS, Rate};
 use crate::resample::Resampler;
-
-/// The longest audio one packet may hold when it is not Opus, in
-/// milliseconds.
-pub const MAX_PLAIN_PACKET_MS: u32 = 60;
 
 /// How long audio that did not arrive is made up for, in milliseconds.
 /// Past that there is nothing to go on, and silence is more honest.
@@ -50,40 +47,6 @@ impl fmt::Display for CodecError {
 }
 
 impl core::error::Error for CodecError {}
-
-/// A way audio is written on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Codec {
-    /// Opus.
-    Opus,
-    /// G.711, which is at 8 kHz.
-    G711(Law),
-    /// Samples as they are: 16 bits each, low byte first, at this rate.
-    Pcm(Rate),
-}
-
-impl Codec {
-    /// The rate the timestamps of its packets count at. For Opus that is
-    /// 48 kHz whatever rate the audio was encoded from.
-    #[must_use]
-    pub const fn clock(self) -> Rate {
-        match self {
-            Self::Opus => Rate::Hz48000,
-            Self::G711(_) => Rate::Hz8000,
-            Self::Pcm(rate) => rate,
-        }
-    }
-
-    /// The most bytes one packet of it is taken to have.
-    #[must_use]
-    pub const fn max_packet(self) -> usize {
-        match self {
-            Self::Opus => opus::MAX_PACKET,
-            Self::G711(_) => Rate::Hz8000.samples_in_millis(MAX_PLAIN_PACKET_MS),
-            Self::Pcm(rate) => rate.samples_in_millis(MAX_PLAIN_PACKET_MS) * 2,
-        }
-    }
-}
 
 /// Makes up audio for packets that did not arrive, for the codecs that
 /// cannot: the last frame heard, again and fading, silent after

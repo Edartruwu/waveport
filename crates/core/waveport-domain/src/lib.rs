@@ -18,6 +18,7 @@
 
 extern crate alloc;
 
+pub mod audio;
 pub mod bounded;
 pub mod command;
 pub mod config;

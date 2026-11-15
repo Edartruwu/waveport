@@ -5,14 +5,7 @@
 //! of 256 entries; encoding finds the sample's segment and takes four bits
 //! of what is left.
 
-/// Which of the two encodings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Law {
-    /// µ-law (PCMU): North America and Japan.
-    Mu,
-    /// A-law (PCMA): everywhere else.
-    A,
-}
+pub use waveport_domain::audio::Law;
 
 /// What µ-law adds to a sample before it looks for the segment.
 const MU_BIAS: i32 = 0x84;
