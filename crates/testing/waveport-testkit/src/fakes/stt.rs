@@ -102,6 +102,10 @@ pub struct SttLog {
     pub audio_ticks: u64,
     /// How many times a final transcript was asked for.
     pub finalize_requests: usize,
+    /// How many streams were let go of in good order: read to their end
+    /// after their sending half was dropped. A stream that is dropped
+    /// whole is not among them.
+    pub let_go: usize,
 }
 
 /// A speech recogniser that follows a script.
@@ -179,6 +183,7 @@ impl Stt for ScriptedStt {
                         }
                     }
                 }
+                log.lock().unwrap_or_else(PoisonError::into_inner).let_go += 1;
                 Ok(())
             });
             Ok(SttStream {

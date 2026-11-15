@@ -53,7 +53,7 @@ use waveport_ports::error::{BoxFuture, Full};
 use waveport_ports::journal::{Journal, JournalError, SessionId};
 use waveport_ports::llm::Llm;
 use waveport_ports::plan::{AgentNeeds, BrainProfile, CascadePlan, PlanError, SessionPlan, plan};
-use waveport_ports::stt::Stt;
+use waveport_ports::stt::{Stt, SttRx};
 use waveport_ports::telemetry::{EventSink, Stage, StageMark};
 use waveport_ports::tool::{ToolExecutor, ToolReply, ToolRequest};
 use waveport_ports::transport::{
@@ -86,8 +86,9 @@ const RECENT: usize = 128;
 const RESUME_GAP: Duration = Duration::from_secs(1);
 
 /// How long a session that has closed waits for its transport to have
-/// told the far end. A far end that does not answer a goodbye is not
-/// worth more: the session is over either way.
+/// told the far end, and for its recognisers to have been let go of. A
+/// far end that does not answer a goodbye is not worth more, and neither
+/// is a recogniser: the session is over either way.
 const FAREWELL: Duration = Duration::from_millis(500);
 
 /// What a session is, beyond its parts.
@@ -315,9 +316,15 @@ pub struct Session<P: Policies = DefaultPolicies> {
     stage_reported: bool,
     taps: Vec<Box<dyn Tap>>,
     sleep: Pin<Box<Sleep>>,
+    /// Recognisers of participants who are no longer listened to, told
+    /// that no more audio follows and read until they end. What they
+    /// still write down is for nobody.
+    parting: Vec<Pin<Box<dyn SttRx>>>,
     /// Until when the session, which has closed, waits for its transport
-    /// to have said so to the far end.
+    /// to have said so to the far end and for its recognisers to end.
     leaving: Option<MonoTime>,
+    /// Whether the transport has said so.
+    far_end_told: bool,
     stats: SessionStats,
 }
 
@@ -423,7 +430,9 @@ impl<P: Policies> Session<P> {
             stage_reported: false,
             taps: Vec::new(),
             sleep: Box::pin(tokio::time::sleep_until(origin)),
+            parting: Vec::new(),
             leaving: None,
+            far_end_told: false,
             stats: SessionStats::default(),
         })
     }
@@ -579,20 +588,52 @@ impl<P: Policies> Session<P> {
         self.calls.clear();
         self.undoing.clear();
         self.ears.clear();
+        self.parting.clear();
         self.timers.clear();
     }
 
     /// Has the transport tell the far end that the session, which has
-    /// closed, is over. Returns whether that is done with: it is said, or
-    /// it has been waited for long enough.
+    /// closed, is over, and lets go of the recognisers. Returns whether
+    /// that is done with: it is said and they have ended, or it has been
+    /// waited for long enough.
     fn farewell(&mut self, cx: &mut Context<'_>, now: MonoTime) -> bool {
         let until = *self.leaving.get_or_insert_with(|| now.after(FAREWELL));
-        if now >= until || self.transport.poll_close(cx).is_ready() {
+        // Whoever is still listened to is not any more.
+        for ear in core::mem::take(&mut self.ears) {
+            self.let_go(ear);
+        }
+        self.far_end_told = self.far_end_told || self.transport.poll_close(cx).is_ready();
+        self.part(cx);
+        if now >= until || (self.far_end_told && self.parting.is_empty()) {
             return true;
         }
         let at = self.instant(until);
         self.sleep.as_mut().reset(at);
         self.sleep.as_mut().poll(cx).is_ready()
+    }
+
+    /// Stops listening to a participant: what went wrong while they were
+    /// heard is kept, and their recogniser is told that no more audio
+    /// follows.
+    fn let_go(&mut self, ear: Ear) {
+        let (hearing, left) = ear.leave();
+        self.stats.hearing.recogniser_failures += hearing.recogniser_failures;
+        self.stats.hearing.finalize_refused += hearing.finalize_refused;
+        self.parting.extend(left);
+    }
+
+    /// Reads the recognisers that were told that no more audio follows,
+    /// and lets go of the ones that have ended.
+    fn part(&mut self, cx: &mut Context<'_>) {
+        self.parting.retain_mut(|left| {
+            loop {
+                match left.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Ok(_))) => {}
+                    Poll::Ready(Some(Err(_)) | None) => return false,
+                    Poll::Pending => return true,
+                }
+            }
+        });
     }
 
     /// How the session has ended, if it has.
@@ -668,6 +709,7 @@ impl<P: Policies> Session<P> {
         for ear in &mut self.ears {
             changed |= ear.poll(cx, now, &mut self.queue);
         }
+        self.part(cx);
 
         for index in 0..self.minds.len() {
             let Some(mind) = self.minds.get_mut(index) else {
@@ -912,9 +954,8 @@ impl<P: Policies> Session<P> {
             }
             Command::Stt(SttCmd::Close { who }) => {
                 if let Some(index) = self.ears.iter().position(|ear| ear.who == who) {
-                    let hearing = self.ears.remove(index).stats();
-                    self.stats.hearing.recogniser_failures += hearing.recogniser_failures;
-                    self.stats.hearing.finalize_refused += hearing.finalize_refused;
+                    let ear = self.ears.remove(index);
+                    self.let_go(ear);
                 }
             }
             Command::Sense(SenseCmd::EstimateEou { turn, who }) => {

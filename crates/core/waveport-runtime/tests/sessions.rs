@@ -878,6 +878,9 @@ async fn an_application_makes_the_agent_speak_stop_and_leave() {
     // was sent after that.
     assert_eq!(log.goodbyes, 1);
     assert_eq!(log.after_close, 0);
+    // And the recogniser was let go of in good order: told that no more
+    // audio follows, and read to its end.
+    assert_eq!(world.stt.log().let_go, 1);
 
     let kinds = kinds(&world.journal.records(SESSION));
     assert_eq!(
@@ -990,6 +993,8 @@ async fn a_transport_that_closes_ends_the_session() {
     assert_eq!(running.far_end.log().after_close, 0);
     // Nobody is there to be told that the session is over.
     assert_eq!(running.far_end.log().goodbyes, 0);
+    // The recogniser of whoever left is let go of all the same.
+    assert_eq!(world.stt.log().let_go, 1);
 
     let records = world.journal.records(SESSION);
     assert_eq!(
@@ -1248,6 +1253,8 @@ async fn a_session_that_another_owner_took_stops_at_once() {
     // The far end is not told that the session is over, because it is
     // not: the other owner has it.
     assert_eq!(log.goodbyes, 0);
+    // Nothing is waited for either: the recogniser is dropped as it is.
+    assert_eq!(world.stt.log().let_go, 0);
 }
 
 #[tokio::test(start_paused = true)]
