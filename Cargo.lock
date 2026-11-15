@@ -2383,6 +2383,16 @@ name = "waveport-sim"
 version = "0.1.0"
 
 [[package]]
+name = "waveport-store-memory"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "tokio",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
 name = "waveport-stt-openai"
 version = "0.1.0"
 dependencies = [
