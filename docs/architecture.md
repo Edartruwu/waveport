@@ -220,7 +220,9 @@ A tool call moves through `Proposed → Authorized → Dispatched` and ends once
 
 The lifecycle is `Running → Draining → Closing → Closed`. A session that is draining lets the agent finish what it is saying and starts nothing new; it moves on as soon as nothing is under way, or at the first step after the drain time has passed, whichever event that step is for. Two timers, for the drain and for the grace time, make sure such a step happens even if one of them is lost. No command waits for an adapter, and an adapter that does not answer is dropped with the session. `Closed` is reached within drain time plus grace time whatever any adapter does.
 
-A session whose transport ends is closed as abandoned, and what the agent was saying is cut off where it was heard to. It is closed first and cut off after, so that the response that was owed next is not started for nobody. A session that cannot hear, because its recogniser failed six times in a row without a transcript in between, is closed as failed. A session that is told its journal belongs to another owner stops where it is: it falls silent at once and asks nothing more of anyone, the tools included.
+A session that has closed says so. Its transport tells the far end that the session is over, and each recogniser is told that no more audio follows and is read until its stream ends, which is when an adapter tells its provider that it is done. Both are waited for together, for half a second at most: a far end that does not answer a goodbye is not worth more, and neither is a provider. A recogniser of somebody who leaves while the session goes on is let go of the same way, without anything waiting for it.
+
+A session whose transport ends is closed as abandoned, and what the agent was saying is cut off where it was heard to. It is closed first and cut off after, so that the response that was owed next is not started for nobody. A session that cannot hear, because its recogniser failed six times in a row without a transcript in between, is closed as failed. A session that is told its journal belongs to another owner stops where it is: it falls silent at once and asks nothing more of anyone, the tools included. It says no goodbye either: the session is not over, the other owner has it.
 
 ### 4.10 Extension points
 
@@ -355,6 +357,7 @@ pub trait Transport: Send + 'static {
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
     fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full>;
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full>; // Clear
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<()>; // tells the far end that the session is over
 }
 
 pub trait Journal: Send + Sync + 'static {
@@ -413,6 +416,8 @@ pub trait RtTx: Send {
 |---|---|
 | Stream helper | Both halves of a stream port from one `async` block (section 8.1) |
 | WebSocket client | Connects with a time limit, sends and receives text and binary messages, and turns a close code into a retry class |
+| WebSocket server side | Takes a connection that was made to this machine: one path, one protocol that the client has to offer, messages of a megabyte at most, a time limit for the request |
+| Kept connections | A connection whose work is done is kept for the work that comes next, since making one takes three trips to a provider and back. One that turns out to be gone before the provider was heard on it is replaced, and the new one is told what the old one was |
 | HTTP client | A POST whose answer is read a piece at a time; a status that is not a success becomes an error with its retry class and the provider's `Retry-After` |
 | Server-sent events | A parser that is given bytes as they arrive, with a limit on the length of an event |
 | Secrets | A key type that prints as `Secret(…)` and is struck out of any text that may be shown |
@@ -444,18 +449,22 @@ pub trait Dispatch {
 - A request is taken or refused at once. A session that has 256 requests waiting refuses the next.
 - Starting a session is a method of the runtime and not of the port. What a session is made of (its transport, its providers, its tools) is decided where the parts are put together, and a port cannot name that yet. It joins the port with the daemon, which starts sessions from a description. `migrate` comes with the fleet.
 
-### 8.5 The adapters of the first voice loop
+### 8.5 The adapters there are
 
 | Crate | Port | What it is |
 |---|---|---|
 | `waveport-models-onnx` | `VadModel`, `TurnModel` | Silero VAD v6.2.3 and Smart Turn v3.2, run by ONNX Runtime. The library and the models are files, loaded when the program starts from the directory that `cargo xtask fetch-assets` fills; nothing is downloaded by a build |
 | `waveport-stt-openai` | `Stt` | OpenAI's realtime transcription over one WebSocket, at 24 kHz. The provider is told not to judge where a turn ends, and writes a final transcript when it is asked for one. A session lasts an hour, and its end is a failure worth another try |
 | `waveport-llm-openai-compat` | `Llm` | Chat completions read as server-sent events, in two dialects: OpenAI's own, and one for every other server that speaks the protocol, a model on this machine among them |
-| `waveport-tts-cartesia` | `Tts` | One WebSocket, one context per response, audio at 24 kHz with the time each word ends at. A connection is kept from one response to the next. Written from the provider's documentation and not yet held against the provider |
+| `waveport-stt-deepgram` | `Stt` | Deepgram's live transcription over one WebSocket, at the rate of the session's audio, with the time of every word. The provider settles what it has heard whenever the speaker pauses, and also when it is asked to; it does not promise an answer to that, so a request that gets none within two seconds is answered with nothing more. A connection that carries no audio is kept alive |
+| `waveport-stt-assemblyai` | `Stt` | AssemblyAI's streaming transcription over one WebSocket, with the time of every word. A stream opens only when the provider has begun a session with the model that was asked for. Audio is put together into messages of the size the provider takes. A turn is given once, when the provider says it is over, which it also does when asked |
+| `waveport-tts-cartesia` | `Tts` | One WebSocket, one context per response, audio at 24 kHz with the time each word ends at. A connection is kept from one response to the next |
+| `waveport-tts-elevenlabs` | `Tts` | One WebSocket, one context per response, audio at the one rate the adapter was set up with (24 kHz unless told), and with every piece of audio the characters spoken in it and when. A connection is kept from one response to the next |
 | `waveport-transport-local-audio` | `Transport` | The microphone and the loudspeaker of this machine, through `cpal`, or a caller who follows a script |
+| `waveport-transport-websocket` | `Transport` | A far end that connects to this machine over a WebSocket, and the client for it |
 | `waveport-store-memory` | `Journal` | Keeps the rules of the port and nothing past the end of its process |
 
-The crate documentation of each provider adapter lists what was learnt from the provider, and its tests replay sessions recorded from it.
+The crate documentation of each provider adapter lists what was learnt from the provider, or read in its documentation. The adapters for OpenAI were held against the provider, and their tests replay sessions recorded from it. **The adapters for Cartesia, Deepgram, AssemblyAI and ElevenLabs were written from the providers' documentation and have not been held against the providers yet.** Their tests replay messages that were made up in the documented shapes, and each has tests named `live_*` that talk to the provider and wait for a key (section 14).
 
 **The local-audio transport** carries plain samples at 48 kHz both ways, in frames of 20 ms. A sound card asks for audio on a thread of its own that must never wait, so the two sides share nothing that locks: one ring of samples each way, and a few numbers that are read and written whole.
 
@@ -467,9 +476,25 @@ The crate documentation of each provider adapter lists what was learnt from the 
 - Nothing takes the agent's voice out of what the microphone hears. With headphones this does not matter. Without them `half_duplex` silences the microphone while the agent speaks and for 300 ms after, which also means the agent cannot be interrupted.
 - In place of the sound card there can be a person who follows a script (`Step`: say this recording, stay silent this long, listen until the agent has finished), moved on by the session's own clock in ticks of 10 ms. What that person is played is kept as a recording. A scripted session takes the same path as a spoken one from the ring onwards, and is the same every time it is run.
 
+**The WebSocket transport** is for a far end on this machine or on a network that is trusted: another terminal, a test, a program that wants to talk to an agent without a sound card of its own. It listens on the loopback interface, and on another only when it is told in so many words that it may be exposed. Nothing in it asks a caller who they are. Its protocol is named `waveport.ws.v0`, and it is not the client protocol of phase 2: it has no way to come back to a session after the connection is lost, and a connection that drops is a caller who left.
+
+| Message | From | What it says |
+|---|---|---|
+| `hello {rate}` | client | The first message: the rate of the audio, both ways |
+| `ready {session, rate}` | server | The session has begun |
+| binary | both | Audio as plain samples, 16 bits, little-endian. From the client it is the microphone; from the server it is the response that was last marked |
+| `mark {run}` | server | The audio that follows belongs to response `run`. With `end: true`, that response has no more audio |
+| `clear {run}` | server | Throw away what is left of response `run`: the agent was interrupted |
+| `played {run, samples}` | client | How much of response `run` has been played, in samples. This is what lets an interrupted response be cut where it was heard to |
+| `text {text}` | client | Text typed to the agent |
+| `event {text}` | server | A line about the call for a person to read |
+| `bye` | both | The call is over. The server says why, in `reason` |
+
+Audio from the client is put into packets of 20 ms on the session's clock. A client that sends nothing for more than a second is taken to have paused, and its audio goes on at the time it comes back.
+
 **Tools** are registered with the runtime's `Registry`, which is the `ToolExecutor` of a session: each tool is a name, a description and a JSON schema for the model, an effect class and a gate for the kernel (section 4.8), and a function. Arguments are checked by reading them into the function's own type, and a tool that is given what it cannot read answers the model with the reason.
 
-**The `waveport` command** (`apps/waveport-cli`) is where the parts are put together: `waveport dev` runs an agent on the sound devices, `waveport run --script` runs it against a scripted caller, and `waveport devices` lists the devices. A key is never an argument: the command is given the name of the environment variable that holds it. The command has two tools: `get_time`, which changes nothing, and `end_call`, which has an effect and is gated on the agent's own words having been heard, so that the agent says goodbye before the line closes.
+**The `waveport` command** (`apps/waveport-cli`) is where the parts are put together: `waveport dev` runs an agent on the sound devices, `waveport run --script` runs it against a scripted caller, `waveport serve` takes calls over the WebSocket transport, as many at a time as come, `waveport client` makes one from the sound devices or from a script, and `waveport devices` lists the devices. `--stt` and `--tts` say who recognises and who synthesises speech; each provider brings its own address, model, voice and the name of the variable that holds its key. A key is never an argument: the command is given the name of the environment variable that holds it. The command has two tools: `get_time`, which changes nothing, and `end_call`, which has an effect and is gated on the agent's own words having been heard, so that the agent says goodbye before the line closes.
 
 ## 9. Durability
 
@@ -592,9 +617,9 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 | Random networks | A seed makes up the network between a sender and the inbound path: jitter, loss, repeats, outages, bursts, and packets that arrive together. Rules are checked on what comes out: one unbroken timeline, each packet once and in order, never more than 60 ms made up in a row, every deadline in the future, and counters that add up. 500 networks in every test run. The outbound path, the codecs and the change of rate have exact tests of their own: a tone must come through the filter at its level, and one above the band must be 55 dB down |
 | Fuzzing | `step` with structured events; every wire parser (SIP, SDP, RTP, client protocol); journal decode with snapshot round trip |
 | Concurrency checking | What a session and the compute plane hand each other: the frames of a stream, the answers, the wake-up of the session and of the thread that judges frames. `loom` tries every way the threads of small cases can take turns, in every test run, and fails on a frame that arrives in pieces or a wake-up that is missed. The rings themselves are `rtrb`'s and are stood in for there: what is tried is how they are used |
-| Port conformance kit | Functions in `waveport-testkit` that hold any implementation of a port to the port's rules: a model's response ends once and says how, a recogniser's final transcripts are in order and inside the audio it was sent, a synthesiser's audio and marks add up, a journal fences and keeps its numbering, and a stream that is dropped stops. They run in every test run on the fakes, in every combination of what a fake can say it does, and on implementations made to break one rule at a time, to show that each rule is checked. Adapters run them against recorded servers, and nightly against the live provider |
+| Port conformance kit | Functions in `waveport-testkit` that hold any implementation of a port to the port's rules: a model's response ends once and says how, a recogniser's final transcripts are in order and inside the audio it was sent, a synthesiser's audio and marks add up, a journal fences and keeps its numbering, and a stream that is dropped stops. They run in every test run on the fakes, in every combination of what a fake can say it does, and on implementations made to break one rule at a time, to show that each rule is checked. Adapters run them against servers that replay what a provider said, or what its documentation says it says. Against the provider itself they run in a workflow of their own, every night and when somebody asks, for the providers whose keys the repository holds; that workflow never runs for a pull request, and a test fails if it is given a trigger for one |
 | Whole sessions on fakes | A fake of every port, on virtual time: a transport whose far end speaks, plays what it is sent and says what it played; a recogniser, a model, a synthesiser and tools that follow a script; a journal in memory. The kernel, the audio path and the session actor are the real ones. Conversations written by hand are run through the ports and nothing else, one for each thing a session has to do or to live through: a question and its answer heard to the end, an interruption answered on the words that were heard, a tool call and its result, parts that can do less, what an application asks, a line that closes, a recogniser that fails, a journal that fails or is taken over, a process that dies, and a follower that comes back. Sessions on real threads are started, driven, followed and ended, one that panics among them |
-| A scripted call | The `waveport` command itself is started, with a caller who follows a script in place of the sound devices and scripted servers in place of the three providers. The models that listen, the adapters, the runtime and the audio path are the real ones. The caller asks a question in recorded synthetic speech; the agent has to call a tool, answer aloud, say goodbye and end the call, and the recording of what the caller was played has to hold the answer and nothing after it. Runs in every test run, on all four platforms |
+| A scripted call | The `waveport` command itself is started, with a caller who follows a script in place of the sound devices and scripted servers in place of the three providers. The models that listen, the adapters, the runtime and the audio path are the real ones. The caller asks a question in recorded synthetic speech; the agent has to call a tool, answer aloud, say goodbye and end the call, and the recording of what the caller was played has to hold the answer and nothing after it. The call is run with each recogniser and each synthesiser there is an adapter for, and once more with the agent in one process and the caller in another, over the WebSocket transport. Runs in every test run, on all four platforms |
 | CI gates | Instruction-count benchmarks for `step` and the per-frame media path; a counting allocator that fails on any allocation in the media path; a 1,000-session soak with flat memory; the density and interruption targets; a `kill -9` test that must resume |
 
 ## 15. Workspace and Cargo spec
@@ -628,7 +653,7 @@ waveport/
 └─ docs/ · examples/
 ```
 
-`xtask/`, `benches/`, `crates/core/`, `crates/testing/` (without `-evals`), `assets/`, `perf/`, `spikes/` and `docs/` exist today. So do the first adapters (`transport/local-audio`, `stt/openai`, `llm/openai-compat`, `tts/cartesia`, `models/onnx`, which holds both listening models, and `store/memory`) and `apps/waveport-cli`. The rest is added in the phase that needs it.
+`xtask/`, `benches/`, `crates/core/`, `crates/testing/` (without `-evals`), `assets/`, `perf/`, `spikes/` and `docs/` exist today. So do the first adapters (`transport/local-audio`, `transport/websocket`, `stt/openai`, `stt/deepgram`, `stt/assemblyai`, `llm/openai-compat`, `tts/cartesia`, `tts/elevenlabs`, `models/onnx`, which holds both listening models, and `store/memory`) and `apps/waveport-cli`. The rest is added in the phase that needs it.
 
 The root [`Cargo.toml`](../Cargo.toml) is the source of truth for workspace members, lint levels, profiles and dependency versions. What it does not say by itself:
 
