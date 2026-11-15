@@ -608,6 +608,39 @@ async fn parts_that_can_do_less_still_hold_a_conversation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_synthesiser_given_text_by_the_piece_that_gives_no_times_says_all_of_it() {
+    let story = "Of course. Once upon a time there was a ship. It sailed all the seas of \
+                 the world.";
+    let speech = [(1_000, 2_200, "tell me a story")];
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say(story)]]);
+    let mut world = World::new(&speech, llm);
+    // It is given a sentence at a time, and says of none of them how far
+    // into it the audio is.
+    world.tts = ScriptedTts::new(TtsScript {
+        caps: TtsCaps {
+            alignment: Alignment::None,
+            input: TtsInput::Incremental,
+            ..TtsScript::default().caps
+        },
+        ..TtsScript::default()
+    });
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 12_000, &talks(&speech));
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.session.plan().speak.marks, Marks::Spread);
+    assert_eq!(running.until(12_000).await, None);
+
+    // Every sentence was said, not only the first: the ones after it do
+    // not wait for the synthesiser to say that it has finished.
+    assert_eq!(running.utterances(), [(story.to_owned(), false)]);
+    let log = running.far_end.log();
+    let length = u32::try_from(story.len()).unwrap() * 60;
+    assert_eq!(log.heard(log.frames[0].tag), MediaDur::from_millis(length));
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_application_makes_the_agent_speak_stop_and_leave() {
     let world = World::new(&[], ScriptedLlm::replies(vec![]));
     let transport = FakeTransport::sound_card()

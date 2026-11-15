@@ -48,8 +48,15 @@ struct Speaking {
     finish_sent: bool,
     /// Bytes of text released so far.
     text: u32,
+    /// Bytes of text the stream has been given.
+    sent: u32,
     /// Bytes of text the audio so far is known to reach.
     marked: u32,
+    /// Bytes of text the stream is taken to have begun on: what it had
+    /// been given when audio last arrived. For a synthesiser that says
+    /// nothing of where its words are, this is all that is known of how
+    /// far it has got before it has finished.
+    begun: u32,
     /// Samples handed to the outbound path so far.
     audio: usize,
     /// Audio the outbound path had no room for, and how much of it has
@@ -83,6 +90,8 @@ impl Speaking {
             if stream.tx.try_speak(text).is_err() {
                 break;
             }
+            let length = u32::try_from(text.len()).unwrap_or(u32::MAX);
+            self.sent = self.sent.saturating_add(length);
             self.unsent.pop_front();
         }
         if self.finish && !self.finish_sent && self.unsent.is_empty() {
@@ -218,7 +227,9 @@ impl Voice {
                 finish: false,
                 finish_sent: false,
                 text: 0,
+                sent: 0,
                 marked: 0,
+                begun: 0,
                 audio: 0,
                 held: None,
                 silent: true,
@@ -321,8 +332,18 @@ impl Voice {
             if taken > 0 {
                 changed = true;
                 speaking.audio += taken;
+                // The kernel holds text back until the audio of what it
+                // released has arrived. A synthesiser that gives no times
+                // does not say when that is before it has finished, so
+                // its text counts from when audio follows it: otherwise
+                // the kernel would wait for an end that it has to send
+                // the rest of the text to bring about.
+                let text_end = match self.plan.marks {
+                    Marks::Timed => speaking.marked,
+                    Marks::Spread => speaking.marked.max(speaking.begun),
+                };
                 let segment = OpEvent::TtsSegment {
-                    text_end: speaking.marked,
+                    text_end,
                     audio_end: rate.length_of(speaking.audio),
                     last: false,
                 };
@@ -336,6 +357,7 @@ impl Voice {
                     if core::mem::take(&mut speaking.silent) {
                         milestone(Milestone::FirstAudio(tag));
                     }
+                    speaking.begun = speaking.sent;
                     speaking.held = Some((pcm, 0));
                 }
                 Poll::Ready(Some(Ok(TtsEvent::Mark(mark)))) => {
