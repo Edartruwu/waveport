@@ -1,0 +1,56 @@
+# Dependency policy, checked by `cargo deny check`.
+
+[graph]
+all-features = true
+# The platforms Waveport is built and tested on.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+# Security advisories always fail. These settings cover the rest.
+yanked = "deny"
+# Unmaintained crates fail only when a workspace crate depends on them directly.
+unmaintained = "workspace"
+unsound = "all"
+
+[licenses]
+# Licences compatible with shipping Waveport under Apache-2.0. Adding one is a
+# reviewed change to this file.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+# The list is a policy, not an inventory: an entry no dependency uses yet is fine.
+unused-allowed-license = "allow"
+
+[bans]
+# One version of each crate. A duplicate that cannot be avoided is listed
+# under `skip` with the reason.
+multiple-versions = "deny"
+# `version = "*"` is not allowed; path dependencies between private workspace
+# crates are.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[bans.workspace-dependencies]
+# Versions are declared once, in `[workspace.dependencies]`.
+duplicates = "deny"
+unused = "deny"
+
+[sources]
+# crates.io only: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

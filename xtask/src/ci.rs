@@ -1,6 +1,7 @@
 //! `cargo xtask ci`: runs every gate locally, cheapest first.
 //!
-//! The command strings below are the gates; CI runs the same strings.
+//! The command strings below are the gates. CI runs the same strings; a test
+//! in this module fails if the workflows and this file drift apart.
 
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -80,7 +81,7 @@ impl Tool {
             Self::Miri => concat!(
                 "rustup toolchain install ",
                 miri_toolchain!(),
-                " --component miri"
+                " --profile minimal --component miri --component rust-src"
             ),
             Self::Valgrind => "install valgrind, then cargo install --locked gungraun-runner",
         }
@@ -312,7 +313,12 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::GATES;
+    use std::path::Path;
+
+    use super::{
+        BENCH_SMOKE, CLIPPY, DENY, DOCS, DOCTEST, FEATURES, FMT, GATES, MIRI, MSRV, NO_STD, TEST,
+        Tool,
+    };
 
     #[test]
     fn gate_names_are_unique() {
@@ -330,5 +336,77 @@ mod tests {
             last_fast < first_slow,
             "a fast gate is listed after a slow one"
         );
+    }
+
+    /// The text of a workflow, with runs of whitespace collapsed.
+    fn workflow(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../.github/workflows")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[track_caller]
+    fn assert_runs(workflow_name: &str, text: &str, commands: &[&str]) {
+        for command in commands {
+            assert!(
+                text.contains(command),
+                "`.github/workflows/{workflow_name}` does not run `{command}`"
+            );
+        }
+    }
+
+    /// CI and `cargo xtask ci` must run the same gates. A gate changed in
+    /// one place and not the other fails here.
+    #[test]
+    fn ci_workflow_runs_the_same_commands() {
+        let text = workflow("ci.yml");
+        assert_runs(
+            "ci.yml",
+            &text,
+            &[
+                FMT,
+                CLIPPY,
+                TEST,
+                DOCTEST,
+                DOCS,
+                NO_STD,
+                FEATURES,
+                MSRV,
+                DENY,
+                BENCH_SMOKE,
+                MIRI,
+                Tool::Miri.hint(),
+                // Run in-process by `cargo xtask ci`.
+                "cargo xtask arch-check",
+                "cargo xtask tier-check",
+                "cargo xtask lint-sync",
+                "cargo xtask semver --self-test",
+                "cargo xtask bench-ir --base",
+                // Settings the local runner applies to its child processes.
+                "CARGO_BUILD_WARNINGS: deny",
+                "RUSTDOCFLAGS: -D warnings",
+            ],
+        );
+    }
+
+    #[test]
+    fn pull_request_workflow_runs_the_title_and_semver_gates() {
+        let text = workflow("pr-meta.yml");
+        assert_runs(
+            "pr-meta.yml",
+            &text,
+            &[
+                "cargo xtask check-title --env PR_TITLE",
+                "cargo xtask semver --baseline-rev",
+                "--title-env PR_TITLE",
+            ],
+        );
+        // Code from a fork must never run with a privileged token.
+        assert!(!text.contains("pull_request_target:"));
     }
 }

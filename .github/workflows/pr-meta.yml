@@ -1,0 +1,66 @@
+# Checks that depend on the pull request itself, not only on its code. They
+# run again when the title is edited.
+#
+# This workflow uses `pull_request`, never `pull_request_target`: code from a
+# fork runs with a read-only token and no secrets. The title reaches the
+# commands through an environment variable, never through the script text.
+name: pr-meta
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-meta-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_WARNINGS: deny
+
+jobs:
+  # The title becomes the commit subject when the pull request is squashed,
+  # and the changelog is generated from those subjects.
+  title:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Check the title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: cargo xtask check-title --env PR_TITLE
+
+  # Stable crates may not break their API. Preview crates may, when the title
+  # declares it with `!`.
+  semver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The base revision is read from history.
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: Check for breaking changes
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: cargo xtask semver --baseline-rev "$BASE_SHA" --title-env PR_TITLE
