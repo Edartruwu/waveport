@@ -224,6 +224,24 @@ impl Kept {
         })
     }
 
+    /// What whoever runs the command is told of the calls that broke off
+    /// earlier and are still kept, if there are any: nothing takes them
+    /// out of the file but going on with them to their end.
+    pub(crate) async fn earlier(&self) -> Option<String> {
+        let file = self.file.as_ref()?;
+        let count = file.journal.sessions().await.ok()?.len();
+        let (calls, are) = match count {
+            0 => return None,
+            1 => ("call", "is"),
+            _ => ("calls", "are"),
+        };
+        Some(format!(
+            "{count} {calls} that broke off earlier {are} kept in {} (deleting the file lets go \
+             of every call in it)",
+            file.path.display()
+        ))
+    }
+
     /// Whether a call that broke off here can be gone on with.
     pub(crate) const fn outlasts_the_command(&self) -> bool {
         self.file.is_some()
@@ -302,6 +320,7 @@ mod tests {
         let kept = kept_in(&journal);
         assert!(kept.outlasts_the_command());
         // Nothing was begun yet.
+        assert_eq!(kept.earlier().await, None);
         let Err(none) = kept.resume(&Resume::Last).await else {
             panic!("nothing was begun");
         };
@@ -334,6 +353,11 @@ mod tests {
         let elsewhere = folder.join("monday.token");
         std::fs::copy(&last, &elsewhere).unwrap();
         let kept = kept_in(&journal);
+        let told = kept.earlier().await.unwrap();
+        assert!(
+            told.starts_with("1 call that broke off earlier is kept in "),
+            "{told}"
+        );
         assert_eq!(kept.resume(&Resume::Last).await.unwrap(), id);
         assert_eq!(
             kept.resume(&Resume::File(elsewhere.clone())).await.unwrap(),
@@ -360,6 +384,7 @@ mod tests {
         assert!(last.exists());
         kept.forget(newer).await;
         assert!(!last.exists());
+        assert_eq!(kept.earlier().await, None);
     }
 
     #[tokio::test]
@@ -385,6 +410,7 @@ mod tests {
     async fn calls_in_memory_are_not_gone_on_with() {
         let (kept, notes) = Kept::open(&agent(&["--no-journal"]), &Halt::Nowhere).unwrap();
         assert!(notes.is_empty() && !kept.outlasts_the_command());
+        assert_eq!(kept.earlier().await, None);
         assert_eq!(kept.issue(SessionId(1)).await.unwrap(), None);
         let Err(failure) = kept.resume(&Resume::Last).await else {
             panic!("nothing is kept");

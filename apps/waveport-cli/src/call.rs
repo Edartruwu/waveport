@@ -227,7 +227,8 @@ impl Stack {
         let halt = Halt::from_env().map_err(Failure)?;
         // First, so that a file of calls that cannot be used is said
         // before anything is waited for.
-        let (kept, notes) = Kept::open(agent, &halt)?;
+        let (kept, mut notes) = Kept::open(agent, &halt)?;
+        notes.extend(kept.earlier().await);
         let instructions = instructions(agent)?;
         let llm_key = key(&agent.llm_key_env, &agent.llm_url, LLM_URL)?;
         let stt = recogniser(agent)?;

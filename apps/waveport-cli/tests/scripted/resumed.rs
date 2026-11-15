@@ -135,9 +135,6 @@ struct Killed {
     answers: Vec<HttpAnswer>,
     /// After how many records the call stores all it has come to.
     state_every: u32,
-    /// What else has to have happened before the process is killed: a
-    /// line it told that begins like this.
-    told_first: Option<&'static str>,
 }
 
 /// One thing in the conversation, as the model is shown it.
@@ -298,10 +295,9 @@ impl Set {
             .collect()
     }
 
-    /// Runs a call until its process is at `place` and has told a line
-    /// that begins with `told_first`, if there is to be one, and kills
-    /// the process there. Returns what it told, and its errors.
-    async fn killed_at(&self, place: &str, told_first: Option<&str>) -> (Vec<String>, String) {
+    /// Runs a call until its process is at `place`, and kills the
+    /// process there. Returns what it told, and its errors.
+    async fn killed_at(&self, place: &str) -> (Vec<String>, String) {
         let mut first = self.run(&one_question(&self.folder), &[], Some(place));
         let told = lines_of(first.stdout.take().unwrap());
         let errors = lines_of(first.stderr.take().unwrap());
@@ -309,8 +305,7 @@ impl Set {
         let began = Instant::now();
         loop {
             let so_far = told.lock().unwrap().clone();
-            let said = |start: &str| so_far.iter().any(|line| line.starts_with(start));
-            if so_far.contains(&halted) && told_first.is_none_or(said) {
+            if so_far.contains(&halted) {
                 break;
             }
             let gone = first.try_wait().unwrap();
@@ -351,11 +346,11 @@ impl Set {
 /// call in another process, and checks what holds wherever a call is
 /// killed. Returns how it went, for what holds only there.
 async fn goes_on(killed: Killed) -> WentOn {
-    let (place, told_first) = (killed.place, killed.told_first);
+    let place = killed.place;
     let set = Set::up(killed).await;
 
     // The process that is killed.
-    let (before, errors_before) = set.killed_at(place, told_first).await;
+    let (before, errors_before) = set.killed_at(place).await;
     let notes_before = lines(&set.notes);
     let asked_before = set.asked();
 
@@ -417,7 +412,9 @@ impl WentOn {
     /// the second.
     fn holds_wherever_a_call_is_killed(&self, recording: &Path) {
         let all = &self.all;
-        // It went on with the call, and did not begin one.
+        // It found the call that had broken off, went on with it, and
+        // did not begin one.
+        self.told("note: 1 call that broke off earlier is kept in ");
         let went_on = self.told("the call goes on, from ");
         let began = |line: &String| line.starts_with("the call has begun");
         assert!(!self.after.iter().any(began), "{all}");
@@ -519,7 +516,6 @@ async fn a_call_killed_while_the_model_answers_goes_on() {
         place: "after:turn_committed",
         answers: vec![stops_short(), says(false)],
         state_every: 256,
-        told_first: None,
     })
     .await;
     let all = &went.all;
@@ -549,7 +545,6 @@ async fn a_call_killed_while_the_agent_speaks_goes_on() {
         place: "after:utterance_progress",
         answers: vec![says(false)],
         state_every: 256,
-        told_first: None,
     })
     .await;
     let all = &went.all;
@@ -583,15 +578,13 @@ async fn a_call_killed_while_the_agent_speaks_goes_on() {
 async fn a_call_killed_after_a_tool_has_acted_goes_on() {
     // The tool has written its note and has not answered. By then the
     // record that allowed the call was stored: the tool is not called
-    // before that.
+    // before that. Whether the record that it was called is stored too
+    // is not the same every time, and makes no difference.
     let went = goes_on(Killed {
         name: "killed-after-a-tool-has-acted",
         place: "tool",
         answers: vec![says(true), says(false)],
         state_every: 256,
-        // Not before the sentence that came with the call is over, so
-        // that what the journal has is the same every time.
-        told_first: Some("agent: "),
     })
     .await;
     let all = &went.all;
@@ -602,12 +595,29 @@ async fn a_call_killed_after_a_tool_has_acted_goes_on() {
     // make the call again.
     let doubted = went.told("tool: a call from before the call broke off -> ");
     assert!(went.after[doubted].ends_with("[in doubt]"), "{all}");
-    went.first_shown_is(&[
-        question(),
-        asked_for_a_note(),
-        tool_said("the call was made, and whether it took effect is not known"),
-        agent_said(&SAID.concat()),
-    ]);
+    let first = &went.asked_after[0];
+    assert_eq!(
+        first[..3],
+        [
+            question(),
+            asked_for_a_note(),
+            tool_said("the call was made, and whether it took effect is not known"),
+        ],
+        "{all}"
+    );
+    // The sentence that came with the call was being said when the
+    // process died. How much of it the journal had by then is not the
+    // same every time: none of it, or its first words.
+    let sentence = SAID.concat();
+    match &first[3..] {
+        [told] => assert!(told.content.contains(RESTORED), "{all}"),
+        [said, told] => {
+            assert_eq!(said.role, "assistant", "{all}");
+            assert!(sentence.starts_with(&said.content), "{all}");
+            assert!(told.content.contains(RESTORED), "{all}");
+        }
+        _ => panic!("the model was shown something else\n{all}"),
+    }
     // One note, and no second one.
     assert_eq!(went.notes, [NOTE], "{all}");
     let called_again = went
@@ -626,7 +636,6 @@ async fn a_call_killed_before_a_tool_was_allowed_goes_on() {
         place: "before:tool_authorized",
         answers: vec![says(true), says(true), says(false)],
         state_every: 256,
-        told_first: None,
     })
     .await;
     let all = &went.all;
@@ -661,7 +670,6 @@ async fn a_call_killed_before_its_state_was_stored_goes_on() {
         place: "before:state",
         answers: vec![says(false)],
         state_every: 1,
-        told_first: None,
     })
     .await;
     // The records are all there is, and all that is needed.
@@ -678,7 +686,6 @@ async fn a_call_killed_after_its_state_was_stored_goes_on() {
         place: "after:state",
         answers: vec![says(false)],
         state_every: 1,
-        told_first: None,
     })
     .await;
     // It is the same call as from the records.

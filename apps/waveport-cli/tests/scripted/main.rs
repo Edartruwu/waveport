@@ -272,7 +272,12 @@ async fn ended(child: &mut Child) {
 
 /// Runs the command to its end.
 async fn waveport(arguments: &[&str]) -> Output {
-    let mut child = started(arguments);
+    waveport_at(&desk(), arguments).await
+}
+
+/// Runs the command to its end, in the folder `desk`.
+async fn waveport_at(desk: &Path, arguments: &[&str]) -> Output {
+    let mut child = started_at(desk, arguments, None);
     ended(&mut child).await;
     child.wait_with_output().unwrap()
 }
@@ -638,7 +643,7 @@ async fn a_caller_asks_the_time_of(hears: Hears, speaks: Speaks, name: &str) {
     ];
     arguments.extend(providers.arguments());
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
-    let output = waveport(&arguments).await;
+    let output = waveport_at(&folder, &arguments).await;
     let told = String::from_utf8_lossy(&output.stdout).into_owned();
     let all = everything(&output, &providers.stt, &providers.llm, &providers.tts);
     assert!(output.status.success(), "{all}");
@@ -646,6 +651,20 @@ async fn a_caller_asks_the_time_of(hears: Hears, speaks: Speaks, name: &str) {
     tells_the_call(&told, "", &all);
     providers.were_asked_as_one_question_asks(&all);
     holds_the_answer(&recording, &all);
+
+    // The command was told nothing about where to keep its calls, and
+    // kept them where it was run, in a folder that is its owner's alone.
+    // The call is over, so there is none to go on with.
+    let kept = folder.join(".waveport");
+    assert!(kept.join("journal.redb").is_file(), "{all}");
+    assert!(!kept.join("journal.last").exists(), "{all}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&kept), 0o700, "{all}");
+        assert_eq!(mode(&kept.join("journal.redb")), 0o600, "{all}");
+    }
 }
 
 #[tokio::test]
