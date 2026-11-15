@@ -95,6 +95,9 @@ bytes = "1.12.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 loom = { version = "0.7.3", features = ["futures"] }
 opus = "0.4.0"
+# ONNX Runtime is loaded from a file when the program starts, not linked in:
+# no library is downloaded while building, and none is built.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["api-31", "load-dynamic", "std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider"] }
 rtrb = "0.4.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -121,6 +124,12 @@ gungraun = "0.20.0"
 opt-level = 2
 
 [profile.dev.package.waveport-testkit]
+opt-level = 2
+
+# What the end-of-turn model is given to look at is worked out here, a
+# transform of 400 samples 800 times over for each answer. Unoptimised it
+# takes three quarters of a second, and a turn waits for it.
+[profile.dev.package.waveport-models-onnx]
 opt-level = 2
 
 [profile.release]

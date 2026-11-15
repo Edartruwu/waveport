@@ -1,0 +1,28 @@
+[package]
+name = "waveport-models-onnx"
+description = "Waveport adapter: the models that listen for speech and for the end of a turn, run by ONNX Runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "adapter"
+stability = "experimental"
+
+[lib]
+bench = false
+
+[dependencies]
+waveport-ports = { workspace = true }
+
+ort = { workspace = true }
+
+[dev-dependencies]
+waveport-testkit = { workspace = true }
+
+[lints]
+workspace = true
