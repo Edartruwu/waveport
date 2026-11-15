@@ -181,8 +181,28 @@ impl FakeTransportBuilder {
     /// The codec of the transport cannot be set up.
     #[must_use]
     pub fn microphone(
+        self,
+        who: ParticipantId,
+        from_ms: u64,
+        to_ms: u64,
+        talks: &[(u64, u64)],
+    ) -> Self {
+        self.microphone_of(who, 0, from_ms, to_ms, talks)
+    }
+
+    /// A [`microphone`](Self::microphone) whose tone is in the voice
+    /// numbered `voice`, from 0 to 2: the higher the number the quieter
+    /// the tone, which is how a scripted recogniser tells who is
+    /// speaking.
+    ///
+    /// # Panics
+    ///
+    /// The codec of the transport cannot be set up.
+    #[must_use]
+    pub fn microphone_of(
         mut self,
         who: ParticipantId,
+        voice: u8,
         from_ms: u64,
         to_ms: u64,
         talks: &[(u64, u64)],
@@ -202,7 +222,7 @@ impl FakeTransportBuilder {
             let talking = talks.iter().any(|(from, to)| (*from..*to).contains(&at_ms));
             for (offset, sample) in frame.iter_mut().enumerate() {
                 *sample = if talking {
-                    tone(n * rate.frame() + offset)
+                    tone(n * rate.frame() + offset) / (i16::from(voice.min(2)) + 1)
                 } else {
                     0
                 };
@@ -225,6 +245,26 @@ impl FakeTransportBuilder {
                 },
             ));
         }
+        self
+    }
+
+    /// Changes when the packets written so far arrive: each at the time
+    /// `arrival` makes of the time it was sent, or never, for `None`.
+    /// Packets that arrive in another order than they were sent in are
+    /// what a network does to them.
+    #[must_use]
+    pub fn disturbed(mut self, mut arrival: impl FnMut(Duration) -> Option<Duration>) -> Self {
+        let mut kept = Vec::with_capacity(self.events.len());
+        for (at, event) in self.events {
+            if matches!(event, TransportEvent::Audio { .. }) {
+                if let Some(at) = arrival(at) {
+                    kept.push((at, event));
+                }
+            } else {
+                kept.push((at, event));
+            }
+        }
+        self.events = kept;
         self
     }
 
