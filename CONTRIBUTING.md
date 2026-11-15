@@ -154,9 +154,25 @@ A scenario stays repeatable only if all its randomness comes from the context's 
 
 **Kernel scenarios.** `waveport-kernel-sim` runs a story about one session against the real kernel, with a simulated world in place of every adapter, along every path the story allows. The six scenarios in `crates/core/waveport-domain/tests/scenarios/` were written before the kernel. Do not edit one to make it pass: needing to is the sign that the kernel's design is wrong, and is settled in review. `tests/scenarios/main.rs` lists each scenario as `unstarted`, `pending` or `passes`, and the listing is checked both ways, so a scenario that starts to pass has to be promoted there in the same pull request. A failure prints the path that led to it, the check that did not hold and the last steps of the session.
 
-**Kernel simulation.** `crates/core/waveport-domain/tests/simulation.rs` runs random sessions, 600 for each of five profiles of adapter behaviour (calm, chaos, stalls, duplicates, shutdown). A monitor in `waveport-kernel-sim` keeps its own account of each session from the events and the kernel's emissions alone, and fails the step at which the kernel breaks an invariant of section 13 of the architecture document, or the session if it ends with something unfinished. The same monitor watches every path of the scenarios. Each test also checks that its sweep did what it is there for, such as interrupting the agent often enough. When you change the kernel, run a larger sweep once with `WAVEPORT_SIM_SEEDS=50000`: the rare failures are the interesting ones. A kernel rule that the monitor cannot see, because breaking it only makes the session worse and breaks no invariant, needs a test in `tests/kernel.rs`.
+**Kernel simulation.** `crates/core/waveport-domain/tests/simulation.rs` runs random sessions, 600 for each of six profiles of what goes wrong (calm, chaos, stalls, duplicates, shutdown, and crashes, in which the process dies and the session goes on from its journal). A monitor in `waveport-kernel-sim` keeps its own account of each session from the events and the kernel's emissions alone, and fails the step at which the kernel breaks an invariant of section 13 of the architecture document, or the session if it ends with something unfinished. The same monitor watches every path of the scenarios. Each test also checks that its sweep did what it is there for, such as interrupting the agent often enough. A kernel rule that the monitor cannot see, because breaking it only makes the session worse and breaks no invariant, needs a test in `tests/kernel.rs`, `tests/tools.rs`, `tests/recovery.rs` or `tests/stage.rs`.
 
-**Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
+When you change the kernel, run a larger sweep once: the rare failures are the interesting ones, and every one found so far needed more than 600 sessions. A release build runs a million sessions in under a minute:
+
+```sh
+WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-domain --test simulation
+```
+
+**Small sessions, every path.** `tests/model.rs` takes sessions small enough to try every order in which their events can arrive, and tries them all under the same monitor. Each test is one session, described by a `Scope`: what may happen in it and how often. A failure prints the path as a trace. The larger sessions are ignored in an ordinary run: `cargo test --release -p waveport-domain --test model -- --include-ignored` has them.
+
+**Recorded sessions.** A trace is a session written down as the events its kernel was given (`waveport_kernel_sim::trace`). `tests/traces/` keeps five, each with what the kernel emitted for every event, and `tests/replay.rs` gives a new kernel the same events and compares. A change in what the kernel does therefore shows as a failure there, with the first line that differs. If the change is meant, write the files anew and review their diff, which is the change in behaviour:
+
+```sh
+WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay
+```
+
+**Every night.** The `scheduled` workflow runs 200,000 random sessions per profile, other ones each night, and the larger sessions of `tests/model.rs`.
+
+**Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps and of rebuilding a session from its journal, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
 
 **Allocations.** `waveport-alloc-counter` proves a code path does not touch the heap. Install `CountingAllocator` as the global allocator of the test binary and wrap the code in `assert_no_alloc`. Without the allocator installed the assertion fails instead of passing silently.
 

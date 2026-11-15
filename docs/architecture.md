@@ -1,6 +1,6 @@
 # Waveport architecture and technical spec
 
-**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the session kernel (section 4) takes turns, speaks, keeps the conversation and closes; tools, agents and recovery are not in it yet. Four of its six scenarios (section 14) pass, and the invariants that concern turns and speech (section 13) are checked on random sessions in every test run. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
+**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the session kernel (section 4) exists: it takes turns, speaks, keeps the conversation, runs tool calls, lets a second agent answer a call or take the floor, closes, and is rebuilt from its journal after a crash. Nothing around it exists yet: no media path, no adapter, no runtime. All six of its scenarios (section 14) pass, and its ten invariants (section 13) are checked on random sessions and on every path through small ones in every test run. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
 
 See also the [roadmap](../ROADMAP.md) and the [ecosystem inventory](ecosystem.md).
 
@@ -191,12 +191,17 @@ Around these three steps the kernel keeps to a few rules:
 
 ### 4.8 Tools
 
-A tool call moves through `Proposed → Authorized → Dispatched → Completed | Failed | InDoubt`.
+A tool call moves through `Proposed → Authorized → Dispatched` and ends once, as `Completed`, `Failed`, `Cancelled` or `InDoubt`. Its request and its result are items of the conversation, so the model that is told the result is also told how the call ended.
 
-- Each `ToolSpec` declares an **effect class**. After dispatch, a call can be cancelled only if it is declared `Pure`, or when the tool acknowledges its own rollback.
-- Each `ToolSpec` can declare a **gate**, for example "after the agent's own utterance has finished playing" for an end-call tool.
-- Before a side-effecting tool is dispatched, the kernel waits until the journal record that authorises the dispatch is durable (see section 9). Waiting for the record that proposes the call is not enough: after a crash, recovery would find only the proposal, conclude that the call never ran, and report a failure for an effect that happened.
-- A side-effecting call that was authorised and has no recorded result after a crash is `InDoubt`. It is retried only if the tool declares idempotency; otherwise the model is told the outcome is unknown.
+- Each `ToolSpec` declares an **effect class**: `Pure` (changes nothing), `Idempotent` (repeating it changes nothing more) or `SideEffecting` (must happen at most once).
+- Each `ToolSpec` can declare a **gate**, for example "after the agent's own utterance has finished playing" for an end-call tool. A call whose gate never opens fails.
+- A call is accepted only from a response that holds the floor and whose model is still writing, for a tool its agent has. A response that is cut off takes the calls it had not sent with it: they end `Cancelled`. Calls that were sent run on, and their results still enter the conversation.
+- Before a call that is not `Pure` is dispatched, the kernel waits until the journal record that authorises the dispatch is durable (see section 9). Waiting for the record that proposes the call is not enough: after a crash, recovery would find only the proposal, conclude that the call never ran, and report a failure for an effect that happened. If the record is not stored within the tool's timeout, the call fails without having been sent.
+- A tool that does not answer within its timeout is told to cancel. A `Pure` call then fails. Any other call may have taken effect: the tool has a short time to report that it undid the call, which ends it `Cancelled`, and otherwise the call ends `InDoubt`. A result that arrives in that time still counts.
+- After a crash, a call that was never authorised fails: it was not sent. An authorised call may have been sent, whether or not the record of that survived. A `Pure` or `Idempotent` one is sent again, as a further attempt, up to three times. A `SideEffecting` one ends `InDoubt`, and the model is told that the outcome is unknown.
+- The calls one response asks for form a **batch**. When all of them have ended and the response has finished writing, the batch is resolved and one response, the continuation, is owed for the results. The news of a tool never takes the floor: the continuation waits for a response that is being written or heard, and only a new user turn replaces a response nobody has heard.
+- A tool can be run by another agent of the session instead of by the application (section 10).
+- A session that is closing sends nothing new. It withdraws the calls it had not sent, cancels the `Pure` ones, and waits up to the grace time for the others, which then end `InDoubt`.
 - Tool results enter the context exactly once, whatever happened to the turn that requested them.
 
 ### 4.9 Shutdown
@@ -374,7 +379,7 @@ Waveport stores a snapshot plus a journal of **domain events**, not inputs. Reco
 | Journaled | Turn commits, context items, utterance commits, tool-call transitions, agent and flow transitions, participant and configuration changes, and a playout checkpoint each second while speaking. Expect 5 to 30 records per turn |
 | Not journaled | Audio, token deltas, voice-activity edges, interim transcripts |
 | Hot-path cost | Serialisation into a shard buffer; group commit off-thread every 10 ms or less |
-| One synchronous barrier | Before dispatching a side-effecting tool, the kernel emits `AwaitDurable(seq)` for the record that authorises the dispatch, and dispatches on `Durable` |
+| One synchronous barrier | Before dispatching a call to a tool that is not `Pure`, the kernel emits `AwaitDurable(seq)` for the record that authorises the dispatch, and dispatches on `Durable` |
 | Format | Facts and snapshots are versioned serde records defined in `waveport-protocol`. The domain crate stays free of serialisation: the runtime maps each fact to its record with an exhaustive match, so a new fact does not compile until it is mapped. Zero-copy archives (`rkyv`) were rejected for snapshots, because an archived layout cannot evolve and a newer build must read the state an older one wrote |
 | Fencing | Appends are conditional on `(lease epoch, expected seq)`, so a superseded owner can neither write nor speak |
 
@@ -387,6 +392,15 @@ Three recovery levels:
 | Live migration | The target pre-opens provider connections; the source waits for a safe point (floor idle, no live generation; forced at a deadline), freezes, flushes and hands over the lease | Drain time becomes "time to the next turn boundary" |
 
 How the media moves during a migration depends on the transport: through an SFU or relay it re-joins (gap of 300 ms or less); direct WebRTC uses an ICE restart (0.3 to 1 s); a carrier WebSocket is bound to its TCP connection and cannot move unless a thin media edge holds that socket.
+
+A snapshot holds what the facts add up to and nothing that was only under way: `Kernel::restore(snapshot, tail)` gives a session whose snapshot equals the live one's, from any earlier snapshot. What was under way is dealt with by the first step the rebuilt kernel takes, whatever event that step is for:
+
+- The epoch advances, so that whatever still arrives for the session's earlier life is stale.
+- Speech that was being heard is committed as far as its last checkpoint, flagged truncated.
+- A response that was owed and not heard to its end is owed again. Whether a response was heard to its end is itself journaled, with the utterance, so an answer that was given is not given twice.
+- Tool calls are dealt with as section 4.8 says, and a handoff that was under way is completed.
+- If anything was lost, a notice says so in the conversation, so that the model knows why it is asked again.
+- A session that was closing is closed.
 
 What cannot be restored, and what happens instead:
 
@@ -403,10 +417,10 @@ Agents are participants of kind `Agent` on the stage. At most one holds the floo
 
 | Mode | Mechanism |
 |---|---|
-| In-process handoff | A handoff request arrives, usually from a tool result, carrying full context, a summary, a filtered context or none. At a safe point the kernel bumps the epoch, activates the new agent, recomputes the session plan and swaps drivers make-before-break |
+| In-process handoff | A handoff request arrives, usually from a tool result, carrying full context, a summary, a filtered context or none. The kernel bumps the epoch, which stops the agent that is speaking, leaves a note for the new agent when it is to see a summary or nothing in place of the conversation, and starts no response until the parts that serve the new agent are reported ready. Then it activates the new agent. If they are not ready in time, the agent that had the floor keeps it. Recomputing the session plan and swapping drivers make-before-break is the runtime's part |
 | Cross-process: remote brain | Session, media and floor stay put. The think role is filled by a bus-backed LLM adapter whose results carry the `OpTag`, so the same liveness rule discards stale remote output. Costs one bus round trip per turn |
 | Cross-node: session transfer | The migration from section 9 to a node hosting the target agent, followed by activation |
-| Background and parallel agents | A generation without playout, optionally parented by a tool call. One parented by a call ends with that call, and an interruption of the floor leaves it running. Its output lands as a tool result or a notice. To speak, it requests the floor, and the policy that arbitrates humans arbitrates agents |
+| Background and parallel agents | A generation without playout, optionally parented by a tool call. One parented by a call ends with that call, and an interruption of the floor leaves it running. Its output lands as a tool result or a notice. To speak, it requests the floor, and the policy that arbitrates humans arbitrates agents. In phase 1 the only background agent is one that answers a tool call: what it writes is the call's result, and it cannot call tools itself |
 
 Bus envelopes are `{ session, lease, seq, tag, payload }`, delivered at least once and deduplicated on `(session, seq)`.
 
@@ -447,15 +461,15 @@ All are design targets, each enforced by a benchmark gate from phase 1.
 
 These ten are stated formally and checked in simulation.
 
-1. The epoch is monotonic, and no playout start or tool dispatch is emitted for a generation that is not live.
+1. The epoch is monotonic. No playout start is emitted for a generation that is not live, and no tool dispatch for a response that was cut off.
 2. Every accepted perception event ends in exactly one outcome: a committed user turn, or a turn dismissed for a stated reason (a backchannel, noise, no words, or the session closing while the turn was open).
 3. Each utterance commits exactly once; committed text is a prefix of planned text and never extends past the audio handed to the transport.
-4. A dispatched side-effecting call ends `Completed`, `Failed` or `InDoubt`; it is dispatched at most once per key within one lease, and after a crash a call is dispatched again only if its tool is declared pure or idempotent; its result enters the context exactly once.
-5. Each tool batch starts at most one continuation.
+4. A call ends exactly once. A dispatched call that may have changed something ends `Completed`, `Failed` or `InDoubt`, or `Cancelled` if its tool confirms that it undid the call. A call that is not pure is dispatched only once the record that authorises it is durable. A call is dispatched at most once per key within one lease, and after a crash it is dispatched again only if its tool is declared pure or idempotent. Its result enters the context exactly once.
+5. Each tool batch starts at most one continuation in one life of the session. A continuation that a crash interrupted is started again.
 6. At most one generation holds playout per output track.
 7. From `Close`, `Closed` is reached within drain plus grace under any adapter behaviour.
 8. All queues are bounded; `step` is total and deterministic.
-9. `load(snapshot) ⊕ apply(tail)` equals live state.
+9. `load(snapshot) ⊕ apply(tail)` equals live state: a session rebuilt from any snapshot and the facts journaled since holds what the live session's snapshot holds.
 10. The facts a kernel emits are numbered without gaps, and once told that its lease is lost it emits nothing more. That at most one lease appends per session is the journal's guarantee (section 9) and is checked with the journal, since a lease is not kernel state.
 
 Invariants 1 to 5 close the incumbents' race classes by construction. General robustness to adapter interleavings is established by exploration, not by construction.
@@ -465,11 +479,11 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 | Technique | Scope |
 |---|---|
 | Kernel scenarios | Six stories written before the kernel, each closing a race from section 4.5 or a session shape from section 6. A simulated world stands in for every adapter, and each story is run along every order in which its events could arrive. The scenario files are not edited to make them pass |
-| Deterministic simulation, level 1 | A seed makes up a session: who is in it, when they speak, what the model writes, and how each adapter answers. Five profiles decide how the adapters misbehave: calm, chaos, stalls, duplicates and shutdown. `Kernel::step` is driven with a virtual clock, no executor needed, and a monitor that keeps its own account of the session checks the invariants after every step and that nothing is left unfinished at the end. Each session runs twice to show the kernel is deterministic |
+| Deterministic simulation, level 1 | A seed makes up a session: who is in it, when they speak, what the model writes and which tools it calls, which agent has the floor, and how each adapter answers. Six profiles decide what goes wrong: calm, chaos, stalls, duplicates, shutdown, and crashes, in which the process dies and the session goes on from what of its journal had reached the disk. `Kernel::step` is driven with a virtual clock, no executor needed, and a monitor that keeps its own account of the session checks the invariants after every step, that the journal alone adds up to the kernel's state, and that nothing is left unfinished at the end. Each session runs twice to show the kernel is deterministic. Every test run has 600 sessions per profile; a nightly run has 200,000, and other ones each night |
 | Deterministic simulation, level 2 | The real actor loop and drivers on a simulated single-threaded executor. Fake adapters delay, reorder, stall, disconnect and crash at any journal offset. Every failure is a seed |
 | Property tests | The ten invariants over arbitrary interleavings |
-| Small-scope model check | Floor × generation × tool call × lifecycle with 2 participants, 3 turns, 2 tools |
-| Replay | Flight-recorder traces re-run in CI against golden command traces, and differentially between versions |
+| Small-scope model check | Every order in which the events of a small session can arrive: speech, transcripts and estimates, model text and tool requests, synthesis and playback, tool results, timers, an interruption, a close and the death of the process, with the same monitor checking each step. One session with all of that would be too large, so there are several, each without what another has: up to 2 participants, 3 turns, 2 tools and 2 calls. Every test run tries about 200,000 states, and the nightly run about 6 million |
+| Replay | A session is written down as the events its kernel was given, a line each. Five such traces are kept with what the kernel emitted for every line, and each test run gives a new kernel the same events and compares: a change in what the kernel does shows as the first line that differs. A path on which the model check or the simulation fails can be written down and run again in the same way. Flight-recorder traces from the runtime will use the format |
 | Fuzzing | `step` with structured events; every wire parser (SIP, SDP, RTP, client protocol); journal decode with snapshot round trip |
 | Concurrency checking | The few lock-free structures (rings, batcher) |
 | Port conformance kit | Each adapter's declared capabilities tested nightly against the live provider |
