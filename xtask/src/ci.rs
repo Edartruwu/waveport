@@ -431,6 +431,7 @@ mod tests {
                 "cargo deny check advisories",
                 "cargo test --release --locked -p waveport-domain --test simulation",
                 "cargo test --release --locked -p waveport-runtime --test simulation",
+                "cargo test --release --locked -p waveport-store-journal --test power",
                 "WAVEPORT_SIM_SEEDS=",
                 "cargo test --release --locked -p waveport-domain --test model -- --include-ignored",
             ],

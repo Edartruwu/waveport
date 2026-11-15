@@ -177,7 +177,7 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-domain --test simulat
 WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay
 ```
 
-**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile and 1,000 of the runtime per story and profile (see below), other ones each night, and the larger sessions of `tests/model.rs`. The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
+**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile, 1,000 of the runtime per story and profile and 20,000 power cuts in the middle of a commit of the journal (see below), other ones each night, and the larger sessions of `tests/model.rs`. The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
 
 **Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps and of rebuilding a session from its journal, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
 
@@ -203,6 +203,14 @@ WAVEPORT_SIM_SEED=12 cargo test --release -p waveport-runtime --test simulation 
 ```
 
 With `-- --nocapture` each test prints what its sessions did, counted: turns, interruptions, tool calls and how they ended, processes that died. A sweep in which something stopped happening passes while it tests nothing, so look at the counts when you change what a profile makes up.
+
+**Journal.** `waveport-store-journal` is held to what every journal is held to (`waveport_testkit::conformance`), and `tests/journal.rs` adds what only a journal in a file can be held to. `tests/power.rs` puts the file on a disk in memory that the test can break: a write or a sync that fails, and the power going at a write that a seed picks, in the middle of a commit, with every write that was not yet synced kept, lost or torn. After each cut the file is opened again, and nothing the journal acknowledged may be gone, a commit has to be there whole or not at all, and the sessions have to go on. An ordinary run makes 60 cuts; when you change how the journal writes, make more once. A release build makes 2,000 in under two minutes:
+
+```sh
+WAVEPORT_SIM_SEEDS=2000 cargo test --release -p waveport-store-journal --test power -- --nocapture
+```
+
+The test prints how often the commit that was cut was found whole and how often not at all. Both have to happen, or it tests nothing: a cut that always lands before the commit proves only that an empty file opens.
 
 **Threads.** A session never leaves its thread, and the listening models run on others. Everything the two sides share is in `src/handoff.rs` of the runtime, and its tests try every way the threads of a small case can take turns, with [loom](https://docs.rs/loom). They are in a build of their own, which the gate `loom` makes:
 

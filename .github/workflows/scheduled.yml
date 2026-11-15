@@ -66,6 +66,27 @@ jobs:
           echo "seeds ${WAVEPORT_SIM_SEEDS}"
           cargo test --release --locked -p waveport-runtime --test simulation
 
+  # The journal's file on a disk that loses its power in the middle of a
+  # commit: 20,000 cuts, other ones every night, each at a write the seed
+  # picks, with what was not yet synced kept, lost or torn. Nothing the
+  # journal acknowledged may be gone afterwards, and no commit may be in
+  # the file by halves. A failure prints its seed, and
+  # `WAVEPORT_SIM_SEED=<seed>` makes that cut alone.
+  power:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: cargo test --release -p waveport-store-journal --test power
+        run: |
+          first=$(( GITHUB_RUN_NUMBER * 20000 ))
+          export WAVEPORT_SIM_SEEDS="${first}..$(( first + 20000 ))"
+          echo "seeds ${WAVEPORT_SIM_SEEDS}"
+          cargo test --release --locked -p waveport-store-journal --test power
+
   # Every path through sessions small enough to try them all, the larger
   # ones included: millions of states, each step checked.
   model-check:
