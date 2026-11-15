@@ -15,6 +15,7 @@ use waveport_domain::time::MonoTime;
 
 use crate::explore::Chooser;
 use crate::failure::{Failure, Verdict};
+use crate::invariants::Monitor;
 use crate::script::Script;
 use crate::setup::{Names, Setup};
 use crate::world::{Arrival, Manner, Ms, Timer, World};
@@ -85,6 +86,8 @@ pub(crate) enum Probe<T> {
 #[derive(Debug)]
 pub struct Sim {
     kernel: Kernel<BoxedPolicies>,
+    /// Checks the kernel's invariants after every step.
+    monitor: Monitor,
     out: Out,
     pub(crate) now: Ms,
     pub(crate) world: World,
@@ -112,6 +115,7 @@ impl Sim {
             Err(fault) => (Kernel::default(), Names::fallback(), Some(fault)),
         };
         let mut sim = Self {
+            monitor: Monitor::new(kernel.view()),
             kernel,
             out: Out::new(),
             now: 0,
@@ -298,6 +302,12 @@ impl Sim {
         let now = MonoTime::from_millis(self.now);
         self.kernel.step(now, event, &mut self.out);
         self.note(&format!("<- {event:?}"));
+        let checked = self
+            .monitor
+            .observe(now, event, &self.out, self.kernel.view());
+        if let Err(violation) = checked {
+            self.world.blame(violation.to_string());
+        }
 
         for index in 0..self.out.facts.len() {
             let Some(stamped) = self.out.facts.get(index).copied() else {

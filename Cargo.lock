@@ -693,6 +693,7 @@ name = "waveport-kernel-sim"
 version = "0.1.0"
 dependencies = [
  "waveport-domain",
+ "waveport-sim",
 ]
 
 [[package]]

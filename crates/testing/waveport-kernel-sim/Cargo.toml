@@ -1,6 +1,6 @@
 [package]
 name = "waveport-kernel-sim"
-description = "Waveport kernel scenarios: a simulated world around the session kernel, explored along every path."
+description = "Waveport kernel scenarios and simulation: a simulated world around the session kernel, with its invariants checked at every step."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +18,7 @@ bench = false
 
 [dependencies]
 waveport-domain = { workspace = true }
+waveport-sim = { workspace = true }
 
 [lints]
 workspace = true
