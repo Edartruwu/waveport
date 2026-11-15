@@ -80,13 +80,21 @@ waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", versi
 waveport-domain = { path = "crates/core/waveport-domain", version = "0.1.0" }
 waveport-kernel-sim = { path = "crates/testing/waveport-kernel-sim", version = "0.1.0" }
 waveport-media = { path = "crates/core/waveport-media", version = "0.1.0" }
+waveport-ports = { path = "crates/core/waveport-ports", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
 
 bytes = "1.12.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 opus = "0.4.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7.1"
 serde = { version = "1.0.229", default-features = false }
 serde_json = { version = "1.0.154", default-features = false }
 sha2 = { version = "0.11.1", default-features = false }
+tokio = { version = "~1.53", default-features = false }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 toml = "1.2.1"
 
 # Benchmark harnesses, used only by the `benches` package.
