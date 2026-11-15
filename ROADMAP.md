@@ -99,12 +99,14 @@ Build, in this order:
 4. `waveport-media`: inbound and outbound audio paths, reorder buffer, pacer, playout ledger, G.711, frame pool (done, with Opus and a resampler among 8, 16, 24 and 48 kHz. Not yet: noise suppression, G.722, and the framing the voice-activity model wants, which comes with the compute plane).
 5. `waveport-ports`: every port trait, the capability types and the session planner (done, with `waveport-adapter-kit`, which holds what adapters share: a stream helper, WebSocket and HTTP clients, server-sent events. Also done: `SessionControl`, the port an application drives running sessions through. Not yet: the speech-to-speech port, the bus, retrieval and dispatch, which later phases need).
 6. `waveport-runtime`: shards, session actor, cascaded driver, compute plane with cross-session batching, supervision and shutdown (done, with the journal's barrier before a tool that has an effect, and a session that goes on from its journal after its process died. Not yet: snapshots, which come with the local journal; threads pinned to cores and the gate on how long a session may run at a time, which come with the performance gates).
-7. Local models: voice-activity detection and Smart Turn v3.2 end-of-turn detection, one instance shared by all sessions.
-8. Provider adapters: speech-to-text for OpenAI, Deepgram and AssemblyAI; one LLM adapter for OpenAI-compatible APIs; text-to-speech for Cartesia and ElevenLabs.
-9. Local-audio and WebSocket transports.
-10. Tools with effect classes and gates (the kernel decides and the runtime runs them, both done; a registry of tools and the first two tools come with the first voice loop).
+7. Local models: voice-activity detection and Smart Turn v3.2 end-of-turn detection, one instance shared by all sessions (done: Silero VAD v6.2.3 and Smart Turn v3.2 on ONNX Runtime, in `waveport-models-onnx`).
+8. Provider adapters: speech-to-text for OpenAI, Deepgram and AssemblyAI; one LLM adapter for OpenAI-compatible APIs; text-to-speech for Cartesia and ElevenLabs (done: OpenAI speech-to-text and the LLM adapter, both held against the provider, and Cartesia, written from its documentation and not yet tried against the provider. Not yet: Deepgram, AssemblyAI and ElevenLabs).
+9. Local-audio and WebSocket transports (done: local audio, on the sound devices of the machine or with a caller who follows a script. Not yet: the WebSocket transport).
+10. Tools with effect classes and gates (done: the kernel decides, the runtime runs them, and a registry holds them. The `waveport` command has the first two: one that tells the time, and one that ends the call once the agent has been heard saying goodbye).
 11. A local journal with snapshots and crash resume.
 12. Traces and metrics.
+
+The `waveport` command puts these together (done: `waveport dev` at the microphone, `waveport run --script` for a call that follows a script, which every test run makes on four platforms against servers that stand in for the providers).
 
 Exit criteria:
 
