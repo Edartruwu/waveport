@@ -18,11 +18,17 @@ bench = false
 
 [dependencies]
 waveport-domain = { workspace = true }
+waveport-ports = { workspace = true }
 waveport-protocol = { workspace = true }
 
 bytes = { workspace = true }
+futures-util = { workspace = true }
+rtrb = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [lints]
 workspace = true

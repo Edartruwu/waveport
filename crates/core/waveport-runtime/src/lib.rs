@@ -8,3 +8,4 @@
 //! sessions. It depends on the domain and the ports, never on an adapter.
 
 pub mod codec;
+pub mod compute;

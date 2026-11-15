@@ -1079,6 +1079,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtrb"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5974e397833d890f2f74963408e0d4a6cd8eda2f6a445ae06750291b5d7a997e"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1825,9 +1831,13 @@ name = "waveport-runtime"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
+ "rtrb",
  "serde",
  "serde_json",
+ "tokio",
  "waveport-domain",
+ "waveport-ports",
  "waveport-protocol",
 ]
 
