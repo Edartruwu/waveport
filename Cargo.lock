@@ -1864,6 +1864,7 @@ dependencies = [
 name = "waveport-adapter-kit"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "futures-util",
  "reqwest",
@@ -1975,11 +1976,26 @@ name = "waveport-sim"
 version = "0.1.0"
 
 [[package]]
+name = "waveport-stt-openai"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
 name = "waveport-testkit"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "tokio",
+ "tokio-tungstenite",
  "waveport-adapter-kit",
  "waveport-alloc-counter",
  "waveport-domain",

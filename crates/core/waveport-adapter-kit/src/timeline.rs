@@ -104,7 +104,16 @@ impl Timeline {
     /// last called covers, for a provider that gives no times: its words
     /// were spoken somewhere in there. `None` when nothing was sent.
     pub fn take_window(&mut self) -> Option<MediaSpan> {
-        let start = self.window.take()?;
+        let window = self.window();
+        self.window = None;
+        window
+    }
+
+    /// The same stretch, left where it is: what words that are not final
+    /// yet were spoken in.
+    #[must_use]
+    pub fn window(&self) -> Option<MediaSpan> {
+        let start = self.window?;
         Some(MediaSpan::new(start, self.end.max(start)))
     }
 }
@@ -167,10 +176,16 @@ mod tests {
         let mut timeline = Timeline::new();
         assert_eq!(timeline.take_window(), None);
         send(&mut timeline, 1_000, 10);
+        // Looking at it leaves it there.
+        assert_eq!(
+            timeline.window(),
+            Some(MediaSpan::new(ms(1_000), ms(1_200)))
+        );
         assert_eq!(
             timeline.take_window(),
             Some(MediaSpan::new(ms(1_000), ms(1_200)))
         );
+        assert_eq!(timeline.window(), None);
         assert_eq!(timeline.take_window(), None);
         send(&mut timeline, 1_200, 5);
         send(&mut timeline, 4_000, 5);

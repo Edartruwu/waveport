@@ -96,6 +96,14 @@ impl<C> Sender<C> {
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
+
+    /// Whether a command sent now would be taken. An adapter asks before
+    /// it goes to the trouble of making a command that costs something to
+    /// make, such as audio written out as text.
+    #[must_use]
+    pub fn has_room(&self) -> bool {
+        !self.tx.is_closed() && self.tx.capacity() > 0
+    }
 }
 
 impl<C> fmt::Debug for Sender<C> {
@@ -336,7 +344,9 @@ mod tests {
         });
         // Nothing runs the loop yet, so the room fills.
         assert_eq!(sender.try_send(1_u8), Ok(()));
+        assert!(sender.has_room());
         assert_eq!(sender.try_send(2), Ok(()));
+        assert!(!sender.has_room());
         assert_eq!(sender.try_send(3), Err(Full));
         // Taking an event runs the loop, which makes room.
         assert_eq!(receiver.next().await, Some(Ok(1)));
@@ -407,6 +417,7 @@ mod tests {
         assert!(closed.load(Ordering::SeqCst), "the connection is closed");
         // What is sent now goes nowhere, and the sender knows.
         assert!(sender.is_closed());
+        assert!(!sender.has_room());
         assert_eq!(sender.try_send(2), Err(Full));
     }
 

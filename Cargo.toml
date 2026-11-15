@@ -90,6 +90,7 @@ waveport-protocol = { path = "crates/core/waveport-protocol", version = "0.1.0" 
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
 waveport-testkit = { path = "crates/testing/waveport-testkit", version = "0.1.0" }
 
+base64 = "0.23.1"
 bytes = "1.12.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 loom = { version = "0.7.3", features = ["futures"] }

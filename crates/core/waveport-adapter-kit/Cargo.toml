@@ -20,6 +20,7 @@ bench = false
 waveport-domain = { workspace = true }
 waveport-ports = { workspace = true }
 
+base64 = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }

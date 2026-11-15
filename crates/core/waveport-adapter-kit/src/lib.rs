@@ -14,7 +14,9 @@
 //!   ([`retry`]).
 //! - [`sse`] reads the event streams language models answer with.
 //! - [`timeline`] turns a speech recogniser's times into the session's.
-//! - [`pcm`] puts samples together from audio that arrives cut anywhere.
+//! - [`pcm`] puts samples together from audio that arrives cut anywhere,
+//!   and reads and writes audio that travels as text.
+//! - [`wav`] reads and writes the files audio is kept in.
 //! - [`secret`] keeps keys out of logs.
 
 pub mod http;
@@ -25,4 +27,5 @@ pub mod sse;
 pub mod stream;
 pub mod timeline;
 pub mod tls;
+pub mod wav;
 pub mod ws;
