@@ -191,7 +191,7 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-media --test network
 
 **Session simulation.** `tests/simulation/` makes sessions up from seeds and runs them on the real session actor, with the kernel's monitor on every step. A seed decides who calls and what they say, how late every part answers, what the line does to the packets, which parts fail, what the application asks, and at which records of its journal the process dies. `stories` tells the six kernel scenarios again, and `sweeps` makes up sessions nobody wrote under four profiles (calm, chaos, crashes, shutdown). Beyond the invariants, `world.rs` checks every run on what the far end was sent, that nothing is in the conversation that the far end did not play, that no tool with an effect was called early or twice, and that a session rebuilt from the journal is the session that wrote it. A new rule about what a session may do to the world goes there.
 
-An ordinary run has ten sessions per test. When you change the session, run more once; a release build does 10,000 in about two minutes. A failure prints its seed, and that seed alone prints every step of its session:
+An ordinary run has 25 sessions per test. When you change the session, run more once; a release build does 10,000 in about two minutes. A failure prints its seed, and that seed alone prints every step of its session:
 
 ```sh
 WAVEPORT_SIM_SEEDS=1000 cargo test --release -p waveport-runtime --test simulation

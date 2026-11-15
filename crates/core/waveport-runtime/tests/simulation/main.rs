@@ -33,8 +33,9 @@ use waveport_sim::{Seed, SeedPlan};
 use self::world::{Broken, Outcome, Plan, Tally, run};
 
 /// How many seeds each story and each sweep is run under in an ordinary
-/// test run. Ten of them a night are run under a thousand each.
-const SEEDS: u64 = 10;
+/// test run. Every night each is run under a thousand, and other ones
+/// each night.
+const SEEDS: u64 = 25;
 
 /// Runs `story` under each of `seeds` seeds, or under those the
 /// environment asks for, and adds up what the runs did. `check` looks at
