@@ -34,7 +34,9 @@ pub(crate) struct Mind {
     pub paused: bool,
     /// The tools it was offered.
     offered: Vec<ToolId>,
-    /// Whether nothing of it has arrived yet.
+    /// Whether the model has written nothing of it yet: no text, and no
+    /// request for a tool. A response that ends or fails before it has
+    /// written anything stays silent.
     pub silent: bool,
 }
 
@@ -103,10 +105,13 @@ impl Mind {
             && let State::Writing(rx) = &mut self.state
             && let Poll::Ready(next) = rx.as_mut().poll_next(cx)
         {
-            self.silent = false;
             let event = match next {
-                Some(Ok(LlmEvent::Delta { text })) => OpEvent::LlmDelta { text: text.into() },
+                Some(Ok(LlmEvent::Delta { text })) => {
+                    self.silent = false;
+                    OpEvent::LlmDelta { text: text.into() }
+                }
                 Some(Ok(LlmEvent::ToolCall { tool, args })) => {
+                    self.silent = false;
                     // Only a tool that was offered can be asked for.
                     let asked = defs
                         .tools

@@ -38,7 +38,8 @@ pub enum Stage {
     TranscriptFinal(TurnId),
     /// It was decided that a turn has ended.
     TurnEnded(TurnId),
-    /// The model wrote the first text of a response.
+    /// The model wrote the first of a response: text, or a request for
+    /// a tool.
     FirstToken(GenId),
     /// Speech synthesis delivered the first audio of a response.
     FirstAudio(GenId),

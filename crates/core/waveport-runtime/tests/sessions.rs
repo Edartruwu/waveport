@@ -18,17 +18,19 @@ use tokio::time::Instant;
 use waveport_domain::command::{Activity, ClientEvent, Command};
 use waveport_domain::config::{AgentSpec, Effect, KernelConfig, ToolSpec};
 use waveport_domain::event::Event;
-use waveport_domain::fact::Lifecycle;
-use waveport_domain::ids::{ParticipantId, Seq, ToolId};
+use waveport_domain::fact::{Lifecycle, Stamped};
+use waveport_domain::ids::{GenId, ParticipantId, Seq, ToolId, TurnId};
 use waveport_domain::kernel::{ItemView, View};
 use waveport_domain::out::Out;
 use waveport_domain::policy::DefaultPolicies;
+use waveport_domain::text::TextArena;
 use waveport_domain::time::{MediaDur, MonoTime};
 use waveport_ports::audio::{Codec, Law, PcmBytes, Rate};
 use waveport_ports::error::PortError;
 use waveport_ports::journal::{Journal, SessionId};
 use waveport_ports::plan::{Marks, Shortfall};
 use waveport_ports::stt::{SttFinalize, SttTiming};
+use waveport_ports::telemetry::{EventSink, Stage, StageMark};
 use waveport_ports::tool::ToolReply;
 use waveport_ports::transport::{RemoteBuffer, TransportCaps};
 use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
@@ -93,6 +95,30 @@ struct World {
     tools: ScriptedTools,
     journal: MemoryJournal,
     compute: Arc<Compute>,
+    sink: Option<Arc<Recorder>>,
+}
+
+/// A sink that keeps what it is told.
+#[derive(Debug, Default)]
+struct Recorder {
+    /// The number of every fact, in the order they came.
+    facts: Mutex<Vec<u64>>,
+    /// Every part of a turn that was reached, and when in milliseconds.
+    stages: Mutex<Vec<(u64, Stage)>>,
+}
+
+impl EventSink for Recorder {
+    fn facts(&self, session: SessionId, _: MonoTime, facts: &[Stamped], _: &TextArena) {
+        assert_eq!(session, SESSION);
+        let numbers = facts.iter().map(|stamped| stamped.seq.get());
+        self.facts.lock().unwrap().extend(numbers);
+    }
+
+    fn stage(&self, session: SessionId, mark: StageMark) {
+        assert_eq!(session, SESSION);
+        let ms = mark.at.as_nanos() / 1_000_000;
+        self.stages.lock().unwrap().push((ms, mark.stage));
+    }
 }
 
 impl World {
@@ -111,6 +137,7 @@ impl World {
             tools: ScriptedTools::with(|_| ToolReply::Completed("09:15".to_owned())),
             journal: MemoryJournal::new(),
             compute: Arc::new(Compute::inline(LoudVad::default(), turns, None).unwrap()),
+            sink: None,
         }
     }
 
@@ -123,7 +150,7 @@ impl World {
             tools: Arc::new(self.tools.clone()),
             journal: Arc::new(self.journal.clone()),
             compute: Arc::clone(&self.compute),
-            sink: None,
+            sink: self.sink.clone().map(|sink| -> Arc<dyn EventSink> { sink }),
         }
     }
 }
@@ -507,6 +534,98 @@ async fn a_tool_call_is_run_and_its_result_is_spoken() {
     assert_eq!(running.utterances(), [("It is 09:15.".to_owned(), false)]);
     let log = running.far_end.log();
     assert_eq!(log.heard(log.frames[0].tag), MediaDur::from_millis(12 * 60));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sink_is_told_every_fact_and_when_each_part_of_a_turn_was_reached() {
+    let speech = [(1_000, 2_200, "what time is it")];
+    let mut world = World::new(&speech, calls_a_tool());
+    let recorder = Arc::new(Recorder::default());
+    world.sink = Some(Arc::clone(&recorder));
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 8_000, &talks(&speech));
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(8_000).await, None);
+
+    // Every fact, once and in order: the numbers the journal has.
+    let stored = u64::try_from(world.journal.records(SESSION).len()).unwrap();
+    assert!(stored > 5, "{stored}");
+    let facts = recorder.facts.lock().unwrap().clone();
+    assert_eq!(facts, (1..=stored).collect::<Vec<u64>>());
+
+    // The parts of the turn, in the order they were reached. The model
+    // asked for the time before it said anything, so its first response
+    // was never heard, and the second was.
+    let stages = recorder.stages.lock().unwrap().clone();
+    let called = world.tools.called();
+    let call = called[0].call;
+    let log = running.far_end.log();
+    let (first, second) = (GenId(1), GenId(2));
+    assert_eq!(log.frames[0].tag.generation, second);
+    let reached: Vec<Stage> = stages.iter().map(|(_, stage)| *stage).collect();
+    assert_eq!(
+        reached,
+        [
+            Stage::TranscriptFinal(TurnId(1)),
+            Stage::TurnEnded(TurnId(1)),
+            Stage::FirstToken(first),
+            Stage::ToolSent(call),
+            Stage::ToolBack(call),
+            Stage::FirstToken(second),
+            Stage::FirstAudio(second),
+            Stage::FirstFrameOut(second),
+        ]
+    );
+    // Each at the moment it happened: the caller stopped speaking at
+    // 2,200 ms, and the first frame of the answer went out when the far
+    // end says it came.
+    let times: Vec<u64> = stages.iter().map(|(at, _)| *at).collect();
+    assert!(times.is_sorted(), "{times:?}");
+    assert!((2_200..2_700).contains(&times[0]), "{times:?}");
+    assert_eq!(times[7], ms(&log.frames[0]));
+    // What the caller waited for the answer, and where it went: 200 ms
+    // for each response to begin, 150 ms for the tool, 120 ms for the
+    // synthesiser.
+    assert_eq!(times[2] - times[1], 200);
+    assert_eq!(times[4] - times[3], 150);
+    assert_eq!(times[5] - times[4], 200);
+    assert_eq!(times[6] - times[5], 120);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sink_is_told_when_the_agent_was_lowered_and_stopped() {
+    let speech = [
+        (1_000, 2_200, "tell me a story"),
+        (5_000, 5_800, "stop please"),
+    ];
+    let llm = ScriptedLlm::replies(vec![
+        vec![LlmStep::say(STORY)],
+        vec![LlmStep::say("All right.")],
+    ]);
+    let mut world = World::new(&speech, llm);
+    let recorder = Arc::new(Recorder::default());
+    world.sink = Some(Arc::clone(&recorder));
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 12_000, &talks(&speech));
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(12_000).await, None);
+
+    // The marks are made at the commands they are about.
+    let stages = recorder.stages.lock().unwrap().clone();
+    let at = |wanted: Stage| {
+        let found = stages.iter().find(|(_, stage)| *stage == wanted);
+        found.map(|(at, _)| *at)
+    };
+    let story = GenId(1);
+    assert_eq!(at(Stage::Lowered(story)), running.watch.first("Duck"));
+    assert_eq!(at(Stage::Stopped(story)), running.watch.first("Stop"));
+    assert!(at(Stage::Lowered(story)) < at(Stage::Stopped(story)));
+    // The answer to the interruption has marks of its own.
+    assert!(at(Stage::FirstFrameOut(GenId(2))) > at(Stage::Stopped(story)));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1041,6 +1160,7 @@ impl World {
             tools: self.tools.clone(),
             journal: self.journal.clone(),
             compute: Arc::new(Compute::inline(LoudVad::default(), turns, None).unwrap()),
+            sink: self.sink.clone(),
         }
     }
 }
