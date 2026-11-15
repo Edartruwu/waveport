@@ -218,7 +218,7 @@ fn asks_again(folder: &Path) -> PathBuf {
     std::fs::write(
         &script,
         "# A caller who was cut off, and asks again.\n\
-         listen 800 6000\n\
+         listen 800 12000\n\
          say question.wav\n\
          listen 1500 40000\n",
     )
