@@ -25,6 +25,7 @@ opus = { workspace = true }
 
 [dev-dependencies]
 waveport-alloc-counter = { workspace = true }
+waveport-sim = { workspace = true }
 
 [lints]
 workspace = true

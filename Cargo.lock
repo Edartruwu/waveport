@@ -732,6 +732,7 @@ dependencies = [
  "opus",
  "waveport-alloc-counter",
  "waveport-domain",
+ "waveport-sim",
 ]
 
 [[package]]
