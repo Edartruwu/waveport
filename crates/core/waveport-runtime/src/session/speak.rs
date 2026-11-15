@@ -12,6 +12,7 @@
 //! dropped is cancelled.
 
 use core::task::{Context, Poll};
+use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -30,6 +31,13 @@ use waveport_ports::tts::{Tts, TtsConfig, TtsEvent, TtsStream};
 
 type Opening = BoxFuture<'static, Result<TtsStream, PortError>>;
 
+/// How long a synthesiser that marks its words may give nothing, after it
+/// has given audio for the text it has, before that text is taken to have
+/// been spoken although its last word was never marked. A synthesiser
+/// that names a word otherwise than it was written leaves it unmarked,
+/// and the rest of the response would wait for that mark for ever.
+const QUIET: Duration = Duration::from_millis(400);
+
 enum Stream {
     Opening(Opening),
     Open(TtsStream),
@@ -37,6 +45,10 @@ enum Stream {
 }
 
 /// The synthesis of one response.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four things that have each happened or not, in no fixed order"
+)]
 struct Speaking {
     tag: OpTag,
     stream: Stream,
@@ -50,8 +62,19 @@ struct Speaking {
     text: u32,
     /// Bytes of text the stream has been given.
     sent: u32,
+    /// Bytes of text the stream has been given, up to the end of the last
+    /// word among them: the last letter or digit. A mark for a word can
+    /// reach this far and no further, because the space or the full stop
+    /// after the last word has no mark of its own.
+    worded: u32,
     /// Bytes of text the audio so far is known to reach.
     marked: u32,
+    /// Bytes of text the kernel was last told have audio.
+    counted: u32,
+    /// When the stream last gave anything.
+    heard_at: MonoTime,
+    /// Whether the stream has said that it has given everything.
+    ended: bool,
     /// Bytes of text the stream is taken to have begun on: what it had
     /// been given when audio last arrived. For a synthesiser that says
     /// nothing of where its words are, this is all that is known of how
@@ -91,6 +114,14 @@ impl Speaking {
                 break;
             }
             let length = u32::try_from(text.len()).unwrap_or(u32::MAX);
+            let last_word = text
+                .char_indices()
+                .rev()
+                .find(|(_, character)| character.is_alphanumeric());
+            if let Some((at, character)) = last_word {
+                let end = u32::try_from(at + character.len_utf8()).unwrap_or(u32::MAX);
+                self.worded = self.sent.saturating_add(end);
+            }
             self.sent = self.sent.saturating_add(length);
             self.unsent.pop_front();
         }
@@ -98,6 +129,38 @@ impl Speaking {
             self.finish_sent = stream.tx.try_finish().is_ok();
         }
         changed
+    }
+
+    /// How much of the text has audio that has arrived, as far as can be
+    /// told at `now`. The kernel holds the rest of a response back until
+    /// this has reached what it released, so this must not stay short of
+    /// the truth for good.
+    fn reached(&self, marks: Marks, now: MonoTime) -> u32 {
+        match marks {
+            // A synthesiser that gives no times does not say where it is
+            // before it has finished, so its text counts from when audio
+            // follows it: otherwise the kernel would wait for an end that
+            // it has to send the rest of the text to bring about.
+            Marks::Spread => self.marked.max(self.begun),
+            // The last word that was given has been marked: so has what
+            // follows it, which is nothing that is spoken.
+            Marks::Timed if self.marked >= self.worded => self.marked.max(self.sent),
+            // Audio followed the text, and then nothing did for a while:
+            // the synthesiser has no more to give for it.
+            Marks::Timed if self.stalled_at().is_some_and(|at| at <= now) => self.sent,
+            Marks::Timed => self.marked,
+        }
+    }
+
+    /// When a stream that marks its words is taken to have spoken what
+    /// it was given although the last word is not marked, if that is what
+    /// is being waited for.
+    fn stalled_at(&self) -> Option<MonoTime> {
+        let waiting = !self.ended
+            && self.marked < self.worded
+            && self.begun >= self.sent
+            && self.counted < self.sent;
+        waiting.then(|| self.heard_at.after(QUIET))
     }
 }
 
@@ -184,7 +247,14 @@ impl Voice {
     /// When the outbound path is to be looked at again if nothing wakes
     /// the session before.
     pub(crate) fn deadline(&self) -> Option<MonoTime> {
-        self.playout.wake()
+        let stalled = match (&self.speaking, self.plan.marks) {
+            (Some(speaking), Marks::Timed) => speaking.stalled_at(),
+            _ => None,
+        };
+        match (self.playout.wake(), stalled) {
+            (Some(wake), Some(stalled)) => Some(wake.min(stalled)),
+            (wake, stalled) => wake.or(stalled),
+        }
     }
 
     /// How far playback has got, if that has changed since the kernel was
@@ -228,7 +298,11 @@ impl Voice {
                 finish_sent: false,
                 text: 0,
                 sent: 0,
+                worded: 0,
                 marked: 0,
+                counted: 0,
+                heard_at: MonoTime::ZERO,
+                ended: false,
                 begun: 0,
                 audio: 0,
                 held: None,
@@ -317,9 +391,9 @@ impl Voice {
         let tag = speaking.tag;
         let rate = self.plan.rate;
         let mut changed = speaking.send_text(cx, events);
-        let Stream::Open(stream) = &mut speaking.stream else {
+        if !matches!(speaking.stream, Stream::Open(_)) {
             return changed;
-        };
+        }
 
         loop {
             let taken = hand_on(
@@ -330,18 +404,14 @@ impl Voice {
                 &mut self.scratch,
             );
             if taken > 0 {
-                changed = true;
                 speaking.audio += taken;
-                // The kernel holds text back until the audio of what it
-                // released has arrived. A synthesiser that gives no times
-                // does not say when that is before it has finished, so
-                // its text counts from when audio follows it: otherwise
-                // the kernel would wait for an end that it has to send
-                // the rest of the text to bring about.
-                let text_end = match self.plan.marks {
-                    Marks::Timed => speaking.marked,
-                    Marks::Spread => speaking.marked.max(speaking.begun),
-                };
+            }
+            // The kernel is told of audio that was taken, and of text
+            // that is now known to have its audio.
+            let text_end = speaking.reached(self.plan.marks, now);
+            if !speaking.ended && (taken > 0 || text_end > speaking.counted) {
+                changed = true;
+                speaking.counted = speaking.counted.max(text_end);
                 let segment = OpEvent::TtsSegment {
                     text_end,
                     audio_end: rate.length_of(speaking.audio),
@@ -352,11 +422,15 @@ impl Voice {
             if speaking.held.is_some() {
                 return changed;
             }
+            let Stream::Open(stream) = &mut speaking.stream else {
+                return changed;
+            };
             match stream.rx.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(TtsEvent::Audio(pcm)))) => {
                     if core::mem::take(&mut speaking.silent) {
                         milestone(Milestone::FirstAudio(tag));
                     }
+                    speaking.heard_at = now;
                     speaking.begun = speaking.sent;
                     speaking.held = Some((pcm, 0));
                 }
@@ -371,9 +445,11 @@ impl Voice {
                         spread,
                     };
                     let _ = self.playout.mark(tag, mark);
+                    speaking.heard_at = now;
                     speaking.marked = mark.text;
                 }
                 Poll::Ready(Some(Ok(TtsEvent::Done))) => {
+                    speaking.ended = true;
                     let audio = rate.length_of(speaking.audio);
                     if speaking.marked < speaking.text {
                         // The synthesiser said nothing about where the

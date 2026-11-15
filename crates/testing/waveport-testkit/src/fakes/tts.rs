@@ -28,6 +28,15 @@ pub struct TtsScript {
     pub per_char: MediaDur,
     /// How much audio it gives at a time.
     pub chunk: MediaDur,
+    /// Whether a word is marked where the word itself ends, as a provider
+    /// marks it, and not where the white space after it ends. The white
+    /// space after the last word of a piece then has no mark at all until
+    /// the stream has finished.
+    pub bare_words: bool,
+    /// With [`bare_words`](Self::bare_words): a word that has this in it
+    /// gets no mark, as a word does that the provider names otherwise
+    /// than it was written.
+    pub unmarked: Option<String>,
     /// Opening a stream fails with this.
     pub fail_open: Option<PortError>,
     /// After this many pieces of audio a stream fails with this.
@@ -46,6 +55,8 @@ impl Default for TtsScript {
             speed: 4,
             per_char: MediaDur::from_millis(60),
             chunk: MediaDur::from_millis(100),
+            bare_words: false,
+            unmarked: None,
             fail_open: None,
             fail_after: None,
         }
@@ -196,21 +207,46 @@ impl Voice {
         let mut samples = 0;
         let mut bytes = 0_u32;
         let mut in_word = false;
+        let bare = self.script.bare_words && self.script.caps.alignment == Alignment::Word;
+        // Where the word in hand begins and ends, as far as it has been
+        // read.
+        let mut word_start = 0;
+        let mut word_end = (0, 0);
+        let marked = |from: u32, to: u32| {
+            let word = text.get(from as usize..to as usize).unwrap_or_default();
+            let skipped = self.script.unmarked.as_deref();
+            !skipped.is_some_and(|skipped| word.contains(skipped))
+        };
         for character in text.chars() {
+            let ends_word = in_word && character.is_whitespace();
+            if bare && ends_word && marked(word_start, word_end.0) {
+                marks.push(word_end);
+            }
+            if !in_word && !character.is_whitespace() {
+                word_start = bytes;
+            }
             samples += per_char;
             bytes += u32::try_from(character.len_utf8()).unwrap_or(0);
-            let ends_word = in_word && character.is_whitespace();
             in_word = !character.is_whitespace();
+            if in_word {
+                word_end = (bytes, samples);
+            }
             match self.script.caps.alignment {
                 Alignment::Char => marks.push((bytes, samples)),
                 // A word is marked where the white space after it ends.
-                Alignment::Word if ends_word => marks.push((bytes, samples)),
+                Alignment::Word if ends_word && !bare => marks.push((bytes, samples)),
                 _ => {}
             }
         }
         let whole = self.script.caps.input == TtsInput::Whole;
         let last_is_marked = marks.last().is_some_and(|(at, _)| *at == bytes);
-        if !last_is_marked && (self.script.caps.alignment != Alignment::None || whole) {
+        if bare {
+            // The last word, if the piece ends in one. What follows it is
+            // left unmarked.
+            if in_word && marked(word_start, word_end.0) {
+                marks.push(word_end);
+            }
+        } else if !last_is_marked && (self.script.caps.alignment != Alignment::None || whole) {
             // The end of the piece: its last word, or all that is known
             // of a piece that is spoken on its own.
             marks.push((bytes, samples));
