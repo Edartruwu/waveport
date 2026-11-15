@@ -1,5 +1,6 @@
 //! What the command is told on its command line.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -12,6 +13,14 @@ pub(crate) const LLM_URL: &str = "https://api.openai.com/v1";
 
 /// Where Cartesia synthesises speech.
 pub(crate) const TTS_URL: &str = "wss://api.cartesia.ai/tts/websocket";
+
+/// Where calls are taken over a WebSocket unless told otherwise: on this
+/// machine alone.
+pub(crate) const LISTEN: &str = "127.0.0.1:9283";
+
+/// Where a client finds an agent that was told nothing about where to
+/// take calls.
+pub(crate) const CALLS: &str = "ws://127.0.0.1:9283";
 
 /// What an agent is told when it is told nothing else.
 pub(crate) const INSTRUCTIONS: &str = "You are a friendly assistant on a voice call. What you \
@@ -48,6 +57,17 @@ pub(crate) enum Command {
     /// out, the caller hangs up.
     #[command(verbatim_doc_comment)]
     Run(Run),
+    /// Take calls over a WebSocket, each from a `waveport client`.
+    ///
+    /// The agent runs here and whoever calls it is somewhere else: in
+    /// another terminal, or on another machine if --exposed says that it
+    /// may be. Nothing asks a caller who they are.
+    Serve(Serve),
+    /// Call an agent that `waveport serve` runs.
+    ///
+    /// The caller is whoever sits at this machine, at its microphone and
+    /// loudspeaker, or follows a script as with `waveport run`.
+    Client(Client),
     /// List the sound devices of this machine.
     Devices,
 }
@@ -77,6 +97,49 @@ pub(crate) struct Run {
     pub script: PathBuf,
     /// Where to write what the caller was played, as a WAV file.
     #[arg(long, value_name = "FILE")]
+    pub record: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct Serve {
+    #[command(flatten)]
+    pub agent: Agent,
+    /// The address calls are taken at. Port 0 is any port that is free.
+    #[arg(long, value_name = "ADDRESS", default_value = LISTEN)]
+    pub listen: SocketAddr,
+    /// Take calls at an address that other machines can reach.
+    #[arg(long)]
+    pub exposed: bool,
+    /// Stop once this many calls have been taken and have ended.
+    #[arg(long, value_name = "NUMBER")]
+    pub calls: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct Client {
+    /// Where the agent takes calls.
+    #[arg(long, value_name = "URL", default_value = CALLS)]
+    pub url: String,
+    /// The microphone, as `waveport devices` names it.
+    #[arg(long, value_name = "ID")]
+    pub microphone: Option<String>,
+    /// The loudspeaker, as `waveport devices` names it.
+    #[arg(long, value_name = "ID")]
+    pub loudspeaker: Option<String>,
+    /// Make the microphone deaf while the agent speaks, for a machine
+    /// with no headphones. The agent can then not be spoken over.
+    #[arg(long)]
+    pub half_duplex: bool,
+    /// A script for the caller to follow, in place of the microphone and
+    /// the loudspeaker. `waveport run --help` says how one is written.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["microphone", "loudspeaker", "half_duplex"]
+    )]
+    pub script: Option<PathBuf>,
+    /// Where to write what the caller was played, as a WAV file.
+    #[arg(long, value_name = "FILE", requires = "script")]
     pub record: Option<PathBuf>,
 }
 
@@ -185,6 +248,34 @@ mod tests {
         };
         assert_eq!(run.script.to_str(), Some("calls/time.call"));
         assert_eq!(run.agent.llm_url, "http://127.0.0.1:9/v1");
+    }
+
+    #[test]
+    fn calls_over_a_websocket_stay_on_this_machine_unless_told() {
+        let cli = Cli::try_parse_from(["waveport", "serve"]).unwrap();
+        let Command::Serve(serve) = cli.command else {
+            panic!("serve is serve");
+        };
+        assert!(serve.listen.ip().is_loopback() && !serve.exposed);
+        assert_eq!(serve.calls, None);
+        let cli = Cli::try_parse_from(["waveport", "client"]).unwrap();
+        let Command::Client(client) = cli.command else {
+            panic!("client is client");
+        };
+        // A client finds a server that was told nothing, having been told
+        // nothing itself.
+        assert_eq!(client.url, format!("ws://{}", serve.listen));
+        assert!(client.script.is_none());
+
+        // A caller is at the devices or follows a script, not both, and
+        // only a scripted one is recorded.
+        let both = ["waveport", "client", "--script", "a.call", "--half-duplex"];
+        assert!(Cli::try_parse_from(both).is_err());
+        assert!(Cli::try_parse_from(["waveport", "client", "--record", "a.wav"]).is_err());
+        let scripted = [
+            "waveport", "client", "--script", "a.call", "--record", "a.wav",
+        ];
+        assert!(Cli::try_parse_from(scripted).is_ok());
     }
 
     #[test]

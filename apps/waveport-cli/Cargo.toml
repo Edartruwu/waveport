@@ -28,6 +28,7 @@ waveport-runtime = { workspace = true }
 waveport-store-memory = { workspace = true }
 waveport-stt-openai = { workspace = true }
 waveport-transport-local-audio = { workspace = true }
+waveport-transport-websocket = { workspace = true }
 waveport-tts-cartesia = { workspace = true }
 
 clap = { workspace = true, features = ["derive", "env", "error-context", "help", "std", "suggestions", "usage"] }

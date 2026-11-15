@@ -2407,6 +2407,7 @@ dependencies = [
  "waveport-stt-openai",
  "waveport-testkit",
  "waveport-transport-local-audio",
+ "waveport-transport-websocket",
  "waveport-tts-cartesia",
 ]
 

@@ -8,7 +8,6 @@ use core::fmt::Write as _;
 use core::time::Duration;
 use std::sync::{Mutex, PoisonError};
 
-use tokio::sync::mpsc::UnboundedSender;
 use waveport_domain::event::CloseReason;
 use waveport_domain::fact::{Fact, Lifecycle, Stamped, ToolOutcome};
 use waveport_domain::ids::{GenId, ToolCallId, ToolId};
@@ -33,28 +32,38 @@ struct Notes {
     reason: Option<CloseReason>,
 }
 
+/// Where the lines of a call go. It is called on the session's own
+/// thread, and must not keep it waiting.
+pub(crate) type Tell = Box<dyn Fn(String) + Send + Sync>;
+
 /// Tells a call line by line.
-#[derive(Debug)]
 pub(crate) struct Reporter {
-    lines: UnboundedSender<String>,
+    tell: Tell,
     /// What the tools are called, in the kernel's order.
     tools: Vec<String>,
     notes: Mutex<Notes>,
 }
 
+impl core::fmt::Debug for Reporter {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Reporter")
+            .field("tools", &self.tools)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Reporter {
-    /// A reporter that puts its lines in `lines`.
-    pub(crate) fn new(lines: UnboundedSender<String>, tools: Vec<String>) -> Self {
+    /// A reporter that gives its lines to `tell`.
+    pub(crate) fn new(tell: Tell, tools: Vec<String>) -> Self {
         Self {
-            lines,
+            tell,
             tools,
             notes: Mutex::default(),
         }
     }
 
     fn say(&self, line: String) {
-        // Nobody reads any more when the command is on its way out.
-        let _ = self.lines.send(line);
+        (self.tell)(line);
     }
 
     fn line(&self, notes: &mut Notes, fact: &Fact, text: &TextArena) -> Option<String> {
@@ -173,7 +182,10 @@ mod tests {
     fn reporter() -> (Reporter, UnboundedReceiver<String>) {
         let (lines, printed) = unbounded_channel();
         let tools = vec!["get_time".to_owned(), "end_call".to_owned()];
-        (Reporter::new(lines, tools), printed)
+        let tell = Box::new(move |line| {
+            let _ = lines.send(line);
+        });
+        (Reporter::new(tell, tools), printed)
     }
 
     /// Tells the reporter one fact, made with the text it is about.

@@ -554,6 +554,13 @@ impl Far {
         };
         match end {
             End::Closed => {
+                // What was told of the call before it ended is said
+                // before the goodbye, and the last of it is how it ended.
+                while lines_open && let Ok(text) = lines.try_recv() {
+                    if self.say(&FromServer::Event { text }).await.is_err() {
+                        break;
+                    }
+                }
                 let bye = FromServer::Bye {
                     reason: "the call is over".to_owned(),
                 };
