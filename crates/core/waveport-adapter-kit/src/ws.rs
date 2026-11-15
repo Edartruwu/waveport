@@ -1,9 +1,13 @@
-//! WebSocket connections to providers.
+//! WebSocket connections.
 //!
 //! Most streaming providers speak JSON and audio over a WebSocket. This
 //! is the client for them: it connects with a time limit, checks the
 //! certificate, answers pings, and hands every failure over as a
 //! [`PortError`] whose class says whether trying again can help.
+//!
+//! A transport is on the other side of such a connection: its far end
+//! connects to it. [`WsConn::accept`] takes a connection that was made
+//! to a listener on this machine, and what follows is the same.
 
 use core::fmt;
 use core::pin::Pin;
@@ -21,8 +25,10 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, Utf8Bytes};
 use waveport_ports::error::PortError;
 
@@ -54,6 +60,23 @@ impl<'a> WsRequest<'a> {
             timeout: CONNECT_TIMEOUT,
         }
     }
+}
+
+/// The largest message a connection that was accepted takes: audio comes
+/// a fraction of a second at a time, and nothing else is long.
+const ACCEPTED_MESSAGE_AT_MOST: usize = 1 << 20;
+
+/// The header a client names the protocols it speaks in, and a server the
+/// one it chose.
+const PROTOCOL_HEADER: &str = "sec-websocket-protocol";
+
+/// What a client asked for as it connected.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WsAsked {
+    /// The path it asked for, such as `/v0/session`.
+    pub path: String,
+    /// What followed the path after a `?`, if anything did.
+    pub query: Option<String>,
 }
 
 /// A message of a connection.
@@ -129,7 +152,8 @@ impl AsyncWrite for Io {
     }
 }
 
-/// A WebSocket connection to a provider.
+/// A WebSocket connection: to a provider, or from whoever connected to
+/// a listener on this machine.
 pub struct WsConn {
     stream: WebSocketStream<Io>,
 }
@@ -216,6 +240,76 @@ impl WsConn {
         Ok(Self { stream })
     }
 
+    /// Takes a connection that was made to a listener on this machine:
+    /// reads the request and answers it.
+    ///
+    /// `protocol` is the one protocol spoken here. A client that does not
+    /// name it among the ones it speaks is refused, and so is one that
+    /// asks for a path other than `path`.
+    ///
+    /// # Errors
+    ///
+    /// What arrived was no WebSocket request, was refused, or took longer
+    /// than `timeout`.
+    pub async fn accept(
+        tcp: TcpStream,
+        path: &str,
+        protocol: &str,
+        timeout: Duration,
+    ) -> Result<(Self, WsAsked), PortError> {
+        let _ = tcp.set_nodelay(true);
+        let mut asked = WsAsked::default();
+        #[expect(
+            clippy::result_large_err,
+            reason = "the type of the callback is the library's"
+        )]
+        let check = |request: &Request, mut response: Response| {
+            let uri = request.uri();
+            uri.path().clone_into(&mut asked.path);
+            asked.query = uri.query().map(str::to_owned);
+            if uri.path() != path {
+                return Err(refusal(StatusCode::NOT_FOUND, "nothing is served here"));
+            }
+            let offered = request
+                .headers()
+                .get_all(PROTOCOL_HEADER)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .any(|offer| offer.trim() == protocol);
+            if !offered {
+                return Err(refusal(
+                    StatusCode::BAD_REQUEST,
+                    &format!("the protocol spoken here is {protocol}"),
+                ));
+            }
+            if let Ok(chosen) = HeaderValue::from_str(protocol) {
+                response.headers_mut().insert(PROTOCOL_HEADER, chosen);
+            }
+            Ok(response)
+        };
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(ACCEPTED_MESSAGE_AT_MOST))
+            .max_frame_size(Some(ACCEPTED_MESSAGE_AT_MOST));
+        let accepting =
+            tokio_tungstenite::accept_hdr_async_with_config(Io::Plain(tcp), check, Some(config));
+        let stream = match tokio::time::timeout(timeout, accepting).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                return Err(PortError::permanent(format!(
+                    "a connection was not taken: {error}"
+                )));
+            }
+            Err(_) => {
+                return Err(PortError::timeout(format!(
+                    "a connection did not say what it wanted within {} ms",
+                    timeout.as_millis()
+                )));
+            }
+        };
+        Ok((Self { stream }, asked))
+    }
+
     /// Sends text.
     ///
     /// # Errors
@@ -293,6 +387,24 @@ impl WsConn {
     pub async fn close(mut self) {
         let _ = self.stream.close(None).await;
     }
+
+    /// Closes the connection with a complaint: a code of the protocol,
+    /// such as 1008 for something that is not allowed, and a few words.
+    pub async fn close_with(mut self, code: u16, reason: &str) {
+        let reason: String = reason.chars().take(100).collect();
+        let frame = CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.into(),
+        };
+        let _ = self.stream.close(Some(frame)).await;
+    }
+}
+
+/// The answer to a request that is not taken.
+fn refusal(status: StatusCode, why: &str) -> ErrorResponse {
+    let mut response = ErrorResponse::new(Some(why.to_owned()));
+    *response.status_mut() = status;
+    response
 }
 
 /// A failure of TLS while connecting. A certificate that does not check
@@ -429,6 +541,116 @@ mod tests {
         );
         conn.ping().await.unwrap();
         conn.close().await;
+    }
+
+    /// A listener on this machine, and the address a client reaches it
+    /// at.
+    async fn listener() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        (listener, format!("ws://{address}"))
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_is_accepted_speaks_as_one_that_was_made() {
+        let (listener, url) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (mut conn, asked) =
+                WsConn::accept(tcp, "/v0/session", "talk.v0", Duration::from_secs(2))
+                    .await
+                    .unwrap();
+            assert_eq!(asked.path, "/v0/session");
+            assert_eq!(asked.query.as_deref(), Some("rate=24000"));
+            assert_eq!(text(&conn.next().await.unwrap().unwrap()), "hello");
+            conn.send_binary(Bytes::from_static(&[7, 8])).await.unwrap();
+            // The client says goodbye, in good order.
+            assert_eq!(conn.next().await.unwrap(), None);
+        });
+        let url = format!("{url}/v0/session?rate=24000");
+        let request = WsRequest {
+            // A client may speak several protocols.
+            headers: &[("Sec-WebSocket-Protocol", "other.v9, talk.v0")],
+            ..WsRequest::new(&url)
+        };
+        let mut conn = WsConn::connect(request).await.unwrap();
+        conn.send_text("hello".to_owned()).await.unwrap();
+        assert_eq!(
+            conn.next().await.unwrap(),
+            Some(WsMessage::Binary(Bytes::from_static(&[7, 8])))
+        );
+        conn.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_client_that_asks_for_something_else_is_refused() {
+        for (path, protocols, class) in [
+            // Another protocol, or none.
+            ("/v0/session", Some("other.v9"), RetryClass::Permanent),
+            ("/v0/session", None, RetryClass::Permanent),
+            // Another path.
+            ("/elsewhere", Some("talk.v0"), RetryClass::Permanent),
+        ] {
+            let (listener, url) = listener().await;
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                WsConn::accept(tcp, "/v0/session", "talk.v0", Duration::from_secs(2))
+                    .await
+                    .unwrap_err()
+            });
+            let url = format!("{url}{path}");
+            let headers: Vec<(&str, &str)> = protocols
+                .iter()
+                .map(|offer| ("Sec-WebSocket-Protocol", *offer))
+                .collect();
+            let request = WsRequest {
+                headers: &headers,
+                ..WsRequest::new(&url)
+            };
+            let error = WsConn::connect(request).await.unwrap_err();
+            assert_eq!(error.class, class, "{path} {protocols:?}: {error}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_says_nothing_is_not_waited_for() {
+        let (listener, url) = listener().await;
+        let address = url.trim_start_matches("ws://").to_owned();
+        let client = tokio::spawn(async move {
+            // Connects, and asks for nothing.
+            let stream = TcpStream::connect(address).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        });
+        let (tcp, _) = listener.accept().await.unwrap();
+        let error = WsConn::accept(tcp, "/", "talk.v0", Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.class, RetryClass::Timeout, "{error}");
+        client.abort();
+    }
+
+    #[tokio::test]
+    async fn a_complaint_made_here_reaches_the_other_side() {
+        let (listener, url) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (conn, _) = WsConn::accept(tcp, "/", "talk.v0", Duration::from_secs(2))
+                .await
+                .unwrap();
+            conn.close_with(1008, "that is not allowed").await;
+        });
+        let request = WsRequest {
+            headers: &[("Sec-WebSocket-Protocol", "talk.v0")],
+            ..WsRequest::new(&url)
+        };
+        let mut conn = WsConn::connect(request).await.unwrap();
+        let error = conn.next().await.unwrap_err();
+        assert_eq!(error.class, RetryClass::Permanent, "{error}");
+        assert!(error.message.contains("that is not allowed"), "{error}");
+        server.await.unwrap();
     }
 
     #[tokio::test]
