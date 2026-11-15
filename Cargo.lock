@@ -1828,7 +1828,13 @@ version = "0.1.0"
 name = "waveport-testkit"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "tokio",
+ "waveport-adapter-kit",
  "waveport-alloc-counter",
+ "waveport-domain",
+ "waveport-media",
+ "waveport-ports",
 ]
 
 [[package]]

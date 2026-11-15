@@ -76,6 +76,7 @@ allowed = ["waveport-alloc-counter"]
 # Only what the workspace uses today. `default-features = false` here lets
 # each member opt in, which also works on the minimum supported Cargo.
 [workspace.dependencies]
+waveport-adapter-kit = { path = "crates/core/waveport-adapter-kit", version = "0.1.0" }
 waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", version = "0.1.0" }
 waveport-domain = { path = "crates/core/waveport-domain", version = "0.1.0" }
 waveport-kernel-sim = { path = "crates/testing/waveport-kernel-sim", version = "0.1.0" }
