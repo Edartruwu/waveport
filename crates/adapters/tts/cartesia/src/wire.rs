@@ -150,10 +150,7 @@ pub(crate) struct Speaking {
     assembler: PcmAssembler,
     /// How many samples of audio were handed on.
     samples: usize,
-    /// The newest mark. It is kept back until the next one, or the end:
-    /// at the end it may have to give way to how much audio there was.
-    held: Option<TtsMark>,
-    /// The mark before it, which the next may not go back from.
+    /// The newest mark, which the next may not go back from.
     last: TtsMark,
     /// Whether the provider has said anything about this speech.
     heard: bool,
@@ -179,7 +176,6 @@ impl Speaking {
             finished: false,
             assembler: PcmAssembler::new(),
             samples: 0,
-            held: None,
             last: TtsMark {
                 text_end: 0,
                 audio_end: MediaDur::ZERO,
@@ -312,31 +308,22 @@ impl Speaking {
             return;
         };
         self.cursor += found + word.len();
-        let mark = TtsMark {
+        // A mark is handed on as soon as it is known, and not held for
+        // the next one to follow: whoever gives this stream its text a
+        // sentence at a time waits for the last word of a sentence to be
+        // marked before it gives the next.
+        self.last = TtsMark {
             text_end: u32::try_from(self.cursor).unwrap_or(u32::MAX),
             // Marks do not go back, whatever the provider's times do.
-            audio_end: audio_end.max(self.newest().audio_end),
+            audio_end: audio_end.max(self.last.audio_end),
         };
-        if let Some(before) = self.held.replace(mark) {
-            self.last = before;
-            out.push(TtsEvent::Mark(before));
-        }
+        out.push(TtsEvent::Mark(self.last));
     }
 
-    /// The mark that was made last.
-    fn newest(&self) -> TtsMark {
-        self.held.unwrap_or(self.last)
-    }
-
-    /// All the audio is there. The last word cannot end after it does,
-    /// and all the text was spoken by the time it ends.
+    /// All the audio is there, and all the text was spoken by the time it
+    /// ends.
     fn end(&mut self, out: &mut Vec<TtsEvent>) {
         let spoken = self.rate.length_of(self.samples);
-        if let Some(mut mark) = self.held.take() {
-            mark.audio_end = mark.audio_end.min(spoken).max(self.last.audio_end);
-            self.last = mark;
-            out.push(TtsEvent::Mark(mark));
-        }
         let all = u32::try_from(self.text.len()).unwrap_or(u32::MAX);
         if all > self.last.text_end && self.samples > 0 {
             self.last = TtsMark {
@@ -499,11 +486,41 @@ mod tests {
                 mark(12, 900),
                 mark(17, 1_100),
                 mark(21, 1_200),
-                // The last word cannot end after the audio does.
-                mark(25, 1_500),
-                // And the mark of the end takes in what follows it.
-                mark(26, 1_500),
+                // The provider's time for the last word is past the end
+                // of the audio. It is handed on as it came: a mark is not
+                // held until the audio has ended to be set right.
+                mark(25, 1_600),
+                // And the mark of the end takes in what follows it. It
+                // does not go back.
+                mark(26, 1_600),
                 TtsEvent::Done,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mark_is_handed_on_before_anything_follows_it() {
+        // The first sentence of a response, and nothing after it yet:
+        // whoever gives the text waits for its last word to be marked
+        // before the next sentence is given.
+        let mut speaking = speaking();
+        speaking.speak("It is ten past three. ").unwrap();
+        let (events, _) = hear(
+            &mut speaking,
+            &[
+                chunk("ctx-1", 900),
+                timestamps("ctx-1", &[("It", 0.1), ("is", 0.2), ("ten", 0.4)]),
+                timestamps("ctx-1", &[("past", 0.6), ("three.", 0.9)]),
+            ],
+        );
+        assert_eq!(
+            events,
+            [
+                mark(2, 100),
+                mark(5, 200),
+                mark(9, 400),
+                mark(14, 600),
+                mark(21, 900),
             ]
         );
     }
