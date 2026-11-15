@@ -350,6 +350,43 @@ async fn a_session_that_is_over_says_goodbye() {
     assert_eq!(tokio::time::timeout(SOON, next).await.unwrap(), None);
 }
 
+#[tokio::test]
+async fn a_client_that_is_still_talking_when_the_call_ends_is_told_how_it_ended() {
+    let (mut session, mut client) = call(Rate::Hz48000).await;
+    session.lines.say("the call ended: it was asked to");
+    // The session has closed, and its transport says goodbye. The client
+    // is in the middle of sending what its microphone hears, and reads
+    // nothing meanwhile.
+    let leaving = poll_fn(|cx| session.transport.poll_close(cx));
+    let talking = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..40 {
+            // Not one piece of audio fails to be sent: the connection is
+            // not let go of while the client is at it.
+            client.audio(Bytes::from_static(&[1; 1_920])).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // And everything it was told is there when it reads: how the
+        // call ended, and the goodbye.
+        let mut heard = Vec::new();
+        while let Some(next) = client.next().await.unwrap() {
+            heard.push(next);
+        }
+        drop(client);
+        heard
+    };
+    let (heard, ()) = tokio::time::timeout(SOON, async { tokio::join!(talking, leaving) })
+        .await
+        .unwrap();
+    assert_eq!(
+        heard,
+        [
+            Heard::Line("the call ended: it was asked to".to_owned()),
+            Heard::Bye("the call is over".to_owned()),
+        ]
+    );
+}
+
 /// A client that speaks the WebSocket protocol and then whatever it
 /// likes.
 async fn stranger(address: &str) -> WsConn {

@@ -70,6 +70,15 @@ const ACCEPTED_MESSAGE_AT_MOST: usize = 1 << 20;
 /// one it chose.
 const PROTOCOL_HEADER: &str = "sec-websocket-protocol";
 
+/// The frame a connection is closed with for a reason.
+fn close_frame(code: u16, reason: &str) -> CloseFrame {
+    let reason: String = reason.chars().take(100).collect();
+    CloseFrame {
+        code: CloseCode::from(code),
+        reason: reason.into(),
+    }
+}
+
 /// What a client asked for as it connected.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WsAsked {
@@ -391,12 +400,26 @@ impl WsConn {
     /// Closes the connection with a complaint: a code of the protocol,
     /// such as 1008 for something that is not allowed, and a few words.
     pub async fn close_with(mut self, code: u16, reason: &str) {
-        let reason: String = reason.chars().take(100).collect();
-        let frame = CloseFrame {
-            code: CloseCode::from(code),
-            reason: reason.into(),
-        };
-        let _ = self.stream.close(Some(frame)).await;
+        let _ = self.stream.close(Some(close_frame(code, reason))).await;
+    }
+
+    /// Closes as [`close`](Self::close) does, or with a code and a few
+    /// words as [`close_with`](Self::close_with) does, and then reads
+    /// what the far end still sends until it has closed too, for
+    /// `patience` at most.
+    ///
+    /// This is for a far end that may be sending when it is told that
+    /// the connection is over. A connection that is let go of while
+    /// something from the far end is unread is reset, and a reset can
+    /// take with it what the far end has not read yet: the very last
+    /// things this side said.
+    pub async fn close_and_wait(mut self, complaint: Option<(u16, &str)>, patience: Duration) {
+        let frame = complaint.map(|(code, reason)| close_frame(code, reason));
+        let _ = self.stream.close(frame).await;
+        let _ = tokio::time::timeout(patience, async {
+            while let Ok(Some(_)) = self.next().await {}
+        })
+        .await;
     }
 }
 
@@ -612,6 +635,74 @@ mod tests {
             assert_eq!(error.class, class, "{path} {protocols:?}: {error}");
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_close_that_waits_lets_the_far_end_finish_what_it_was_saying() {
+        let (listener, url) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (mut conn, _) = WsConn::accept(tcp, "/", "talk.v0", Duration::from_secs(2))
+                .await
+                .unwrap();
+            conn.send_text("the last word".to_owned()).await.unwrap();
+            let began = std::time::Instant::now();
+            conn.close_and_wait(None, Duration::from_secs(5)).await;
+            began.elapsed()
+        });
+        let request = WsRequest {
+            headers: &[("Sec-WebSocket-Protocol", "talk.v0")],
+            ..WsRequest::new(&url)
+        };
+        let mut conn = WsConn::connect(request).await.unwrap();
+        // The client is in the middle of saying something, and reads
+        // nothing meanwhile. All of it is taken, though the server has
+        // said that the connection is over.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..50 {
+            conn.send_binary(Bytes::from_static(&[0; 1_920]))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // And what the server said last is still there to be read.
+        assert_eq!(text(&conn.next().await.unwrap().unwrap()), "the last word");
+        assert_eq!(conn.next().await.unwrap(), None);
+        drop(conn);
+        // The server waited for the client, and no longer.
+        let waited = server.await.unwrap();
+        assert!(
+            (Duration::from_millis(150)..Duration::from_secs(3)).contains(&waited),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_that_waits_does_not_wait_for_ever() {
+        let (listener, url) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (conn, _) = WsConn::accept(tcp, "/", "talk.v0", Duration::from_secs(2))
+                .await
+                .unwrap();
+            let began = std::time::Instant::now();
+            let complaint = Some((1008, "that is not allowed"));
+            conn.close_and_wait(complaint, Duration::from_millis(150))
+                .await;
+            began.elapsed()
+        });
+        let request = WsRequest {
+            headers: &[("Sec-WebSocket-Protocol", "talk.v0")],
+            ..WsRequest::new(&url)
+        };
+        // A client that neither reads nor closes.
+        let conn = WsConn::connect(request).await.unwrap();
+        let waited = server.await.unwrap();
+        assert!(
+            (Duration::from_millis(140)..Duration::from_secs(2)).contains(&waited),
+            "{waited:?}"
+        );
+        drop(conn);
     }
 
     #[tokio::test]

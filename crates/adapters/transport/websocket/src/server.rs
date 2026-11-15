@@ -41,6 +41,12 @@ const MOST_RUNS: usize = 64;
 /// The close code for a client that did not keep to the protocol.
 const NOT_ALLOWED: u16 = 1008;
 
+/// How long a client that has been told that its connection is over is
+/// still read from, so that it gets to read what it was told. A client
+/// sends audio all the time, and a connection that is let go of with
+/// some of that unread is reset, which can cost the client the goodbye.
+const LAST_WORDS: Duration = Duration::from_millis(300);
+
 /// Why a listener could not be set up.
 #[derive(Debug)]
 pub enum ListenError {
@@ -175,7 +181,8 @@ async fn turn_away(mut conn: WsConn, why: &str) {
         reason: why.to_owned(),
     };
     let _ = conn.send_text(wire::write(&bye)).await;
-    conn.close_with(NOT_ALLOWED, why).await;
+    conn.close_and_wait(Some((NOT_ALLOWED, why)), LAST_WORDS)
+        .await;
 }
 
 /// A client that has said hello and has not been answered yet.
@@ -565,7 +572,7 @@ impl Far {
                     reason: "the call is over".to_owned(),
                 };
                 let _ = self.say(&bye).await;
-                self.conn.close().await;
+                self.conn.close_and_wait(None, LAST_WORDS).await;
             }
             End::Gone => events.send(TransportEvent::Left { who }).await,
             End::Broke(why) => {
