@@ -5,7 +5,9 @@
 //! facts of an older one without repeating its decisions.
 
 use crate::event::CloseReason;
-use crate::ids::{AgentId, BatchId, Epoch, GenId, ParticipantId, Seq, ToolCallId, ToolId, TurnId};
+use crate::ids::{
+    AgentId, BatchId, ContextVersion, Epoch, GenId, ParticipantId, Seq, ToolCallId, ToolId, TurnId,
+};
 use crate::text::TextRef;
 use crate::time::MediaSpan;
 
@@ -93,6 +95,11 @@ pub enum Fact {
         generation: GenId,
         /// Its agent.
         agent: AgentId,
+        /// The conversation this speech answers: every item up to this
+        /// version has had its response. `None` when it answers nothing:
+        /// the agent was cut off, or the text came from the application
+        /// and not from a language model.
+        answers: Option<ContextVersion>,
         /// What the listener heard.
         text: TextRef,
         /// Whether the agent was cut off before it had said everything.
@@ -166,6 +173,24 @@ impl Fact {
             _ => None,
         }
     }
+
+    /// The same fact with its text at `text`. A fact's text lives in the
+    /// [`Out`](crate::out::Out) of the step that emitted it; whoever keeps
+    /// the fact for longer copies the text somewhere else and points the
+    /// fact there. A fact without text is returned as it is.
+    #[must_use]
+    pub const fn with_text(mut self, text: TextRef) -> Self {
+        match &mut self {
+            Self::TurnCommitted { text: at, .. }
+            | Self::NoticeAppended { text: at, .. }
+            | Self::UtteranceCommitted { text: at, .. }
+            | Self::UtteranceProgress { heard: at, .. }
+            | Self::ToolProposed { args: at, .. }
+            | Self::ToolFinished { result: at, .. } => *at = text,
+            _ => {}
+        }
+        self
+    }
 }
 
 /// The stages of a session's life.
@@ -220,7 +245,9 @@ pub enum Dismissal {
 pub enum NoticeKind {
     /// The session was rebuilt after a crash, and some work was lost.
     Recovered,
-    /// Another agent took over.
+    /// Another agent is taking over, and this is what it is told of the
+    /// conversation so far in place of the conversation itself. An empty
+    /// note means it is told nothing.
     Handoff,
 }
 
@@ -235,4 +262,38 @@ pub enum ToolOutcome {
     Cancelled,
     /// The call was dispatched, and whether it took effect is unknown.
     InDoubt,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Fact;
+    use crate::ids::{AgentId, GenId, ToolCallId};
+    use crate::text::TextArena;
+
+    #[test]
+    fn a_fact_can_be_pointed_at_a_copy_of_its_text() {
+        let mut step = TextArena::default();
+        let _ = step.push("something else");
+        let said = step.push("Gate twelve.");
+        let fact = Fact::UtteranceCommitted {
+            generation: GenId(3),
+            agent: AgentId(0),
+            answers: None,
+            text: said,
+            truncated: false,
+        };
+
+        let mut kept = TextArena::default();
+        let copy = kept.push(step.get(said));
+        let moved = fact.with_text(copy);
+        assert_eq!(moved.text(), Some(copy));
+        assert_eq!(kept.get(copy), "Gate twelve.");
+        assert_eq!(moved.with_text(said), fact);
+
+        let plain = Fact::ToolAuthorized {
+            call: ToolCallId(1),
+        };
+        assert_eq!(plain.with_text(copy), plain);
+        assert_eq!(plain.text(), None);
+    }
 }

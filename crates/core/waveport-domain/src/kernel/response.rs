@@ -83,6 +83,7 @@ impl Generation {
     pub(super) fn begin(
         tag: OpTag,
         agent: AgentId,
+        role: GenerationRole,
         context: ContextVersion,
         source: Source,
         reserve: usize,
@@ -90,7 +91,7 @@ impl Generation {
         Self {
             tag,
             agent,
-            role: GenerationRole::Floor,
+            role,
             context,
             source,
             planned: String::with_capacity(reserve),
@@ -164,6 +165,7 @@ impl Generation {
 mod tests {
     use super::{Generation, Playback, Source, Synthesis};
     use crate::ids::{AgentId, ContextVersion, Epoch, GenId, OpTag};
+    use crate::kernel::view::GenerationRole;
     use crate::time::MediaDur;
 
     fn response(text: &str) -> Generation {
@@ -171,8 +173,14 @@ mod tests {
             generation: GenId(1),
             epoch: Epoch(0),
         };
-        let mut generation =
-            Generation::begin(tag, AgentId(0), ContextVersion(1), Source::Writing, 64);
+        let mut generation = Generation::begin(
+            tag,
+            AgentId(0),
+            GenerationRole::Floor,
+            ContextVersion(1),
+            Source::Writing,
+            64,
+        );
         generation.planned.push_str(text);
         generation
     }

@@ -1,9 +1,8 @@
 //! A read-only look at a session.
 
-use core::iter;
-
 use super::State;
 use super::response::Playback;
+use crate::command::LlmCause;
 use crate::config::KernelConfig;
 use crate::fact::{Lifecycle, NoticeKind, ToolOutcome};
 use crate::ids::{
@@ -100,7 +99,14 @@ impl<'a> View<'a> {
 
     /// The tool calls that have not ended.
     pub fn calls(&self) -> impl Iterator<Item = CallView> + use<'a> {
-        iter::empty()
+        self.state.calls.iter().map(|open| CallView {
+            call: open.id,
+            tool: open.tool,
+            batch: open.batch,
+            by: open.by,
+            state: open.state,
+            attempt: open.attempt,
+        })
     }
 
     /// The humans in the session.
@@ -114,14 +120,38 @@ impl<'a> View<'a> {
         self.state.conversation.iter()
     }
 
+    /// The batches of tool calls that are not resolved: a call of theirs
+    /// has not ended, or the response that asked may ask for more.
+    pub fn batches(&self) -> impl Iterator<Item = BatchView> + use<'a> {
+        self.state.batches.iter().map(|open| BatchView {
+            batch: open.id,
+            by: open.by,
+            pending: usize::from(open.pending),
+            ran: open.ran,
+        })
+    }
+
+    /// The agent that was asked to take the floor and has not yet.
+    #[must_use]
+    pub const fn handoff(&self) -> Option<AgentId> {
+        self.state.handoff
+    }
+
     /// Whether a response is owed and has not been started: the
-    /// conversation holds a turn meant for the agent that no response has
-    /// been computed from.
+    /// conversation holds a turn meant for the agent, or the results of
+    /// tool calls, that no response has been computed from.
     #[must_use]
     pub fn reply_owed(&self) -> bool {
+        self.state.reply_owed()
+    }
+
+    /// What the response that is owed and has not been started is for.
+    #[must_use]
+    pub fn owed(&self) -> Option<LlmCause> {
         self.state
             .owed
-            .is_some_and(|(needs, _)| needs > self.state.answered)
+            .filter(|_| self.state.reply_owed())
+            .map(|(_, cause)| cause)
     }
 }
 
@@ -182,19 +212,35 @@ pub struct CallView {
     pub by: GenId,
     /// How far it has got.
     pub state: CallState,
+    /// How many times it was sent before, after the session was restarted.
+    pub attempt: u8,
+}
+
+/// A batch of tool calls that is not resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchView {
+    /// The batch.
+    pub batch: BatchId,
+    /// The response that asked for its calls.
+    pub by: GenId,
+    /// How many of its calls have not ended.
+    pub pending: usize,
+    /// Whether any of its calls was sent, or ended in another way than by
+    /// being withdrawn. A batch of which nothing ran is owed no response.
+    pub ran: bool,
 }
 
 /// How far a tool call has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallState {
-    /// Asked for by a response.
+    /// Asked for by a response, and waiting for its gate.
     Proposed,
-    /// Cleared to run, and waiting for its gate or for its record to be
-    /// durable.
+    /// Cleared to run, and waiting for its record to be durable.
     Authorized,
-    /// Running.
+    /// Sent to its tool.
     Dispatched,
-    /// Cancelled, and waiting for the tool to confirm.
+    /// Sent, then told to stop, and waiting for the tool to confirm that
+    /// it left no effect.
     Cancelling,
 }
 

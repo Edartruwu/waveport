@@ -803,6 +803,54 @@ fn text_reaches_synthesis_a_sentence_at_a_time_and_only_as_it_is_heard() {
 }
 
 #[test]
+fn white_space_alone_is_nothing_to_say() {
+    let done = OpEvent::LlmDone {
+        finish: Finish::Stop,
+    };
+
+    // Models often begin with a line break. Synthesis is not started for
+    // it: it goes with the words that follow.
+    let mut session = Session::new();
+    let tag = session.asked();
+    let blank = session.op(tag, delta("\n\n"));
+    assert!(blank.speaks_nothing());
+    assert!(!blank.has(Command::Playout(tag, PlayoutCmd::Start)));
+    let words = session.op(tag, delta("It shipped. "));
+    assert_eq!(words.spoken(), ["\n\nIt shipped. "]);
+    assert!(words.has(Command::Playout(tag, PlayoutCmd::Start)));
+
+    // White space after the last words is not sent after them.
+    session.op(tag, segment(14, 800, false));
+    assert!(session.op(tag, delta(" \n")).speaks_nothing());
+    let finished = session.op(tag, done.clone());
+    assert!(finished.speaks_nothing());
+    assert!(finished.has(Command::Tts(tag, TtsCmd::Finish)));
+    session.op(tag, segment(14, 800, true));
+    let end = session.op(tag, played(800, 14, true));
+    assert_eq!(
+        end.fact_text(|fact| matches!(fact, Fact::UtteranceCommitted { .. })),
+        Some("\n\nIt shipped.")
+    );
+    assert!(end.has(listening(1)));
+
+    // A model that writes white space and nothing else said nothing, and
+    // no part was started that would have to be stopped.
+    let mut session = Session::new();
+    let tag = session.asked();
+    assert!(session.op(tag, delta("  \n")).speaks_nothing());
+    let silent = session.op(tag, done);
+    assert!(silent.journals_nothing());
+    assert!(silent.has(listening(1)));
+    let sent = silent.commands();
+    assert!(
+        !sent
+            .iter()
+            .any(|command| matches!(command, Command::Tts(..) | Command::Playout(..))),
+        "{sent:?}"
+    );
+}
+
+#[test]
 fn a_response_that_plays_to_its_end_enters_the_conversation_whole() {
     let mut session = Session::new();
     let tag = session.asked();
@@ -815,6 +863,7 @@ fn a_response_that_plays_to_its_end_enters_the_conversation_whole() {
         [Fact::UtteranceCommitted {
             generation: GenId(1),
             agent: AgentId(0),
+            answers: Some(ContextVersion(1)),
             text: over.facts[0].0.text().unwrap(),
             truncated: false,
         }]

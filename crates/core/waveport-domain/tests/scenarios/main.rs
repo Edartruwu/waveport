@@ -6,11 +6,11 @@
 //! them pass: needing to change one is the sign that the kernel's design is
 //! wrong.
 //!
-//! This file says how far the kernel has got. A scenario is listed as
-//! `unstarted` while it fails at its first expectation, `pending` while it
-//! gets further and still fails, and `passes` once it holds on every path.
-//! The listing is checked both ways, so a scenario that starts to pass must
-//! be promoted here.
+//! This file says how far the kernel has got: all six pass. A scenario
+//! added later is listed with `unstarted` while it fails at its first
+//! expectation, with `pending` while it gets further and still fails, and
+//! with `passes` once it holds on every path. The listing is checked both
+//! ways, so a scenario that starts to pass must be promoted here.
 
 mod backchannel_tool;
 mod hybrid_front_back;
@@ -19,7 +19,7 @@ mod shutdown;
 mod spoken_text;
 mod three_party;
 
-use waveport_kernel_sim::check::{Report, passes, pending};
+use waveport_kernel_sim::check::{Report, passes};
 
 #[test]
 fn lost_input() -> Result<(), Report> {
@@ -28,7 +28,7 @@ fn lost_input() -> Result<(), Report> {
 
 #[test]
 fn backchannel_tool() -> Result<(), Report> {
-    pending(backchannel_tool::backchannel_tool)
+    passes(backchannel_tool::backchannel_tool)
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn shutdown() -> Result<(), Report> {
 
 #[test]
 fn hybrid_front_back() -> Result<(), Report> {
-    pending(hybrid_front_back::hybrid_front_back)
+    passes(hybrid_front_back::hybrid_front_back)
 }
 
 #[test]

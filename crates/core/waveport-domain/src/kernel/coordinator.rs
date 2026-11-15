@@ -10,10 +10,12 @@
 //!   the conversation.
 //! - [`Step::turn_ended`] is the only place a user turn is committed or
 //!   dismissed.
+//! - [`Step::call_finished`] is the only place a tool call ends and its
+//!   result enters the conversation.
 //! - [`Step::settle`] runs after every event and applies, in a fixed
-//!   order, the rules that start things: end the turns that can end, start
-//!   the response that is owed, start playback, move the session through
-//!   its life.
+//!   order, the rules that start things: end the turns that can end, move
+//!   the tool calls on, start the response that is owed, start playback,
+//!   move the session through its life.
 
 use core::time::Duration;
 
@@ -21,22 +23,35 @@ use super::State;
 use super::floor::{OpenTurn, Overlap};
 use super::lifecycle::Closing;
 use super::response::{Generation, Playback, Source, Synthesis};
-use super::view::GenerationRole;
+use super::tools::{self, Call};
+use super::view::{CallState, GenerationRole};
 use crate::command::{
-    Activity, ClientEvent, Command, LlmCmd, PlayoutCmd, SenseCmd, SttCmd, TtsCmd,
+    Activity, ClientEvent, Command, LlmCause, LlmCmd, PlayoutCmd, SenseCmd, SttCmd, ToolCmd, TtsCmd,
 };
-use crate::config::KernelConfig;
+use crate::config::{Effect, Executor, KernelConfig};
 use crate::event::{
-    CloseReason, ControlInput, Event, OpEvent, OverlapVerdict, Part, TimerId, VadEdge,
+    CloseReason, ControlInput, Event, HandoffContext, OpEvent, OverlapVerdict, Part, TimerId,
+    ToolEvent, VadEdge,
 };
-use crate::fact::{Dismissal, EpochCause, Fact, Lifecycle, Stamped};
-use crate::ids::{GenId, OpTag, ParticipantId, Prob, TurnId};
+use crate::fact::{Dismissal, EpochCause, Fact, Lifecycle, NoticeKind, Stamped, ToolOutcome};
+use crate::ids::{AgentId, GenId, OpTag, ParticipantId, Prob, Seq, ToolCallId, ToolId, TurnId};
 use crate::out::Out;
 use crate::policy::{
-    AddresseeInput, AddresseePolicy, InterruptionPolicy, OverlapDecision, OverlapInput, Policies,
-    TextChunker, TurnDecision, TurnInput, TurnPolicy,
+    AddresseeInput, AddresseePolicy, GateInput, InterruptionPolicy, OverlapDecision, OverlapInput,
+    Policies, TextChunker, ToolGate, TurnDecision, TurnInput, TurnPolicy,
 };
 use crate::time::{MediaDur, MediaSpan, MediaTime, MonoTime};
+
+/// What became of a tool call when the session looked at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Moved {
+    /// Nothing: it waits for something.
+    Waits,
+    /// It is a step further and can be looked at again.
+    On,
+    /// It ended, and is no longer in the table.
+    Ended,
+}
 
 /// Everything one step works with.
 pub(super) struct Step<'a, P: Policies> {
@@ -47,8 +62,14 @@ pub(super) struct Step<'a, P: Policies> {
     pub(super) out: &'a mut Out,
 }
 
+/// Whether `text` holds anything but white space.
+fn says_something(text: &str) -> bool {
+    text.chars().any(|character| !character.is_whitespace())
+}
+
 impl<P: Policies> Step<'_, P> {
     /// Takes one event.
+    #[inline]
     pub(super) fn run(&mut self, event: &Event) {
         match event {
             Event::Speech { who, edge, at } => match edge {
@@ -73,8 +94,8 @@ impl<P: Policies> Step<'_, P> {
             Event::Op(tag, op) => self.op(*tag, op),
             Event::Timer(id) => self.timer_fired(*id),
             Event::Control(input) => self.control(input),
-            // Tool calls and the durability barrier arrive with the tools.
-            Event::Tool(..) | Event::Durable(_) => {}
+            Event::Tool(call, news) => self.tool(*call, news),
+            Event::Durable(seq) => self.stored(*seq),
         }
         self.settle();
     }
@@ -88,10 +109,17 @@ impl<P: Policies> Step<'_, P> {
     /// Journals a fact and makes it true. This is the only way the part of
     /// the state that outlives a crash changes.
     fn fact(&mut self, fact: Fact) {
+        let _ = self.journal(fact);
+    }
+
+    /// Journals a fact, makes it true, and returns its place in the
+    /// journal.
+    fn journal(&mut self, fact: Fact) -> Seq {
         let seq = self.state.next_seq;
         self.state.next_seq = seq.next();
         self.state.apply(&fact, &self.out.text);
         self.out.facts.push(Stamped { seq, fact });
+        seq
     }
 
     fn set_timer(&mut self, id: TimerId, after: Duration) {
@@ -515,6 +543,10 @@ impl<P: Policies> Step<'_, P> {
         let Some(running) = self.state.generations.get_mut(index) else {
             return;
         };
+        if let GenerationRole::Delegated(call) = running.role {
+            self.delegated_op(index, call, op);
+            return;
+        }
         match op {
             OpEvent::LlmDelta { text } => {
                 if running.is_written() {
@@ -570,8 +602,7 @@ impl<P: Policies> Step<'_, P> {
                 }
             }
             OpEvent::Failed { part, .. } => self.failed(index, *part),
-            // Tool calls arrive with the tools.
-            OpEvent::ToolProposed { .. } => {}
+            OpEvent::ToolProposed { tool, args } => self.proposed(index, *tool, args.as_str()),
         }
     }
 
@@ -588,7 +619,10 @@ impl<P: Policies> Step<'_, P> {
             let ready = self.policies.chunker().ready(pending, running.is_written());
             // A policy's answer is not trusted further than it can be
             // checked.
-            if let Some(chunk) = pending.get(..ready).filter(|chunk| !chunk.is_empty()) {
+            let chunk = pending.get(..ready).unwrap_or("");
+            // White space alone is nothing to say. It is held, and goes
+            // with what follows: synthesis is not started for nothing.
+            if says_something(chunk) {
                 let text = self.out.text.push(chunk);
                 self.out
                     .cmds
@@ -597,8 +631,13 @@ impl<P: Policies> Step<'_, P> {
             }
         }
         let spoken = running.released > 0;
-        let everything = running.released == running.planned.len();
-        if running.is_written() && everything && spoken && running.synthesis == Synthesis::Open {
+        // White space after the last words is never handed over, so the
+        // response has said everything once nothing else is left.
+        if running.is_written()
+            && spoken
+            && running.synthesis == Synthesis::Open
+            && !says_something(running.pending())
+        {
             running.synthesis = Synthesis::Closing;
             self.out.cmds.push(Command::Tts(tag, TtsCmd::Finish));
         }
@@ -668,6 +707,7 @@ impl<P: Policies> Step<'_, P> {
             self.cancel_timer(TimerId::Checkpoint);
         }
         self.utterance_ended(&running, !cut);
+        self.asker_ended(tag.generation, cut);
         self.emit(ClientEvent::Agent {
             agent: running.agent,
             generation: Some(tag.generation),
@@ -683,10 +723,15 @@ impl<P: Policies> Step<'_, P> {
             return;
         }
         let truncated = running.is_cut_at(heard);
+        // Speech that was heard to the end answers what its response was
+        // computed from. Speech that was cut off, or that the application
+        // asked for, answers nothing.
+        let answers = (!truncated && running.source != Source::Given).then_some(running.context);
         let text = self.out.text.push(heard);
         self.fact(Fact::UtteranceCommitted {
             generation: running.tag.generation,
             agent: running.agent,
+            answers,
             text,
             truncated,
         });
@@ -694,6 +739,9 @@ impl<P: Policies> Step<'_, P> {
 
     /// Ends every response that holds the floor, and advances the epoch if
     /// there was one. The epoch moves here and nowhere else.
+    ///
+    /// Work on a tool call is not touched: it does not hold the floor, and
+    /// its call outlives the response that asked for it.
     fn interrupt(&mut self, cause: EpochCause) {
         let mut ended = false;
         while let Some(index) = self.floor() {
@@ -703,6 +751,8 @@ impl<P: Policies> Step<'_, P> {
         if ended {
             let to = self.state.epoch.next();
             self.fact(Fact::EpochAdvanced { to, cause });
+            // The calls those responses had not sent yet ended with them.
+            self.resolve_batches();
         }
     }
 
@@ -751,15 +801,16 @@ impl<P: Policies> Step<'_, P> {
                 let stalled = self
                     .generation_index(generation)
                     .and_then(|index| self.state.generations.get(index))
-                    .is_some_and(|running| self.now >= running.stall_at);
+                    .is_some_and(|running| {
+                        running.role == GenerationRole::Floor && self.now >= running.stall_at
+                    });
                 if stalled {
                     self.interrupt(EpochCause::Failure);
                 }
             }
             TimerId::Checkpoint => self.checkpoint(),
-            // The first two only need the session to look at the time,
-            // which `settle` does after every event. The rest arrive with
-            // the tools.
+            // These only need the session to look at the time, which
+            // `settle` does after every event.
             TimerId::Drain
             | TimerId::Grace
             | TimerId::ToolTimeout(_)
@@ -782,9 +833,10 @@ impl<P: Policies> Step<'_, P> {
             ControlInput::Say { text } => self.say(text.as_str()),
             ControlInput::Detached => self.state.attached = false,
             ControlInput::Attached => self.state.attached = true,
+            ControlInput::Handoff { to, context } => self.handoff_asked(*to, context),
+            ControlInput::StageReady => self.stage_ready(),
             // Losing the lease is handled before the step is routed.
-            // Agents and handoffs arrive with the tools.
-            ControlInput::LeaseLost | ControlInput::Handoff { .. } | ControlInput::StageReady => {}
+            ControlInput::LeaseLost => {}
         }
     }
 
@@ -803,39 +855,42 @@ impl<P: Policies> Step<'_, P> {
     /// Has the agent that holds the floor say `text`, in place of whatever
     /// it was saying.
     fn say(&mut self, text: &str) {
-        if self.state.lifecycle != Lifecycle::Running || text.trim().is_empty() {
+        let running = self.state.lifecycle == Lifecycle::Running;
+        // While the floor is changing hands, nobody holds it.
+        if !running || self.state.handoff.is_some() || text.trim().is_empty() {
             return;
         }
         self.interrupt(EpochCause::Interrupted);
-        let Some(index) = self.begin_generation(Source::Given) else {
+        let front = self.state.front;
+        let Some(index) = self.begin_generation(front, GenerationRole::Floor, Source::Given) else {
             return;
         };
+        self.watch(index);
         if let Some(running) = self.state.generations.get_mut(index) {
             running.planned.push_str(text);
         }
         self.pump(index);
     }
 
-    /// Adds a response that holds the floor, and returns where it is.
-    fn begin_generation(&mut self, source: Source) -> Option<usize> {
+    /// Adds a response, and returns where it is. `None` if as many
+    /// responses are under way as there may be.
+    fn begin_generation(
+        &mut self,
+        agent: AgentId,
+        role: GenerationRole,
+        source: Source,
+    ) -> Option<usize> {
         let generation = self.state.next_gen;
         let tag = OpTag {
             generation,
             epoch: self.state.epoch,
         };
         let context = self.state.conversation.version();
-        let running = Generation::begin(
-            tag,
-            self.state.front,
-            context,
-            source,
-            self.config.limits.response_text,
-        );
+        let reserve = self.config.limits.response_text;
+        let running = Generation::begin(tag, agent, role, context, source, reserve);
         self.state.generations.push(running).ok()?;
         self.state.next_gen = generation.next();
-        let index = self.state.generations.len() - 1;
-        self.watch(index);
-        Some(index)
+        Some(self.state.generations.len() - 1)
     }
 
     /// Gives a response a full `generation_max` from now to make progress.
@@ -861,6 +916,7 @@ impl<P: Policies> Step<'_, P> {
         self.state.closing = Some(Closing {
             reason,
             drain_until,
+            grace_until,
         });
         self.fact(Fact::LifecycleChanged {
             to: Lifecycle::Draining,
@@ -919,11 +975,26 @@ impl<P: Policies> Step<'_, P> {
 
     /// Applies, in a fixed order, the rules that follow from the state and
     /// not from any one event.
+    ///
+    /// Most steps of most sessions have no tool call to look at, no floor
+    /// changing hands, no reply to start and nothing closing. Each of
+    /// those rules is asked for only when it has something to look at, so
+    /// that the steps a session takes most often stay short.
     fn settle(&mut self) {
         self.end_turns();
-        self.start_reply();
+        if !self.state.calls.is_empty() || !self.state.batches.is_empty() {
+            self.advance_calls();
+        }
+        if self.state.handoff.is_some() {
+            self.advance_stage();
+        }
+        if self.state.reply_owed() {
+            self.start_reply();
+        }
         self.start_playback();
-        self.advance_lifecycle();
+        if self.state.closing.is_some() {
+            self.advance_lifecycle();
+        }
     }
 
     /// Ends every turn that can end.
@@ -943,36 +1014,48 @@ impl<P: Policies> Step<'_, P> {
 
     /// Starts the response that is owed, if one is and it can start.
     fn start_reply(&mut self) {
-        if self.state.lifecycle != Lifecycle::Running {
+        // A session that is closing starts nothing, and while the floor is
+        // changing hands there is nobody to respond.
+        if self.state.lifecycle != Lifecycle::Running || self.state.handoff.is_some() {
             return;
         }
-        let Some((needs, cause)) = self.state.owed else {
+        let Some((_, cause)) = self.state.owed.filter(|_| self.state.reply_owed()) else {
             return;
         };
-        if needs <= self.state.answered {
-            return;
-        }
         if let Some(running) = self
             .floor()
             .and_then(|index| self.state.generations.get(index))
         {
-            if running.is_audible() || running.source == Source::Given {
+            let waits = running.is_audible()
+                || running.source == Source::Given
+                || matches!(cause, LlmCause::Continuation { .. });
+            if waits {
                 // It is being heard, or the application asked for it to be
-                // said. The next response waits for it.
+                // said, or what is owed is only the news of a tool: that
+                // never takes the floor from a response. The next response
+                // waits for this one.
                 return;
             }
-            // Nobody has heard any of it, and it answers a conversation
-            // that has moved on.
+            // Nobody has heard any of it, and the user has said more
+            // since.
             self.interrupt(EpochCause::Superseded);
         }
-        let Some(index) = self.begin_generation(Source::Writing) else {
+        // Cutting a response off resolves the calls it asked for, and then
+        // their results are what the next response is for.
+        let Some((_, cause)) = self.state.owed else {
             return;
         };
+        let front = self.state.front;
+        let Some(index) = self.begin_generation(front, GenerationRole::Floor, Source::Writing)
+        else {
+            return;
+        };
+        self.watch(index);
         let Some(running) = self.state.generations.get(index) else {
             return;
         };
         let (tag, agent, context) = (running.tag, running.agent, running.context);
-        self.state.answered = context;
+        self.state.started = context;
         let start = LlmCmd::Start {
             agent,
             context,
@@ -1018,34 +1101,629 @@ impl<P: Policies> Step<'_, P> {
         let Some(closing) = self.state.closing else {
             return;
         };
-        if self.state.lifecycle != Lifecycle::Draining {
-            return;
-        }
-        if !self.state.generations.is_empty() && self.now < closing.drain_until {
-            return;
-        }
         let reason = Some(closing.reason);
-        self.fact(Fact::LifecycleChanged {
-            to: Lifecycle::Closing,
-            reason,
-        });
-        self.interrupt(EpochCause::Closing);
-        while let Some(open) = self.state.turns.remove(0) {
-            self.turn_ended(&open, Some(Dismissal::Closed));
-        }
-        for index in 0..self.state.participants.len() {
-            if let Some(&who) = self.state.participants.get(index) {
-                self.cmd(Command::Stt(SttCmd::Close { who }));
+        if self.state.lifecycle == Lifecycle::Draining {
+            let busy = !self.state.generations.is_empty() || !self.state.calls.is_empty();
+            if busy && self.now < closing.drain_until {
+                return;
+            }
+            self.fact(Fact::LifecycleChanged {
+                to: Lifecycle::Closing,
+                reason,
+            });
+            self.interrupt(EpochCause::Closing);
+            while let Some(open) = self.state.turns.remove(0) {
+                self.turn_ended(&open, Some(Dismissal::Closed));
+            }
+            for index in 0..self.state.participants.len() {
+                if let Some(&who) = self.state.participants.get(index) {
+                    self.cmd(Command::Stt(SttCmd::Close { who }));
+                }
+            }
+            self.stop_calls();
+            for id in [TimerId::Checkpoint, TimerId::Drain] {
+                self.cancel_timer(id);
             }
         }
-        for id in [TimerId::Checkpoint, TimerId::Drain, TimerId::Grace] {
-            self.cancel_timer(id);
+        if self.state.lifecycle != Lifecycle::Closing {
+            return;
         }
-        // Nothing is left that could still be waited for.
+        // What is left are calls that may have taken effect. Their results
+        // are waited for, and no longer than the session has.
+        if !self.state.calls.is_empty() && self.now < closing.grace_until {
+            return;
+        }
+        while let Some(open) = self.state.calls.first() {
+            let call = open.id;
+            self.call_finished(call, ToolOutcome::InDoubt, tools::IN_DOUBT);
+        }
+        self.resolve_batches();
+        self.cancel_timer(TimerId::Grace);
         self.fact(Fact::LifecycleChanged {
             to: Lifecycle::Closed,
             reason,
         });
         self.emit(ClientEvent::Lifecycle(Lifecycle::Closed));
+    }
+
+    // ---- The floor changing hands ------------------------------------------
+
+    /// Another agent is to take the floor. The agent that has it stops,
+    /// and nobody responds until the parts that serve the new one are
+    /// ready.
+    fn handoff_asked(&mut self, to: AgentId, context: &HandoffContext) {
+        let running = self.state.lifecycle == Lifecycle::Running;
+        let known = self.config.agent(to).is_some();
+        // An agent that works on tool calls for others never speaks.
+        let works = self
+            .config
+            .tools
+            .iter()
+            .any(|tool| tool.executor == Executor::Agent(to));
+        if !running || !known || works || to == self.state.front || self.state.handoff.is_some() {
+            return;
+        }
+        self.fact(Fact::HandoffRequested { to });
+        self.interrupt(EpochCause::Handoff);
+        let note = match context {
+            HandoffContext::Full => None,
+            HandoffContext::Summary(summary) => Some(summary.as_str()),
+            HandoffContext::None => Some(""),
+        };
+        if let Some(note) = note {
+            let text = self.out.text.push(note);
+            self.fact(Fact::NoticeAppended {
+                kind: NoticeKind::Handoff,
+                text,
+            });
+        }
+        let until = self.now.after(self.config.timing.stage_wait);
+        self.state.stage_until = Some(until);
+        self.cmd(Command::SetTimer(TimerId::StageAck, Some(until)));
+    }
+
+    /// The parts that serve the agent that was asked to take the floor
+    /// are ready: it has the floor.
+    fn stage_ready(&mut self) {
+        if let Some(agent) = self.state.handoff {
+            self.activate(agent);
+        }
+    }
+
+    fn activate(&mut self, agent: AgentId) {
+        self.state.stage_until = None;
+        self.cancel_timer(TimerId::StageAck);
+        self.fact(Fact::AgentActivated { agent });
+        self.emit(ClientEvent::Agent {
+            agent,
+            generation: None,
+            activity: Activity::Listening,
+        });
+    }
+
+    /// Gives the floor back to the agent that had it, when the one that
+    /// was asked to take it has not become ready in time.
+    fn advance_stage(&mut self) {
+        let late = self
+            .state
+            .stage_until
+            .is_some_and(|until| self.now >= until);
+        if self.state.handoff.is_some() && late {
+            self.activate(self.state.front);
+        }
+    }
+
+    // ---- After a restart ---------------------------------------------------
+
+    /// Deals with what a session that was rebuilt from its journal lost
+    /// with the process: the responses and tool calls that were under way.
+    pub(super) fn recover(&mut self) {
+        self.state.recovering = false;
+        // Whatever still arrives for the work of the session's earlier
+        // life is stale.
+        let to = self.state.epoch.next();
+        self.fact(Fact::EpochAdvanced {
+            to,
+            cause: EpochCause::Recovery,
+        });
+        let mut lost = self.state.reply_owed();
+
+        // The speech that was being heard was heard at least as far as
+        // was last recorded.
+        if let Some((generation, agent)) = self.state.speech {
+            lost = true;
+            let text = self.out.text.push(self.state.speech_text.trim_end());
+            self.fact(Fact::UtteranceCommitted {
+                generation,
+                agent,
+                answers: None,
+                text,
+                truncated: true,
+            });
+        }
+
+        // The responses that asked for the calls are gone.
+        for batch in &mut self.state.batches {
+            batch.over = true;
+        }
+        let running = self.state.lifecycle == Lifecycle::Running;
+        let mut index = 0;
+        while let Some(open) = self.state.calls.get(index).copied() {
+            lost = true;
+            let effect = self.config.tool(open.tool).map(|spec| spec.effect);
+            let cleared = open.state != CallState::Proposed;
+            // A call that was cleared may have been sent, whether or not
+            // the record of that survived.
+            if !cleared {
+                self.call_finished(open.id, ToolOutcome::Failed, tools::LOST);
+                continue;
+            }
+            let harmless = matches!(effect, Some(Effect::Pure | Effect::Idempotent));
+            if harmless && running && open.attempt < tools::MOST_RETRIES {
+                // Sending it again does no harm. `settle` does, if the
+                // session is still running by then.
+                index += 1;
+                continue;
+            }
+            self.lose(&open);
+        }
+
+        if lost {
+            let text = self.out.text.push(tools::RECOVERED);
+            self.fact(Fact::NoticeAppended {
+                kind: NoticeKind::Recovered,
+                text,
+            });
+        }
+        // Whoever was to take the floor has it: every part is being set
+        // up anew anyway.
+        if let Some(agent) = self.state.handoff {
+            self.activate(agent);
+        }
+        // A session that was closing has nothing left to wait for.
+        if !running {
+            self.state.closing = Some(Closing {
+                reason: self.state.closed_for.unwrap_or(CloseReason::Failure),
+                drain_until: self.now,
+                grace_until: self.now,
+            });
+        }
+    }
+
+    // ---- Tool calls --------------------------------------------------------
+
+    fn call(&self, call: ToolCallId) -> Option<Call> {
+        self.state
+            .calls
+            .iter()
+            .find(|open| open.id == call)
+            .copied()
+    }
+
+    fn call_mut(&mut self, call: ToolCallId) -> Option<&mut Call> {
+        self.state.calls.iter_mut().find(|open| open.id == call)
+    }
+
+    /// A response asks for a tool call. The request enters the
+    /// conversation, and the call waits for its gate.
+    fn proposed(&mut self, index: usize, tool: ToolId, args: &str) {
+        let Some(running) = self.state.generations.get(index) else {
+            return;
+        };
+        // Tools are called by the agent that holds the floor, while its
+        // model writes, and only the ones it was given.
+        let may = self
+            .config
+            .agent(running.agent)
+            .is_some_and(|agent| agent.tools.contains(&tool));
+        if running.role != GenerationRole::Floor || running.is_written() || !may {
+            return;
+        }
+        let generation = running.tag.generation;
+        let batch = self
+            .state
+            .batches
+            .iter()
+            .find(|open| open.by == generation)
+            .map(|open| open.id);
+        // A call there is no room for is not accepted.
+        if self.state.calls.is_full() || (batch.is_none() && self.state.batches.is_full()) {
+            return;
+        }
+        let call = self.state.next_call;
+        let batch = batch.unwrap_or(self.state.next_batch);
+        let args = self.out.text.push(args);
+        self.fact(Fact::ToolProposed {
+            call,
+            batch,
+            generation,
+            tool,
+            args,
+        });
+        // The model is making progress.
+        self.watch(index);
+    }
+
+    /// The response `generation` has ended. Its calls no longer wait for
+    /// its speech, and if it was cut off, those not sent yet are
+    /// withdrawn: what it was doing is not wanted any more.
+    fn asker_ended(&mut self, generation: GenId, cut: bool) {
+        let Some(batch) = self
+            .state
+            .batches
+            .iter_mut()
+            .find(|open| open.by == generation)
+        else {
+            return;
+        };
+        batch.over = true;
+        let batch = batch.id;
+        if !cut {
+            return;
+        }
+        let mut index = 0;
+        while let Some(open) = self.state.calls.get(index) {
+            if open.batch == batch && !open.is_sent() {
+                let call = open.id;
+                self.call_finished(call, ToolOutcome::Cancelled, tools::WITHDRAWN);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Every fact up to `seq` is stored durably.
+    fn stored(&mut self, seq: Seq) {
+        // Nothing is stored that was not emitted.
+        let emitted = Seq(self.state.next_seq.get().saturating_sub(1));
+        self.state.durable = self.state.durable.max(seq.min(emitted));
+    }
+
+    /// News of a call from its tool.
+    fn tool(&mut self, call: ToolCallId, news: &ToolEvent) {
+        // A call that has ended is not in the table: this is where a
+        // second result is dropped.
+        let Some(open) = self.call(call) else {
+            return;
+        };
+        let external = self
+            .config
+            .tool(open.tool)
+            .is_some_and(|spec| spec.executor == Executor::External);
+        if !external || !open.is_sent() {
+            return;
+        }
+        match news {
+            ToolEvent::Completed { result } => {
+                self.call_finished(call, ToolOutcome::Completed, result.as_str());
+            }
+            ToolEvent::Failed { message, .. } => {
+                self.call_finished(call, ToolOutcome::Failed, message.as_str());
+            }
+            ToolEvent::RolledBack => {
+                if open.state == CallState::Cancelling {
+                    self.call_finished(call, ToolOutcome::Cancelled, tools::UNDONE);
+                }
+            }
+        }
+    }
+
+    /// A tool call ends. Its result enters the conversation, once, here
+    /// and nowhere else.
+    fn call_finished(&mut self, call: ToolCallId, outcome: ToolOutcome, result: &str) {
+        if self.call(call).is_none() {
+            return;
+        }
+        // An agent that was working on it has nothing left to work on.
+        let worker = self
+            .state
+            .generations
+            .iter()
+            .position(|running| running.role == GenerationRole::Delegated(call));
+        if let Some(running) = worker.and_then(|index| self.state.generations.remove(index))
+            && !running.is_written()
+        {
+            self.cmd(Command::Llm(running.tag, LlmCmd::Cancel));
+        }
+        for id in [TimerId::ToolTimeout(call), TimerId::Rollback(call)] {
+            self.cancel_timer(id);
+        }
+        let result = self.out.text.push(result);
+        self.fact(Fact::ToolFinished {
+            call,
+            outcome,
+            result,
+        });
+    }
+
+    /// Moves every call on as far as it can go: through its gate, past
+    /// the record that must be stored first, to its tool, and out when its
+    /// time is up. Then resolves the batches that have nothing left.
+    fn advance_calls(&mut self) {
+        let mut index = 0;
+        while let Some(open) = self.state.calls.get(index).copied() {
+            let moved = match open.state {
+                CallState::Proposed => self.authorize(&open),
+                CallState::Authorized => self.send_when_stored(&open),
+                CallState::Dispatched | CallState::Cancelling => self.check_sent(&open),
+            };
+            if moved == Moved::Waits {
+                index += 1;
+            }
+        }
+        self.resolve_batches();
+    }
+
+    /// Clears a call to run, once its gate is open.
+    fn authorize(&mut self, open: &Call) -> Moved {
+        let Some(spec) = self.config.tool(open.tool).copied() else {
+            self.call_finished(open.id, ToolOutcome::Failed, tools::NOT_ALLOWED);
+            return Moved::Ended;
+        };
+        if self.state.lifecycle != Lifecycle::Running {
+            // A session that is closing starts nothing new.
+            self.call_finished(open.id, ToolOutcome::Cancelled, tools::WITHDRAWN);
+            return Moved::Ended;
+        }
+        let asker_over = self
+            .state
+            .batches
+            .iter()
+            .find(|batch| batch.id == open.batch)
+            .is_none_or(|batch| batch.over);
+        let input = GateInput {
+            tool: open.tool,
+            gate: spec.gate,
+            utterance_done: asker_over,
+        };
+        if !self.policies.gate().open(&input) {
+            if !asker_over {
+                return Moved::Waits;
+            }
+            // Nothing the gate could be waiting for is still to come.
+            self.call_finished(open.id, ToolOutcome::Failed, tools::NOT_ALLOWED);
+            return Moved::Ended;
+        }
+        let seq = self.journal(Fact::ToolAuthorized { call: open.id });
+        if spec.effect != Effect::Pure {
+            // The call may change the world, so the record that it was
+            // cleared has to be safe first: a crash must not forget a call
+            // that may have run.
+            let due = self.now.after(spec.timeout);
+            if let Some(open) = self.call_mut(open.id) {
+                open.barrier = Some(seq);
+                open.due = Some(due);
+            }
+            self.cmd(Command::AwaitDurable(seq));
+            self.cmd(Command::SetTimer(TimerId::ToolTimeout(open.id), Some(due)));
+        }
+        Moved::On
+    }
+
+    /// Ends a call that was cleared in the session's earlier life and is
+    /// not sent again. It may have been sent then: whether it ran, nobody
+    /// knows.
+    fn lose(&mut self, open: &Call) -> Moved {
+        let effect = self.config.tool(open.tool).map(|spec| spec.effect);
+        let (outcome, result) = match effect {
+            Some(Effect::Pure) | None => (ToolOutcome::Failed, tools::ANSWER_LOST),
+            Some(Effect::Idempotent | Effect::SideEffecting) => {
+                (ToolOutcome::InDoubt, tools::IN_DOUBT)
+            }
+        };
+        self.call_finished(open.id, outcome, result);
+        Moved::Ended
+    }
+
+    /// Sends a call that was cleared, once the record of that is stored.
+    fn send_when_stored(&mut self, open: &Call) -> Moved {
+        if self.state.lifecycle != Lifecycle::Running {
+            // A call that waits for its record was never sent. One that
+            // waits for nothing was cleared before the session was
+            // restarted.
+            if open.barrier.is_none() {
+                return self.lose(open);
+            }
+            self.call_finished(open.id, ToolOutcome::Cancelled, tools::WITHDRAWN);
+            return Moved::Ended;
+        }
+        if open
+            .barrier
+            .is_some_and(|barrier| self.state.durable < barrier)
+        {
+            if open.due.is_some_and(|due| self.now < due) {
+                return Moved::Waits;
+            }
+            self.call_finished(open.id, ToolOutcome::Failed, tools::NOT_RECORDED);
+            return Moved::Ended;
+        }
+        self.send(open)
+    }
+
+    /// Sends a call to what runs its tool.
+    fn send(&mut self, open: &Call) -> Moved {
+        let Some(spec) = self.config.tool(open.tool).copied() else {
+            self.call_finished(open.id, ToolOutcome::Failed, tools::NOT_ALLOWED);
+            return Moved::Ended;
+        };
+        let call = open.id;
+        // A call that was sent before is sent again only after the
+        // session was restarted.
+        let attempt = if open.is_sent() {
+            open.attempt.saturating_add(1)
+        } else {
+            open.attempt
+        };
+        match spec.executor {
+            Executor::External => {
+                self.fact(Fact::ToolDispatched { call, attempt });
+                let args = self.out.text.push(self.state.conversation.call_args(call));
+                let tool = open.tool;
+                self.cmd(Command::Tool(
+                    call,
+                    ToolCmd::Dispatch {
+                        tool,
+                        args,
+                        attempt,
+                    },
+                ));
+            }
+            Executor::Agent(worker) => {
+                let role = GenerationRole::Delegated(call);
+                let Some(index) = self.begin_generation(worker, role, Source::Writing) else {
+                    self.call_finished(call, ToolOutcome::Failed, tools::NO_AGENT);
+                    return Moved::Ended;
+                };
+                self.fact(Fact::ToolDispatched { call, attempt });
+                if let Some(running) = self.state.generations.get(index) {
+                    let start = LlmCmd::Start {
+                        agent: worker,
+                        context: running.context,
+                        cause: LlmCause::Delegated { call },
+                    };
+                    self.cmd(Command::Llm(running.tag, start));
+                }
+            }
+        }
+        let due = self.now.after(spec.timeout);
+        if let Some(open) = self.call_mut(call) {
+            open.due = Some(due);
+        }
+        self.cmd(Command::SetTimer(TimerId::ToolTimeout(call), Some(due)));
+        Moved::On
+    }
+
+    /// Looks at a call that was sent: whether its tool has had its time.
+    fn check_sent(&mut self, open: &Call) -> Moved {
+        let Some(due) = open.due else {
+            // It was sent before the session was restarted, and whoever
+            // was running it is gone. A session that is closing sends
+            // nothing.
+            if self.state.lifecycle != Lifecycle::Running {
+                return self.lose(open);
+            }
+            return self.send(open);
+        };
+        if self.now < due {
+            return Moved::Waits;
+        }
+        let call = open.id;
+        if open.state == CallState::Cancelling {
+            // The tool never confirmed that it undid the call.
+            self.call_finished(call, ToolOutcome::InDoubt, tools::IN_DOUBT);
+            return Moved::Ended;
+        }
+        let spec = self.config.tool(open.tool).copied();
+        let external = spec.is_some_and(|spec| spec.executor == Executor::External);
+        if external {
+            self.cmd(Command::Tool(call, ToolCmd::Cancel));
+        }
+        let harmless = spec.is_none_or(|spec| spec.effect == Effect::Pure);
+        if harmless || !external {
+            self.call_finished(call, ToolOutcome::Failed, tools::TIMED_OUT);
+            return Moved::Ended;
+        }
+        // It may have taken effect. The tool is given time to say that it
+        // undid the call.
+        let due = self.now.after(self.config.timing.rollback_wait);
+        if let Some(open) = self.call_mut(call) {
+            open.state = CallState::Cancelling;
+            open.due = Some(due);
+        }
+        self.cmd(Command::SetTimer(TimerId::Rollback(call), Some(due)));
+        Moved::On
+    }
+
+    /// Ends what can be ended of the calls of a session that is stopping:
+    /// those not sent, and those that change nothing. A call that may have
+    /// taken effect is left to finish.
+    fn stop_calls(&mut self) {
+        let mut index = 0;
+        while let Some(open) = self.state.calls.get(index).copied() {
+            let spec = self.config.tool(open.tool).copied();
+            let harmless = spec.is_none_or(|spec| spec.effect == Effect::Pure);
+            if !open.is_sent() {
+                self.call_finished(open.id, ToolOutcome::Cancelled, tools::WITHDRAWN);
+            } else if harmless {
+                if spec.is_some_and(|spec| spec.executor == Executor::External) {
+                    self.cmd(Command::Tool(open.id, ToolCmd::Cancel));
+                }
+                self.call_finished(open.id, ToolOutcome::Cancelled, tools::UNDONE);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Resolves every batch whose calls have all ended and that no call
+    /// can be added to. A batch of which something ran is owed a
+    /// response, the continuation.
+    fn resolve_batches(&mut self) {
+        let mut index = 0;
+        while let Some(open) = self.state.batches.get(index) {
+            let writing = !open.over
+                && self
+                    .generation_index(open.by)
+                    .and_then(|index| self.state.generations.get(index))
+                    .is_some_and(|running| !running.is_written());
+            if open.pending == 0 && !writing {
+                let batch = open.id;
+                self.fact(Fact::BatchResolved { batch });
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    // ---- Work on a tool call by another agent ------------------------------
+
+    /// A result of the work another agent does on a tool call. What it
+    /// writes is not spoken: it is the call's result.
+    fn delegated_op(&mut self, index: usize, call: ToolCallId, op: &OpEvent) {
+        let limit = self.config.limits.pending_text.saturating_mul(2);
+        let Some(running) = self.state.generations.get_mut(index) else {
+            return;
+        };
+        match op {
+            OpEvent::LlmDelta { text } => {
+                running.planned.push_str(text.as_str());
+                if running.planned.len() > limit {
+                    // It has written more than a result may hold. It is
+                    // stopped, and what it wrote is the result.
+                    self.delegated_done(index, call);
+                }
+            }
+            OpEvent::LlmDone { .. } => {
+                running.source = Source::Written;
+                self.delegated_done(index, call);
+            }
+            OpEvent::Failed {
+                part: Part::Think, ..
+            } => {
+                running.source = Source::Written;
+                self.call_finished(call, ToolOutcome::Failed, tools::NO_ANSWER);
+            }
+            // It asks for no tools of its own, and nothing of it is spoken.
+            OpEvent::ToolProposed { .. }
+            | OpEvent::TtsSegment { .. }
+            | OpEvent::Played { .. }
+            | OpEvent::Failed { .. } => {}
+        }
+    }
+
+    /// The agent working on `call` has written its answer.
+    fn delegated_done(&mut self, index: usize, call: ToolCallId) {
+        let Some(running) = self.state.generations.remove(index) else {
+            return;
+        };
+        if !running.is_written() {
+            self.cmd(Command::Llm(running.tag, LlmCmd::Cancel));
+        }
+        let answer = running.planned.trim();
+        if answer.is_empty() {
+            self.call_finished(call, ToolOutcome::Failed, tools::NO_ANSWER);
+        } else {
+            self.call_finished(call, ToolOutcome::Completed, answer);
+        }
     }
 }

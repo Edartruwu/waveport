@@ -845,8 +845,9 @@ impl Sim {
 
 #[cfg(test)]
 mod tests {
-    //! The kernel these tests run against does nothing yet, so what it
-    //! would emit is written into the session's record by hand.
+    //! Most of these tests silence the kernel and write into the session's
+    //! record by hand what it would emit, so that the expectations are
+    //! tested on their own.
 
     use std::rc::Rc;
 
@@ -938,6 +939,7 @@ mod tests {
         let fact_ = Fact::UtteranceCommitted {
             generation: GenId(generation),
             agent: AgentId(0),
+            answers: None,
             text: TextRef::EMPTY,
             truncated,
         };
