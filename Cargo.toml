@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["benches", "crates/core/*", "crates/testing/*", "xtask"]
+members = ["benches", "crates/adapters/*/*", "crates/core/*", "crates/testing/*", "xtask"]
 # Throwaway experiments with their own workspace and lockfile. The gates do
 # not see them, so they may use dependencies the product does not.
 exclude = ["spikes"]

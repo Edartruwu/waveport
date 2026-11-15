@@ -1912,6 +1912,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "waveport-llm-openai-compat"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
 name = "waveport-media"
 version = "0.1.0"
 dependencies = [

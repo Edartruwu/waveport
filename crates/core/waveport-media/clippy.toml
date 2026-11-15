@@ -4,6 +4,7 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+doc-valid-idents = ["OpenAI", "ElevenLabs", "AssemblyAI", ".."]
 
 # The media path is domain code: no clocks, no sockets, no threads, and no
 # collections whose iteration order changes from run to run.
