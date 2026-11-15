@@ -14,7 +14,8 @@ license = "MIT"
 source = "github.com/snakers4/silero-vad, tag v6.2.3"
 
 # The same model exported without `If` nodes, for inference engines that do
-# not run control flow.
+# not run control flow. Only the density spike uses it, to compare engines;
+# the product runs the standard export. Remove this entry with the spike.
 [[asset]]
 name = "silero-vad-v6.2.3-ifless.onnx"
 url = "https://raw.githubusercontent.com/snakers4/silero-vad/5cd7945676eb32225748052e2e6a0580e4686a08/src/silero_vad/data/silero_vad_op18_ifless.onnx"
