@@ -19,6 +19,17 @@ rustup toolchain install nightly-2026-11-14 --profile minimal --component miri -
 
 The instruction-count benchmarks also need Valgrind and `cargo install --locked gungraun-runner --version 0.20.0`. They run on Linux only.
 
+### Model files
+
+Model weights are not committed. `assets/assets.lock.toml` pins each file to an address that never changes what it serves, a SHA-256 and a licence:
+
+```sh
+cargo xtask fetch-assets           # download into target/assets/ and verify
+cargo xtask fetch-assets --check   # verify only; fails if a file is missing
+```
+
+A file whose digest does not match is deleted, never left in place. Adding a model is a reviewed change to the lock file.
+
 ## Running the gates
 
 ```sh
@@ -63,13 +74,16 @@ stability = "experimental"
 | `domain` | `crates/core/` | Other domain crates |
 | `ports` | `crates/core/` | Domain |
 | `protocol` | `crates/core/` | No workspace crate |
-| `application` | `crates/core/` | Domain, ports, protocol, application |
-| `adapter` | `crates/adapters/` | Domain, ports, protocol. Never another adapter |
+| `kit` | `crates/core/` | Domain, ports, protocol, other kit crates |
+| `application` | `crates/core/` | Domain, ports, protocol, application. Not the kit |
+| `adapter` | `crates/adapters/` | Domain, ports, protocol, kit. Never another adapter |
 | `composition` | `apps/`, `crates/bindings/` | Everything above |
 | `testing` | `crates/testing/` | Everything above, and other testing crates |
 | `tooling` | `xtask/`, `benches/` | Anything; `xtask` itself depends on no workspace crate |
 
 Tests follow the same directions, with one addition: any crate may dev-depend on a `testing` crate.
+
+The `kit` layer holds what adapters share: connection plumbing that would otherwise be copied into each provider crate, since one adapter may not depend on another. The application layer cannot use it, so it keeps reaching providers only through ports.
 
 `cargo xtask arch-check` reads the graph from `cargo metadata`, with every feature on, and enforces:
 
@@ -150,6 +164,10 @@ cargo xtask bench-ir --base main
 ```
 
 Only instruction counts gate a pull request: they repeat to within a fraction of a percent, where wall-clock time on a shared runner does not.
+
+## Spikes
+
+`spikes/` holds throwaway experiments that answer a question before product code depends on the answer. Each is its own Cargo workspace with its own lockfile, so it can use dependencies the product workspace would reject, and none of the gates build it. A spike's conclusions are written up under `docs/decisions/` and its raw numbers under `perf/`; the code is deleted once the product has its own benchmark for the same question.
 
 ## Pull requests
 

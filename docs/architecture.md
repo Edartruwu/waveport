@@ -1,6 +1,6 @@
 # Waveport architecture and technical spec
 
-**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist; none of the product described here is implemented yet. Every latency, memory and density figure is a design target to be validated by benchmark, not a measurement.
+**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist; none of the product described here is implemented yet. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
 
 See also the [roadmap](../ROADMAP.md) and the [ecosystem inventory](ecosystem.md).
 
@@ -35,8 +35,9 @@ Waveport is a hexagonal (ports and adapters) system with a domain-driven core. D
 | Domain | `waveport-domain` (includes the session kernel), `waveport-media` | Pure Rust: no async runtime, no sockets, no wall clock. `unsafe` is forbidden, except named DSP hot loops that run under Miri. `waveport-domain` is `no_std` with `alloc`, and CI builds it for a target with no operating system, so the compiler enforces the rule. `waveport-media` uses `std`, because it wraps DSP libraries, and is held to the rule by Clippy bans |
 | Ports | `waveport-ports` | Traits and capability types only; depends on the domain |
 | Protocol | `waveport-protocol` | Wire formats only. Depends on no workspace crate, so that a client SDK never links the kernel |
+| Kit | `waveport-adapter-kit` | What adapters share: the plumbing for provider connections (WebSocket, HTTP, server-sent events, retry classes). Depends on domain, ports and protocol. The application layer may not depend on it |
 | Application | `waveport-runtime`, `waveport-control` | Use cases: run a session, dispatch, drain, migrate, hand off. Depends on domain, ports and Tokio |
-| Adapters | `crates/adapters/**` | One crate per provider or technology. Depend on ports, never on each other |
+| Adapters | `crates/adapters/**` | One crate per provider or technology. Depend on ports and the kit, never on each other |
 | Composition roots | `waveportd`, the `waveport` CLI, language bindings | The only places where adapters are chosen and wired |
 | Testing | `crates/testing/**` | Simulation harness, allocation counter, test kit. Never a dependency of code that ships |
 | Tooling | `xtask`, `benches` | Repository gates and benchmarks. `xtask` depends on no workspace crate, so the gates build even when product crates do not |
@@ -90,9 +91,9 @@ Two alternatives were rejected. A chain of per-processor tasks joined by queues 
 
 - The process runs N shards. Each shard is a pinned, single-threaded Tokio `LocalRuntime`, and a session stays on one shard for life.
 - The session path therefore has no cross-thread wake-ups and no locks, the kernel-to-playout call is an ordinary function call, and production has the same topology as the simulator.
-- The cost is head-of-line blocking. Inline work is capped at 100 µs per call, enforced by a poll-time watchdog and a CI gate. Opus and SIMD resampling fit that budget and run inline.
+- The cost is head-of-line blocking. Inline work is capped at 250 µs per call, enforced by a poll-time watchdog and a CI gate. Opus and SIMD resampling fit that budget and run inline. The cap was 100 µs until the phase 1 spike measured an Opus encode at 24 kHz: 110 to 140 µs on average and up to 215 µs, depending on encoder complexity.
 - Adapters are still required to be `Send`, so moving to a work-stealing runtime stays possible. If pacing jitter misses its target, the media loop moves to a sibling thread per shard without touching the kernel.
-- Model batching: shards push `(slot, frame)` into a lock-free ring. The voice-activity batcher fires at 64 items or after 2 ms. Turn and interruption models fire immediately with whatever is queued. Results return as kernel events stamped with media time, so batching cannot reorder them.
+- Model batching: shards push `(slot, frame)` into a lock-free ring. Every model fires immediately with whatever is queued, up to 64 frames for voice activity, so batches grow by themselves as load grows. The spike measured the alternative, waiting up to 2 ms to fill a batch: it saves 14% of inference time and misses the latency target in section 12. Results return as kernel events stamped with media time, so batching cannot reorder them.
 
 ### 4.3 Identities
 
@@ -422,7 +423,7 @@ All are design targets, each enforced by a benchmark gate from phase 1.
 | Journal cost per record on the hot path | 2 µs | 10 µs |
 | Heap allocations per audio frame in steady state | 0 | 0 |
 
-**Density.** The estimate per active cascaded session is 0.7 to 1 % of a core. The targets are 100 active voice sessions per core (about 40 with local neural noise suppression), 1,000 to 1,500 per 16-core node, and more than 5,000 text-only sessions per core. For comparison, LiveKit's own guidance is 10 to 25 jobs per 4 cores. The estimate assumes a 2 to 4 times CPU gain from batching, which is unverified; the phase 1 spike tests it first.
+**Density.** The phase 1 spike measured one active cascaded session at 1.17% of a core ([decision 0001](decisions/0001-density-spike.md)): 0.45% on the shard thread, most of it the Opus encoder, 0.14% for voice-activity inference and 0.57% for end-of-turn inference at one inference every ten seconds. That is 85 sessions per core with nothing to spare. The planning figure is 60 active voice sessions per core, which keeps a core at 75% and allows a tenth for the work the spike did not model, and about 900 per 16-core node. One shard thread holds its timing up to about 150 sessions; inference is what limits the core count. The earlier estimate of 0.7 to 1% and target of 100 per core left out end-of-turn inference and assumed batching would make inference 2 to 4 times cheaper; the measured gain is 1.9 times. The measurement has limits, listed in the decision record: one laptop core at turbo frequency, with the rest of the machine nearly idle. Not measured: local neural noise suppression, which the earlier figures put at about 1.5% of a core per session, and text-only sessions, estimated at more than 5,000 per core. For comparison, LiveKit's own guidance is 10 to 25 jobs per 4 cores.
 
 ## 13. Invariants
 
@@ -463,7 +464,7 @@ waveport/
 ├─ xtask/          repository gates, run as `cargo xtask <command>`
 ├─ benches/        waveport-benches: wall-clock and instruction-count benchmarks
 ├─ crates/
-│  ├─ core/        waveport-domain · -media · -ports · -runtime · -control · -protocol
+│  ├─ core/        waveport-domain · -media · -ports · -adapter-kit · -runtime · -control · -protocol
 │  ├─ adapters/
 │  │  ├─ transport/   webrtc · websocket · telephony-ws · sip · moq · livekit · local-audio
 │  │  ├─ stt/ llm/ tts/ realtime/   one crate per provider
@@ -479,11 +480,14 @@ waveport/
 ├─ apps/           waveportd · waveport-cli · console (web UI) · operator
 ├─ sdks/           js · react · swift · kotlin · react-native · flutter · embedded
 ├─ models/         training and evaluation code for the open models
+├─ assets/         assets.lock.toml: model files pinned by address and SHA-256, fetched on demand
+├─ perf/           recorded measurements and baselines
+├─ spikes/         throwaway experiments, outside the workspace and its gates
 ├─ deploy/         Dockerfiles · Helm chart · examples
 └─ docs/ · examples/
 ```
 
-`xtask/`, `benches/`, `crates/core/`, `crates/testing/` (without `-evals`) and `docs/` exist today. The rest is added in the phase that needs it.
+`xtask/`, `benches/`, `crates/core/` (without the adapter kit), `crates/testing/` (without `-evals`), `assets/`, `perf/`, `spikes/` and `docs/` exist today. The rest is added in the phase that needs it.
 
 The root [`Cargo.toml`](../Cargo.toml) is the source of truth for workspace members, lint levels, profiles and dependency versions. What it does not say by itself:
 
@@ -509,8 +513,8 @@ Versions and licences were checked against crates.io on 14 November 2026.
 | SIP | `rsipstack` 0.8.5 | `rvoip` 0.4.0 is the fallback |
 | RTP, SRTP, SDP | `rtp` and `rtcp` 0.17.3, `webrtc-srtp` 0.17.3, `sdp-types` 0.3.2 | Packet types only; sessions are written in-repo |
 | Codecs and DSP | `opus` 0.4.0 (libopus), `ezk-g722` 0.1.2, `rubato` 5.1.0, `nnnoiseless` 0.5.2, `rtrb` 0.4.1, `bytes` 1.12.1 | G.711 written in-repo. DeepFilterNet is a later candidate (git dependency only) |
-| Local inference | `ort` 2.0.0-rc.15 (ONNX Runtime 1.31) against `tract` 0.23.10, decided by the phase 1 spike | `ort` inference needs exclusive access to a session, so each compute thread owns one |
-| Bundled models | Silero VAD; Smart Turn v3.2 (BSD-2, about 8 MB) | Re-confirm the Silero licence before bundling. LiveKit's turn detector cannot be used: its licence restricts it to LiveKit Agents |
+| Local inference | `ort` 2.0.0-rc.15 (ONNX Runtime 1.31) | Chosen over `tract` 0.23.10 by the phase 1 spike ([decision 0001](decisions/0001-density-spike.md)): `tract` cannot load the standard Silero export, and on Smart Turn it is 2.6 times slower and its outputs differ. `ort` inference needs exclusive access to a session, so each compute thread owns one |
+| Bundled models | Silero VAD v6.2.3 (MIT, 2.3 MB); Smart Turn v3.2 (BSD-2, 8.7 MB) | Pinned by address and SHA-256 in `assets/assets.lock.toml` and fetched by `cargo xtask fetch-assets`; never committed. LiveKit's turn detector cannot be used: its licence restricts it to LiveKit Agents |
 | Local speech (optional) | `sherpa-onnx` 2.0.1 | Local LLMs run out of process behind the OpenAI-compatible adapter |
 | QUIC and MoQ | `quinn` 0.11.12, `web-transport-quinn` 0.13.6, `moq-net` 0.3.23 | Experimental transport; the drafts are still moving |
 | WebSocket, HTTP, gRPC | `tokio-tungstenite` 0.30.0, `axum` 0.8.9, `hyper` 1.12.0, `reqwest` 0.13.5, `tonic` 0.14.9, `prost` 0.14.6 | A breaking `tonic` release is pending |
@@ -520,7 +524,7 @@ Versions and licences were checked against crates.io on 14 November 2026.
 | Knowledge | `qdrant-client` 1.20.0, `lancedb` 0.41.0, `pgvector` 0.4.2, `fastembed` 7.7.0 | |
 | Observability | `tracing` 0.1.44, `opentelemetry` 0.33.1, `tracing-opentelemetry` 0.34.0, `metrics` 0.24.6, `dial9-tokio-telemetry` 0.5.8 | GenAI attribute names are defined in-repo; the upstream constants are deprecated |
 | Bindings and plugins | `pyo3` 0.30.1, `napi` 3.16.2, `uniffi` 0.32.2, `wasm-bindgen` 0.2.130, `wasmtime` 50.0.1 with `wit-bindgen` 0.63.0 | WASI 0.3 (June 2026) gives plugins native async streams |
-| Hot-path structures | `crossbeam-channel` 0.5.17, `arc-swap` 1.9.5, `papaya` 0.2.5, `zerocopy` 0.8.63; `mimalloc` 0.1.52 or `tikv-jemallocator` 0.7.0 by benchmark | |
+| Hot-path structures | `crossbeam-channel` 0.5.17, `arc-swap` 1.9.5, `papaya` 0.2.5, `zerocopy` 0.8.63; `mimalloc` 0.1.52 | The allocator was chosen by the phase 1 spike ([decision 0001](decisions/0001-density-spike.md)) |
 | Kubernetes | `kube` 5.1.0, `k8s-openapi` 0.29.0 | Three major versions in 2026 |
 | Testing | `turmoil` 0.7.2, `shuttle` 0.9.10, `loom` 0.7.3, `proptest` 1.12.0, `cargo-fuzz`, `insta` 1.49.0, `cargo-nextest`, `criterion` 0.8.2, `gungraun` 0.20.0 | |
 | Release hygiene | `cargo-deny`, `cargo-semver-checks`, `cargo-hack`, `cargo-dist`, `release-plz` | |
@@ -563,7 +567,7 @@ Multi-provider LLM crates (`genai`, `rig`) are rejected as foundations: they hav
 | Features | Additive only. Each provider crate is opt-in. The feature powerset of core crates is checked in CI |
 | Supply chain | Licence allow-list, advisory and duplicate checks on every pull request. Lockfile committed. Cargo 1.100 dependency cooldowns on, because crates.io filled with high-churn voice and SIP crates in 2026 |
 | API stability | Three tiers: stable, preview, experimental; see the [stability policy](stability.md). Semver check and public-API diff on every pull request. Deprecations live at least two minor releases and six months |
-| Release build | Fat LTO, one codegen unit, unwinding kept on, profile-guided optimisation for `waveportd`, a non-glibc allocator |
+| Release build | Fat LTO, one codegen unit, unwinding kept on, profile-guided optimisation for `waveportd`, `mimalloc` as the global allocator |
 | Testing | See section 14. Provider contract tests run against recorded fixtures on every pull request and against live providers nightly |
 
 ## 18. Top risks
@@ -571,7 +575,7 @@ Multi-provider LLM crates (`genai`, `rig`) are rejected as foundations: they hav
 | Risk | Early test |
 |---|---|
 | The kernel becomes a monolith users cannot extend | Six executable scenarios before any real adapter: the four Pipecat races, hybrid front/back, three-party attribution |
-| Shared-process blast radius; density rests on estimates | The 1,000-session spike; `kill -9` resume in CI from the first milestone; per-session panic isolation; an option to host native inference in a sidecar |
+| Shared-process blast radius; density measured on one laptop core only | The phase 1 density spike ([decision 0001](decisions/0001-density-spike.md)), to be repeated on server hardware with every core loaded; `kill -9` resume in CI from the first milestone; per-session panic isolation; an option to host native inference in a sidecar |
 | Providers behave differently from their declared capabilities | Two speech-to-speech adapters with opposite capability profiles; the nightly conformance kit; measured spoken-prefix error on WebRTC and on a carrier WebSocket |
 
 ## 19. Open questions
@@ -580,8 +584,6 @@ These are not decided and each has an owner phase.
 
 | Question | Decided in |
 |---|---|
-| `ort` or `tract` for the small local models | Phase 1 spike |
-| `mimalloc` or jemalloc | Phase 1 spike |
 | Whether per-shard `LocalRuntime` holds its pacing target, or the media loop needs its own thread | Phase 1 |
 | Which speech-to-text and text-to-speech providers ship first | Phase 1 |
 | How a carrier media-stream session moves when its node drains or dies: a thin media edge that holds the socket, or a carrier-side reconnect | Phase 3 |
