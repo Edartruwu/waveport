@@ -56,6 +56,9 @@ pub struct TransportLog {
     /// What the far end had played of each response when it was last
     /// heard of.
     pub played: Vec<(OpTag, MediaDur)>,
+    /// How many frames of a response were sent after the far end was told
+    /// to discard it. The port does not allow any.
+    pub late: usize,
 }
 
 impl TransportLog {
@@ -103,12 +106,15 @@ impl TransportHandle {
 #[derive(Clone, Copy, Debug)]
 struct Playing {
     tag: OpTag,
-    /// When its first frame arrived.
+    /// When it began, or will begin, to be played.
     since: Instant,
     /// How much of its audio has arrived and was not discarded.
     received: MediaDur,
     /// How much the far end last said it had played.
     reported: Option<MediaDur>,
+    /// Whether it was told to discard the response. It plays no more of
+    /// it then, whatever arrives.
+    cleared: bool,
 }
 
 impl Playing {
@@ -131,6 +137,7 @@ pub struct FakeTransportBuilder {
     caps: TransportCaps,
     events: Vec<(Duration, TransportEvent)>,
     closes: bool,
+    holds: Duration,
 }
 
 impl FakeTransportBuilder {
@@ -218,6 +225,15 @@ impl FakeTransportBuilder {
         self
     }
 
+    /// The far end holds `ms` of each response before it plays any of it,
+    /// as a buffer against jitter does. What it has played is then that
+    /// far behind what it was sent.
+    #[must_use]
+    pub const fn holding(mut self, ms: u64) -> Self {
+        self.holds = Duration::from_millis(ms);
+        self
+    }
+
     /// The transport closes once its script has run out. Without this it
     /// stays open, with nothing more happening at the far end.
     #[must_use]
@@ -240,6 +256,7 @@ impl FakeTransportBuilder {
             start,
             script: self.events.into(),
             closes: self.closes,
+            holds: self.holds,
             playing: None,
             timer: Box::pin(tokio::time::sleep_until(start)),
             waker: None,
@@ -256,6 +273,7 @@ pub struct FakeTransport {
     start: Instant,
     script: VecDeque<(Duration, TransportEvent)>,
     closes: bool,
+    holds: Duration,
     playing: Option<Playing>,
     timer: Pin<Box<Sleep>>,
     /// Whoever waits for the next event, to be told when a frame gives
@@ -287,6 +305,7 @@ impl FakeTransport {
             caps,
             events: Vec::new(),
             closes: false,
+            holds: Duration::ZERO,
         }
     }
 
@@ -389,7 +408,7 @@ impl Transport for FakeTransport {
         let end = frame.at.saturating_add(frame.length);
         match &mut self.playing {
             Some(playing) if playing.tag == frame.tag => {
-                if end > playing.received {
+                if end > playing.received && !playing.cleared {
                     playing.received = end;
                 }
             }
@@ -397,11 +416,18 @@ impl Transport for FakeTransport {
             _ => {
                 self.playing = Some(Playing {
                     tag: frame.tag,
-                    since: now,
+                    since: now + self.holds,
                     received: end,
                     reported: None,
+                    cleared: false,
                 });
             }
+        }
+        if self
+            .playing
+            .is_some_and(|playing| playing.tag == frame.tag && playing.cleared)
+        {
+            self.log().late += 1;
         }
         let sent = SentFrame {
             when: now.saturating_duration_since(self.start),
@@ -429,6 +455,7 @@ impl Transport for FakeTransport {
         {
             // What was not played yet never will be.
             playing.received = playing.played(now);
+            playing.cleared = true;
         }
         if let Some(waker) = self.waker.take() {
             waker.wake();
