@@ -16,6 +16,8 @@ mod git;
 mod lint_sync;
 mod meta;
 mod report;
+#[cfg(test)]
+mod secrets;
 mod semver;
 mod tier;
 mod title;
