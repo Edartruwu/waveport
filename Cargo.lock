@@ -2391,11 +2391,15 @@ version = "0.1.0"
 name = "waveport-benches"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "criterion",
  "gungraun",
+ "tokio",
  "waveport-domain",
  "waveport-media",
+ "waveport-ports",
  "waveport-sim",
+ "waveport-store-journal",
 ]
 
 [[package]]
