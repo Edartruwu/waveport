@@ -685,6 +685,7 @@ version = "0.1.0"
 name = "waveport-domain"
 version = "0.1.0"
 dependencies = [
+ "waveport-alloc-counter",
  "waveport-kernel-sim",
 ]
 
