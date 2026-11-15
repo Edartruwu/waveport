@@ -1,0 +1,8 @@
+[registry]
+# Dependency cooldown: never resolve to a version published less than a week
+# ago. Versions already in Cargo.lock are exempt. One-off override:
+#   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update <crate> --precise <version>
+global-min-publish-age = "7 days"
+
+[resolver]
+incompatible-publish-age = "deny"

@@ -1,0 +1,8 @@
+# The minimum supported Rust version comes from `rust-version` in Cargo.toml.
+#
+# A `clippy.toml` nearer to a crate replaces this file instead of merging with
+# it, so nested files must repeat these keys. `cargo xtask lint-sync` checks it.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
