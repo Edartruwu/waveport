@@ -510,8 +510,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let url = format!("ws://{address}/");
+        // Some systems take a second or two to say that nothing listens;
+        // a refusal and a timeout are both worth another try.
         let error = WsConn::connect(WsRequest::new(&url)).await.unwrap_err();
-        assert_eq!(error.class, RetryClass::Transient, "{error}");
+        assert!(error.is_retryable(), "{error}");
     }
 
     #[tokio::test]

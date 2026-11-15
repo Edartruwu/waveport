@@ -359,7 +359,15 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let url = format!("http://{address}/v1/chat/completions?key=in-the-address");
-        let error = client()
+        // The usual time limits: some systems take a second or two to say
+        // that nothing listens, and whether that shows as a refusal or as
+        // a timeout is theirs to decide. Either is worth another try.
+        let client = HttpClient::new(HttpSettings {
+            direct: true,
+            ..HttpSettings::default()
+        })
+        .unwrap();
+        let error = client
             .post(HttpRequest {
                 url: &url,
                 headers: &[],
@@ -368,7 +376,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert_eq!(error.class, RetryClass::Transient, "{error}");
+        assert!(error.is_retryable(), "{error}");
         assert!(!error.message.contains("in-the-address"), "{error}");
     }
 
