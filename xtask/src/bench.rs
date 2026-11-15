@@ -19,12 +19,13 @@ const REGRESSED: i32 = 3;
 /// How far the instruction count of a benchmark may grow.
 const LIMIT: &str = "--callgrind-limits=ir=2%";
 
+/// Every instruction-count benchmark: the bench targets named `ir_*`.
 const BENCH: &[&str] = &[
     "bench",
     "-p",
     "waveport-benches",
     "--bench",
-    "ir_smoke",
+    "ir_*",
     "--locked",
     "--",
 ];

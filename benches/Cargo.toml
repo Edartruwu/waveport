@@ -17,6 +17,7 @@ stability = "internal"
 bench = false
 
 [dependencies]
+waveport-domain = { workspace = true }
 waveport-sim = { workspace = true }
 
 [dev-dependencies]
@@ -31,9 +32,15 @@ name = "wall_smoke"
 path = "wall/smoke.rs"
 harness = false
 
+# `cargo xtask bench-ir` runs every benchmark whose name begins with `ir_`.
 [[bench]]
 name = "ir_smoke"
 path = "ir/smoke.rs"
+harness = false
+
+[[bench]]
+name = "ir_kernel"
+path = "ir/kernel.rs"
 harness = false
 
 [lints]
