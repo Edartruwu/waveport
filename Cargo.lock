@@ -2004,6 +2004,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "waveport-tts-cartesia"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
