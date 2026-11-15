@@ -4,9 +4,9 @@ Waveport is an open-source platform for real-time voice and multimodal AI agents
 
 ## Status
 
-**Foundations, the first measurements, and the session kernel.** The repository holds the workspace, the quality gates, the test and benchmark harnesses, and the first product code: the session kernel, which decides who has the floor, what the agent says and how much of it was heard, which tool calls run and what became of each, and what a session is after its process died. It is a library with no I/O. Nothing here runs a voice session yet.
+**Foundations, the first measurements, the session kernel and the audio path.** The repository holds the workspace, the quality gates, the test and benchmark harnesses, and the first product code. The session kernel decides who has the floor, what the agent says and how much of it was heard, which tool calls run and what became of each, and what a session is after its process died. The audio path turns the packets of a transport into audio in order and the audio of speech synthesis into frames handed over at the pace they are heard, and knows how much of a response has been heard. Both are libraries with no I/O. Nothing here runs a voice session yet.
 
-Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel is the second: it passes the six scenarios written before it, and its invariants are checked on random sessions and on every path through small ones. Audio, the ports, the runtime, providers and the first voice loop come next.
+Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel is the second: it passes the six scenarios written before it, and its invariants are checked on random sessions and on every path through small ones. The audio path is the third: Opus and G.711, the change of rate, a reorder buffer, pacing and the playout ledger, with no allocation per frame. The ports, the runtime, providers and the first voice loop come next.
 
 ## Documents
 

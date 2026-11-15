@@ -6,6 +6,8 @@ This guide covers how the repository is checked and the rules those checks enfor
 
 Install [rustup](https://rustup.rs/). The toolchain (Rust 1.100.0 with rustfmt and Clippy) is pinned in `rust-toolchain.toml` and is installed the first time you run `cargo` in the repository.
 
+Building also needs [CMake](https://cmake.org/) and a C compiler: `waveport-media` uses libopus, which is built from its source and linked in. Nothing has to be installed for it beyond those two.
+
 The slower gates use extra tools. `cargo xtask ci` skips a gate whose tool is missing and prints the command that installs it:
 
 ```sh
@@ -103,7 +105,7 @@ The runtime and entropy crate lists, and the third-party crates each inner layer
 Two layers have a second line of defence:
 
 - `waveport-domain` is `#![no_std]` with `alloc`. It cannot name a socket, a clock, a thread or a file, and the `no-std` gate proves it.
-- `waveport-media` uses `std`, because it will wrap DSP libraries. Its own `clippy.toml` bans clocks, sockets, threads, files and hash maps with random iteration order.
+- `waveport-media` uses `std`, because it wraps libopus. Its own `clippy.toml` bans clocks, sockets, threads, files and hash maps with random iteration order, so the time is always an argument.
 
 ### Adding a crate
 
@@ -174,11 +176,19 @@ WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay
 
 **Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps and of rebuilding a session from its journal, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
 
+**Audio path.** `waveport-media` is tested on signals, not on sample values copied from a run: a tone has to come through a codec or a change of rate at its level, and one above the band has to be gone. `tests/network.rs` makes up 500 networks between a sender and the inbound path from seeds (jitter, loss, repeats, outages, bursts) and checks rules on what comes out: one unbroken timeline, each packet once and in order, no deadline in the past. It also checks that the sweep met each kind of trouble often enough. When you change the inbound path, run a larger sweep once; a release build does 200,000 networks in under half a minute:
+
+```sh
+WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-media --test network
+```
+
+`tests/no_alloc.rs` runs a packet in and a frame out for every codec, with losses, late packets, an interruption and a change of volume, and fails if any of it calls the allocator. `benches/ir/media.rs` counts the instructions of one frame each way for each codec, under the same 2% rule as the kernel's.
+
 **Allocations.** `waveport-alloc-counter` proves a code path does not touch the heap. Install `CountingAllocator` as the global allocator of the test binary and wrap the code in `assert_no_alloc`. Without the allocator installed the assertion fails instead of passing silently.
 
 ## Benchmarks
 
-Benchmarks live in the `benches` package: wall-clock ones under `benches/wall/` (criterion) and instruction-count ones under `benches/ir/` (gungraun, under Valgrind). The workloads are defined once in `benches/src/lib.rs`, so both kinds measure the same code.
+Benchmarks live in the `benches` package: wall-clock ones under `benches/wall/` (criterion) and instruction-count ones under `benches/ir/` (gungraun, under Valgrind). The workloads are defined once under `benches/src/`, so both kinds measure the same code.
 
 ```sh
 cargo bench -p waveport-benches --bench wall_smoke
