@@ -11,11 +11,14 @@
 //!   here, an adapter talking to a recorded provider, or one talking to
 //!   the real thing.
 //! - [`drive`]: taking the next event of a port, as a future.
+//! - [`servers`]: servers on this machine that answer as a provider was
+//!   recorded to, for the tests of adapters.
 //! - The allocation counter, re-exported.
 
 pub mod conformance;
 pub mod drive;
 pub mod fakes;
+pub mod servers;
 
 pub use waveport_alloc_counter::{
     AllocStats, CountingAllocator, assert_no_alloc, is_installed, measure, snapshot,

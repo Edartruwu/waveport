@@ -24,7 +24,7 @@ waveport-media = { workspace = true }
 waveport-ports = { workspace = true }
 
 bytes = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
