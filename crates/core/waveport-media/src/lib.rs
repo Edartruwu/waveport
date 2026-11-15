@@ -15,6 +15,8 @@
 
 pub mod codec;
 pub mod rate;
+pub mod resample;
+pub mod ring;
 
 #[cfg(test)]
 mod testing;

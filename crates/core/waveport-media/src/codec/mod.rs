@@ -1,5 +1,6 @@
 //! Audio codecs: from the bytes a transport carries to samples and back.
 
+pub mod g711;
 pub mod opus;
 
 use core::fmt;
