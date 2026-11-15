@@ -150,7 +150,7 @@ struct Session {
     plan: CascadePlan,
     parts: Parts,
 
-    transport: Pin<Box<FakeTransport>>,
+    transport: FakeTransport,
     ingress: Ingress,
     /// When the inbound path is to be looked at again if nothing arrives.
     ingress_due: Option<MonoTime>,
@@ -248,7 +248,7 @@ impl Session {
             began,
             kernel,
             parts,
-            transport: Box::pin(transport),
+            transport,
             ingress,
             ingress_due: None,
             hearing: Some(hearing),
@@ -415,7 +415,7 @@ impl Session {
     }
 
     fn poll_transport(&mut self, cx: &mut Context<'_>, now: MonoTime, events: &mut Vec<Event>) {
-        while let Poll::Ready(Some(event)) = self.transport.as_mut().poll_event(cx) {
+        while let Poll::Ready(Some(event)) = self.transport.poll_event(cx) {
             match event {
                 TransportEvent::Joined { who } => {
                     events.push(Event::Control(ControlInput::Join { who }));
@@ -712,8 +712,6 @@ impl Session {
                 last: frame.last,
             };
             self.transport
-                .as_mut()
-                .get_mut()
                 .try_send(out)
                 .expect("the transport keeps up");
             sent = true;
@@ -850,8 +848,6 @@ impl Session {
                 if self.plan.playback.clear_on_stop {
                     let clear = TransportControl::Clear { tag };
                     self.transport
-                        .as_mut()
-                        .get_mut()
                         .try_control(clear)
                         .expect("the transport keeps up");
                 }

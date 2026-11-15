@@ -368,8 +368,8 @@ impl Transport for FakeTransport {
         self.caps
     }
 
-    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>> {
-        let this = self.get_mut();
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>> {
+        let this = self;
         let now = Instant::now();
         if let Some((at, _)) = this.script.front()
             && this.start + *at <= now

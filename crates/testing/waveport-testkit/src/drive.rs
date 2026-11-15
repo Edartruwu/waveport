@@ -28,8 +28,6 @@ pub async fn next_tts(rx: &mut Pin<Box<dyn TtsRx>>) -> Option<Result<TtsEvent, P
 }
 
 /// The next event of a transport.
-pub async fn next_transport<T: Transport + ?Sized>(
-    transport: &mut Pin<Box<T>>,
-) -> Option<TransportEvent> {
-    poll_fn(|cx| transport.as_mut().poll_event(cx)).await
+pub async fn next_transport<T: Transport + ?Sized>(transport: &mut T) -> Option<TransportEvent> {
+    poll_fn(|cx| transport.poll_event(cx)).await
 }

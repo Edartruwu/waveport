@@ -5,7 +5,6 @@
 //! transport hands over what arrived, in the order it arrived, and sends
 //! what it is given when it is given it.
 
-use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -22,7 +21,11 @@ pub trait Transport: Send + 'static {
 
     /// The next thing that happened. `None` means the transport is closed
     /// and nothing more will.
-    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
+    ///
+    /// The transport is not pinned: the same owner polls it and sends
+    /// through it, and holds it in a box. A transport that needs a place
+    /// that does not move keeps that part of itself in a box of its own.
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
 
     /// Sends a frame of a response's audio.
     ///

@@ -338,7 +338,7 @@ pub trait Llm: Send + Sync + 'static {
 
 pub trait Transport: Send + 'static {
     fn caps(&self) -> TransportCaps; // codec each way, remote buffer (clearable, says what it played), text
-    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
     fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full>;
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full>; // Clear
 }
