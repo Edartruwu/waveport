@@ -14,7 +14,10 @@
 //! [rates](rate::Rate). Time is always an argument.
 
 pub mod codec;
+pub mod gain;
 pub mod ingress;
+pub mod ledger;
+pub mod playout;
 pub mod rate;
 pub mod resample;
 pub mod ring;
