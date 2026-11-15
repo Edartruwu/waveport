@@ -2,7 +2,7 @@
 
 Waveport is an open-source platform for real-time voice and multimodal AI agents, written in Rust. One runtime is both the agent framework and the system that operates it: it runs conversations, terminates media, dispatches work across a fleet, journals every session, and ships the models, console and connectors needed to run all of it on your own servers.
 
-**Status (14 November 2026):** planning. Nothing in this roadmap is built yet.
+**Status (15 November 2026):** phase 0 (foundations) is implemented and its gates pass on Linux. Its exit criterion is not met yet: the CI workflows have not run on macOS, Windows or Linux arm64. No product code exists.
 
 Companion documents:
 

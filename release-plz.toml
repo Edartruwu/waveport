@@ -1,0 +1,28 @@
+# Release tooling; see https://release-plz.dev/docs/config.
+#
+# The release-plz workflow is started by hand. It opens a pull request with
+# the version bumps and changelog entries computed from the commits since the
+# last tag. Merging that pull request is the release decision.
+
+[workspace]
+# Versions come from git tags, not from a registry: nothing is published yet.
+git_only = true
+publish = false
+# One changelog for the whole workspace.
+changelog_path = "./CHANGELOG.md"
+# Tag a release only when a release pull request is merged.
+release_always = false
+# Dependency updates are separate, reviewed changes.
+dependencies_update = false
+# API compatibility is checked by `cargo xtask semver`, which knows the
+# stability tiers.
+semver_check = false
+
+# Internal crates are never released.
+[[package]]
+name = "xtask"
+release = false
+
+[[package]]
+name = "waveport-benches"
+release = false
