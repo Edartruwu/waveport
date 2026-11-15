@@ -213,6 +213,8 @@ struct Hearing {
     window: Option<MediaTime>,
     /// Transcripts given.
     given: usize,
+    /// Whether any audio has arrived.
+    begun: bool,
 }
 
 impl Hearing {
@@ -242,10 +244,18 @@ impl Hearing {
             end: MediaTime::ZERO,
             window: None,
             given: 0,
+            begun: false,
         }
     }
 
     async fn audio(&mut self, at: MediaTime, length: MediaDur) -> Result<(), PortError> {
+        if !core::mem::replace(&mut self.begun, true) {
+            // What was said before the stream's first audio was not said
+            // to this stream.
+            let before = self.words.iter().take_while(|word| word.end <= at).count();
+            self.heard = before;
+            self.finalized = before;
+        }
         self.window.get_or_insert(at);
         self.end = at.after(length);
         // Every word the audio has now passed is heard.

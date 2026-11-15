@@ -59,6 +59,9 @@ pub struct TransportLog {
     /// How many frames of a response were sent after the far end was told
     /// to discard it. The port does not allow any.
     pub late: usize,
+    /// How many frames and requests were sent after the transport had
+    /// said that it was closed.
+    pub after_close: usize,
 }
 
 impl TransportLog {
@@ -234,8 +237,9 @@ impl FakeTransportBuilder {
         self
     }
 
-    /// The transport closes once its script has run out. Without this it
-    /// stays open, with nothing more happening at the far end.
+    /// The transport closes once its script has run out, whatever the
+    /// far end is playing then. Without this it stays open, with nothing
+    /// more happening at the far end.
     #[must_use]
     pub const fn then_closes(mut self) -> Self {
         self.closes = true;
@@ -256,6 +260,7 @@ impl FakeTransportBuilder {
             start,
             script: self.events.into(),
             closes: self.closes,
+            closed: false,
             holds: self.holds,
             playing: None,
             timer: Box::pin(tokio::time::sleep_until(start)),
@@ -273,6 +278,8 @@ pub struct FakeTransport {
     start: Instant,
     script: VecDeque<(Duration, TransportEvent)>,
     closes: bool,
+    /// Whether it has said that it is closed.
+    closed: bool,
     holds: Duration,
     playing: Option<Playing>,
     timer: Pin<Box<Sleep>>,
@@ -377,6 +384,11 @@ impl Transport for FakeTransport {
         {
             return Poll::Ready(Some(event));
         }
+        if this.closed || (this.closes && this.script.is_empty()) {
+            // The far end is gone, whatever it was playing.
+            this.closed = true;
+            return Poll::Ready(None);
+        }
         if let Some(event) = this.report(now) {
             return Poll::Ready(Some(event));
         }
@@ -387,9 +399,6 @@ impl Transport for FakeTransport {
             (a, b) => a.or(b),
         };
         let Some(next) = next else {
-            if this.closes && this.script.is_empty() {
-                return Poll::Ready(None);
-            }
             // Nothing is due. A frame that is sent may change that.
             this.waker = Some(cx.waker().clone());
             return Poll::Pending;
@@ -404,6 +413,10 @@ impl Transport for FakeTransport {
     }
 
     fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full> {
+        if self.closed {
+            self.log().after_close += 1;
+            return Ok(());
+        }
         let now = Instant::now();
         let end = frame.at.saturating_add(frame.length);
         match &mut self.playing {
@@ -445,6 +458,10 @@ impl Transport for FakeTransport {
     }
 
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full> {
+        if self.closed {
+            self.log().after_close += 1;
+            return Ok(());
+        }
         let now = Instant::now();
         let TransportControl::Clear { tag } = control;
         let when = now.saturating_duration_since(self.start);

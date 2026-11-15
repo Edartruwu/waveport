@@ -11,6 +11,7 @@
 
 pub mod journal;
 pub mod llm;
+pub mod models;
 pub mod stt;
 pub mod tools;
 pub mod transport;
@@ -18,6 +19,7 @@ pub mod tts;
 
 pub use journal::MemoryJournal;
 pub use llm::{Asked, LlmStep, Said, ScriptedLlm};
+pub use models::{ByLength, LoudVad, ScriptedTurns, TurnLog};
 pub use stt::{ScriptedStt, Spoken, SttLog, SttScript};
 pub use tools::{Called, ScriptedTools};
 pub use transport::{
