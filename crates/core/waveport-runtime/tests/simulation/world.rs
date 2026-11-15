@@ -787,6 +787,7 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         }
         let wire = fresh.far_end.log();
         tally.frames += wire.frames.len() as u64;
+        tally.reopened += u64::from(session.stats().hearing.recogniser_failures);
         if explain {
             log.push(format!(
                 "{:>7} ms  LIFE {life} IS OVER: ended {ended:?}, died {died}",

@@ -362,6 +362,9 @@ fn chaos() {
     assert!(tally.turns >= tally.runs, "{tally:?}");
     assert!(tally.spoken >= tally.runs / 2, "{tally:?}");
     assert!(tally.failed >= tally.runs / 10, "{tally:?}");
+    // Recognisers failed, were opened again, and the callers were still
+    // heard.
+    assert!(tally.reopened > 0, "{tally:?}");
 }
 
 #[test]
