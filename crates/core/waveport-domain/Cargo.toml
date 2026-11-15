@@ -16,5 +16,8 @@ stability = "experimental"
 [lib]
 bench = false
 
+[dev-dependencies]
+waveport-kernel-sim = { workspace = true }
+
 [lints]
 workspace = true

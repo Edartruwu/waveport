@@ -684,6 +684,9 @@ version = "0.1.0"
 [[package]]
 name = "waveport-domain"
 version = "0.1.0"
+dependencies = [
+ "waveport-kernel-sim",
+]
 
 [[package]]
 name = "waveport-kernel-sim"
