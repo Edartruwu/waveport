@@ -110,6 +110,18 @@ toml = "1.2.1"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 gungraun = "0.20.0"
 
+# The tests of the runtime run whole sessions, and with them the audio path
+# and the fakes that make and take audio, a sample at a time. Unoptimised,
+# those two crates make such a test about ten times slower, and every pull
+# request pays for it on four platforms. Overflow checks and debug
+# assertions stay on. The price is that a debugger sees less of these two
+# crates in a debug build.
+[profile.dev.package.waveport-media]
+opt-level = 2
+
+[profile.dev.package.waveport-testkit]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "fat"
