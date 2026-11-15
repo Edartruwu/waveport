@@ -18,6 +18,9 @@ pub(crate) enum Layer {
     Domain,
     Ports,
     Protocol,
+    /// Client plumbing shared by adapters. Adapters may not depend on each
+    /// other, so code several of them need lives here.
+    Kit,
     Application,
     Adapter,
     Composition,
@@ -29,6 +32,7 @@ const ALL: &[Layer] = &[
     Layer::Domain,
     Layer::Ports,
     Layer::Protocol,
+    Layer::Kit,
     Layer::Application,
     Layer::Adapter,
     Layer::Composition,
@@ -46,6 +50,7 @@ impl Layer {
             Self::Domain => "domain",
             Self::Ports => "ports",
             Self::Protocol => "protocol",
+            Self::Kit => "kit",
             Self::Application => "application",
             Self::Adapter => "adapter",
             Self::Composition => "composition",
@@ -59,12 +64,17 @@ impl Layer {
         match self {
             Self::Domain | Self::Ports => &[Self::Domain],
             Self::Protocol => &[],
+            // Adapters share code through the kit. A dependency from one
+            // adapter on another is rejected separately, by ARCH003.
+            Self::Kit | Self::Adapter => &[Self::Domain, Self::Ports, Self::Protocol, Self::Kit],
+            // The application layer does not use the kit: it talks to
+            // providers only through ports.
             Self::Application => &[Self::Domain, Self::Ports, Self::Protocol, Self::Application],
-            Self::Adapter => &[Self::Domain, Self::Ports, Self::Protocol],
             Self::Composition => &[
                 Self::Domain,
                 Self::Ports,
                 Self::Protocol,
+                Self::Kit,
                 Self::Application,
                 Self::Adapter,
                 Self::Composition,
@@ -73,6 +83,7 @@ impl Layer {
                 Self::Domain,
                 Self::Ports,
                 Self::Protocol,
+                Self::Kit,
                 Self::Application,
                 Self::Adapter,
                 Self::Composition,
@@ -106,6 +117,7 @@ fn layers_for_dir(dir: &str) -> &'static [Layer] {
             Layer::Domain,
             Layer::Ports,
             Layer::Protocol,
+            Layer::Kit,
             Layer::Application,
         ];
     }
@@ -583,9 +595,10 @@ mod tests {
             .member("ports", "crates/core/ports", "ports")
             .member("proto", "crates/core/proto", "protocol")
             .member("app", "crates/core/app", "application")
+            .member("kit", "crates/core/kit", "kit")
             .member("ad-a", "crates/adapters/stt/a", "adapter")
             .member("ad-b", "crates/adapters/tts/b", "adapter")
-            .member("kit", "crates/testing/kit", "testing")
+            .member("testkit", "crates/testing/testkit", "testing")
             .member("daemon", "apps/daemon", "composition")
             .external("tokio")
             .external("getrandom")
@@ -621,8 +634,8 @@ mod tests {
             .edge("daemon", "ad-a", Normal)
             .edge("daemon", "ad-b", Normal)
             .edge("dom", "bytes", Normal)
-            .edge("dom", "kit", Dev)
-            .edge("kit", "tokio", Normal)
+            .edge("dom", "testkit", Dev)
+            .edge("testkit", "tokio", Normal)
             .build();
         assert_eq!(codes(&graph), Vec::<&str>::new());
     }
@@ -648,10 +661,40 @@ mod tests {
     }
 
     #[test]
+    fn kit_is_shared_by_adapters_but_not_by_the_application() {
+        let shared = base()
+            .edge("kit", "ports", Normal)
+            .edge("kit", "proto", Normal)
+            .edge("kit", "tokio", Normal)
+            .edge("ad-a", "kit", Normal)
+            .edge("ad-b", "kit", Normal)
+            .edge("daemon", "kit", Normal)
+            .edge("testkit", "kit", Normal)
+            .build();
+        assert_eq!(codes(&shared), Vec::<&str>::new());
+        assert_eq!(
+            codes(&base().edge("app", "kit", Normal).build()),
+            ["ARCH001"]
+        );
+        assert_eq!(
+            codes(&base().edge("kit", "ad-a", Normal).build()),
+            ["ARCH001"]
+        );
+        assert_eq!(
+            codes(&base().edge("kit", "app", Normal).build()),
+            ["ARCH001"]
+        );
+        assert_eq!(
+            codes(&base().edge("ports", "kit", Normal).build()),
+            ["ARCH001"]
+        );
+    }
+
+    #[test]
     fn arch001_applies_to_dev_dependencies_except_on_testing_crates() {
         assert_eq!(codes(&base().edge("dom", "app", Dev).build()), ["ARCH001"]);
         assert_eq!(
-            codes(&base().edge("dom", "kit", Dev).build()),
+            codes(&base().edge("dom", "testkit", Dev).build()),
             Vec::<&str>::new()
         );
     }
@@ -690,8 +733,8 @@ mod tests {
     #[test]
     fn arch002_does_not_follow_dev_dependencies() {
         let graph = base()
-            .edge("dom", "kit", Dev)
-            .edge("kit", "tokio", Normal)
+            .edge("dom", "testkit", Dev)
+            .edge("testkit", "tokio", Normal)
             .build();
         assert_eq!(codes(&graph), Vec::<&str>::new());
     }
@@ -735,11 +778,11 @@ mod tests {
     #[test]
     fn arch005_shipping_crate_depends_on_testing_crate() {
         assert_eq!(
-            codes(&base().edge("app", "kit", Normal).build()),
+            codes(&base().edge("app", "testkit", Normal).build()),
             ["ARCH005"]
         );
         assert_eq!(
-            codes(&base().edge("daemon", "kit", Build).build()),
+            codes(&base().edge("daemon", "testkit", Build).build()),
             ["ARCH005"]
         );
     }
