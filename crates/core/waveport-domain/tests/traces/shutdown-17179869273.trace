@@ -1,0 +1,199 @@
+# Profile shutdown, seed 17179869273. A line is an event the kernel was given, with the time in
+# milliseconds; under it are the facts (=) and the commands (>) the kernel emitted.
+# Written by `WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay`.
+0 control join 1
+    = #1 ParticipantJoined { who: ParticipantId(1) }
+1074 speech 1 start 50640
+    > SetTimer(TurnMax(TurnId(1)), Some(MonoTime(121074000000)))
+    > Emit(UserSpeaking { who: ParticipantId(1), turn: TurnId(1), speaking: true })
+2026 tool 1 rolled-back
+2290 speech 1 end 109920
+    > Emit(UserSpeaking { who: ParticipantId(1), turn: TurnId(1), speaking: false })
+    > Sense(EstimateEou { turn: TurnId(1), who: ParticipantId(1) })
+    > SetTimer(Eou(TurnId(1)), Some(MonoTime(3090000000)))
+2453 eou 1 9271
+    > Stt(Finalize { who: ParticipantId(1) })
+    > SetTimer(Eou(TurnId(1)), Some(MonoTime(4453000000)))
+2713 transcript 1 50640 109920 final "is thanks 日本 arrives"
+    = #2 TurnCommitted { turn: TurnId(1), who: ParticipantId(1), span: MediaSpan { start: MediaTime(50640), end: MediaTime(109920) }, text: TextRef { start: 0, len: 24 }, addressed: true } "is thanks 日本 arrives"
+    > SetTimer(Eou(TurnId(1)), None)
+    > SetTimer(Overlap(TurnId(1)), None)
+    > SetTimer(TurnMax(TurnId(1)), None)
+    > SetTimer(Gen(GenId(1)), Some(MonoTime(6713000000)))
+    > Llm(OpTag { generation: GenId(1), epoch: Epoch(0) }, Start { agent: AgentId(0), context: ContextVersion(1), cause: Reply { turn: TurnId(1) } })
+    > Emit(Agent { agent: AgentId(0), generation: Some(GenId(1)), activity: Thinking })
+2766 speech 1 start 132576
+    > SetTimer(TurnMax(TurnId(2)), Some(MonoTime(122766000000)))
+    > Emit(UserSpeaking { who: ParticipantId(1), turn: TurnId(2), speaking: true })
+2935 op 1/0 done stop
+    > SetTimer(Gen(GenId(1)), None)
+    > SetTimer(Checkpoint, None)
+    > Emit(Agent { agent: AgentId(0), generation: Some(GenId(1)), activity: Listening })
+3090 timer eou 1
+4018 transcript 1 132576 183600 interim "thanks where monday"
+4463 timer eou 1
+4899 speech 1 end 234672
+    > Emit(UserSpeaking { who: ParticipantId(1), turn: TurnId(2), speaking: false })
+    > Sense(EstimateEou { turn: TurnId(2), who: ParticipantId(1) })
+    > SetTimer(Eou(TurnId(2)), Some(MonoTime(5699000000)))
+4994 eou 2 9976
+    > Stt(Finalize { who: ParticipantId(1) })
+    > SetTimer(Eou(TurnId(2)), Some(MonoTime(6994000000)))
+5030 transcript 1 132576 234672 final "thanks where monday ok is yes"
+    = #3 TurnCommitted { turn: TurnId(2), who: ParticipantId(1), span: MediaSpan { start: MediaTime(132576), end: MediaTime(234672) }, text: TextRef { start: 0, len: 29 }, addressed: true } "thanks where monday ok is yes"
+    > SetTimer(Eou(TurnId(2)), None)
+    > SetTimer(Overlap(TurnId(2)), None)
+    > SetTimer(TurnMax(TurnId(2)), None)
+    > SetTimer(Gen(GenId(2)), Some(MonoTime(9030000000)))
+    > Llm(OpTag { generation: GenId(2), epoch: Epoch(0) }, Start { agent: AgentId(0), context: ContextVersion(2), cause: Reply { turn: TurnId(2) } })
+    > Emit(Agent { agent: AgentId(0), generation: Some(GenId(2)), activity: Thinking })
+5325 op 2/0 propose 0 "{\"n\":95}"
+    = #4 ToolProposed { call: ToolCallId(1), batch: BatchId(1), generation: GenId(2), tool: ToolId(0), args: TextRef { start: 0, len: 8 } } "{\"n\":95}"
+    = #5 ToolAuthorized { call: ToolCallId(1) }
+    = #6 ToolDispatched { call: ToolCallId(1), attempt: 0 }
+    > SetTimer(Gen(GenId(2)), Some(MonoTime(9325000000)))
+    > Tool(ToolCallId(1), Dispatch { tool: ToolId(0), args: TextRef { start: 8, len: 8 }, attempt: 0 }) "{\"n\":95}"
+    > SetTimer(ToolTimeout(ToolCallId(1)), Some(MonoTime(8325000000)))
+5417 op 2/0 propose 4 "{\"n\":94}"
+    = #7 ToolProposed { call: ToolCallId(2), batch: BatchId(1), generation: GenId(2), tool: ToolId(4), args: TextRef { start: 0, len: 8 } } "{\"n\":94}"
+    = #8 ToolAuthorized { call: ToolCallId(2) }
+    = #9 ToolFinished { call: ToolCallId(2), outcome: Failed, result: TextRef { start: 8, len: 37 } } "no agent was free to work on the call"
+    > SetTimer(Gen(GenId(2)), Some(MonoTime(9417000000)))
+    > SetTimer(ToolTimeout(ToolCallId(2)), None)
+    > SetTimer(Rollback(ToolCallId(2)), None)
+5529 op 2/0 propose 2 "{\"n\":43}"
+    = #10 ToolProposed { call: ToolCallId(3), batch: BatchId(1), generation: GenId(2), tool: ToolId(2), args: TextRef { start: 0, len: 8 } } "{\"n\":43}"
+    = #11 ToolAuthorized { call: ToolCallId(3) }
+    > SetTimer(Gen(GenId(2)), Some(MonoTime(9529000000)))
+    > AwaitDurable(Seq(11))
+    > SetTimer(ToolTimeout(ToolCallId(3)), Some(MonoTime(6129000000)))
+5548 durable 11
+    = #12 ToolDispatched { call: ToolCallId(3), attempt: 0 }
+    > Tool(ToolCallId(3), Dispatch { tool: ToolId(2), args: TextRef { start: 0, len: 8 }, attempt: 0 }) "{\"n\":43}"
+    > SetTimer(ToolTimeout(ToolCallId(3)), Some(MonoTime(6148000000)))
+5555 tool 1 completed "{\"call\":1}"
+    = #13 ToolFinished { call: ToolCallId(1), outcome: Completed, result: TextRef { start: 0, len: 10 } } "{\"call\":1}"
+    > SetTimer(ToolTimeout(ToolCallId(1)), None)
+    > SetTimer(Rollback(ToolCallId(1)), None)
+5600 op 2/0 done tool-calls
+    > SetTimer(Gen(GenId(2)), None)
+    > SetTimer(Checkpoint, None)
+    > Emit(Agent { agent: AgentId(0), generation: Some(GenId(2)), activity: Listening })
+5701 timer eou 2
+5849 speech 1 start 280032
+    > SetTimer(TurnMax(TurnId(3)), Some(MonoTime(125849000000)))
+    > Emit(UserSpeaking { who: ParticipantId(1), turn: TurnId(3), speaking: true })
+6151 timer tool-timeout 3
+    > Tool(ToolCallId(3), Cancel)
+    > SetTimer(Rollback(ToolCallId(3)), Some(MonoTime(6451000000)))
+6273 control join 2
+    = #14 ParticipantJoined { who: ParticipantId(2) }
+6456 timer rollback 3
+    = #15 ToolFinished { call: ToolCallId(3), outcome: InDoubt, result: TextRef { start: 0, len: 58 } } "the call was made, and whether it took effect is not known"
+    = #16 BatchResolved { batch: BatchId(1) }
+    > SetTimer(ToolTimeout(ToolCallId(3)), None)
+    > SetTimer(Rollback(ToolCallId(3)), None)
+    > SetTimer(Gen(GenId(3)), Some(MonoTime(10456000000)))
+    > Llm(OpTag { generation: GenId(3), epoch: Epoch(0) }, Start { agent: AgentId(0), context: ContextVersion(8), cause: Continuation { batch: BatchId(1) } })
+    > Emit(Agent { agent: AgentId(0), generation: Some(GenId(3)), activity: Thinking })
+6633 transcript 1 280032 312432 interim "naïve it"
+6858 tool 3 rolled-back
+6894 op 3/0 delta "refund "
+    > SetTimer(Gen(GenId(3)), Some(MonoTime(10894000000)))
+7015 op 3/0 delta "no the naïve! my ord"
+    > Tts(OpTag { generation: GenId(3), epoch: Epoch(0) }, Speak { text: TextRef { start: 0, len: 22 } }) "refund no the naïve! "
+7073 op 3/0 delta "er monday refund ü"
+7128 op 3/0 delta "ber it is where."
+7205 speech 1 end 344880
+    > Emit(UserSpeaking { who: ParticipantId(1), turn: TurnId(3), speaking: false })
+    > Sense(EstimateEou { turn: TurnId(3), who: ParticipantId(1) })
+    > SetTimer(Eou(TurnId(3)), Some(MonoTime(8005000000)))
+7215 op 3/0 delta " monday yes agent t"
+7284 op 3/0 segment 22 42240 more
+    > Tts(OpTag { generation: GenId(3), epoch: Epoch(0) }, Speak { text: TextRef { start: 0, len: 42 } }) "my order monday refund über it is where. "
+7341 op 3/0 delta "he über "
+7370 op 3/0 segment 43 82560 more
+7370 op 3/0 segment 64 122880 more
+7435 eou 3 2424
+    > SetTimer(Eou(TurnId(3)), Some(MonoTime(10205000000)))
+7460 op 3/0 delta "日本! the where where tha"
+    > Tts(OpTag { generation: GenId(3), epoch: Epoch(0) }, Speak { text: TextRef { start: 0, len: 35 } }) "monday yes agent the über 日本! "
+7499 op 3/0 delta "nks"
+7538 op 3/0 delta " o"
+7569 op 3/0 segment 99 190080 more
+7637 op 3/0 delta "n shipped wher"
+7685 transcript 1 280032 344880 final "naïve it my shipped"
+7784 op 3/0 delta "e.\nmonda"
+7858 op 3/0 delta "y order th"
+7962 op 3/0 delta "e arri"
+8060 op 3/0 delta "ves"
+8134 op 3/0 delta " ok? "
+8200 op 3/0 done stop
+    > SetTimer(Gen(GenId(3)), Some(MonoTime(12200000000)))
+8250 text 2 "mm-hm order! "
+    = #17 TurnCommitted { turn: TurnId(4), who: ParticipantId(2), span: MediaSpan { start: MediaTime(0), end: MediaTime(0) }, text: TextRef { start: 0, len: 12 }, addressed: true } "mm-hm order!"
+    = #18 EpochAdvanced { to: Epoch(1), cause: Superseded }
+    > Tts(OpTag { generation: GenId(3), epoch: Epoch(0) }, Cancel)
+    > SetTimer(Gen(GenId(3)), None)
+    > SetTimer(Checkpoint, None)
+    > Emit(Agent { agent: AgentId(0), generation: Some(GenId(3)), activity: Listening })
+    > SetTimer(Gen(GenId(4)), Some(MonoTime(12250000000)))
+    > Llm(OpTag { generation: GenId(4), epoch: Epoch(1) }, Start { agent: AgentId(0), context: ContextVersion(9), cause: Reply { turn: TurnId(4) } })
+    > Emit(Agent { agent: AgentId(0), generation: Some(GenId(4)), activity: Thinking })
+8331 timer tool-timeout 1
+8540 durable 1757724020112262986
+8545 control leave 2
+    = #19 ParticipantLeft { who: ParticipantId(2) }
+    > Stt(Close { who: ParticipantId(2) })
+8561 op 4/1 delta "order yes! my o"
+    > SetTimer(Gen(GenId(4)), Some(MonoTime(12561000000)))
+    > Tts(OpTag { generation: GenId(4), epoch: Epoch(1) }, Speak { text: TextRef { start: 0, len: 11 } }) "order yes! "
+8580 speech 1 start 411504
+    > SetTimer(Eou(TurnId(3)), None)
+    > Emit(UserSpeaking { who: ParticipantId(1), turn: TurnId(3), speaking: true })
+8649 op 4/1 delta "n my th"
+8699 op 4/1 delta "e! mon"
+8721 op 4/1 segment 5 9600 more
+8721 op 4/1 segment 11 21120 more
+    > Tts(OpTag { generation: GenId(4), epoch: Epoch(1) }, Speak { text: TextRef { start: 0, len: 14 } }) "my on my the! "
+8722 op 4/1 delta "day thanks "
+8788 op 4/1 delta "please "
+8895 op 4/1 delta "ple"
+8990 op 4/1 segment 25 48000 more
+9020 op 4/1 delta "ase thanks no no. monday"
+    > Tts(OpTag { generation: GenId(4), epoch: Epoch(1) }, Speak { text: TextRef { start: 0, len: 42 } }) "monday thanks please please thanks no no. "
+9053 op 4/1 delta "? thanks"
+9109 control close requested
+    = #20 LifecycleChanged { to: Draining, reason: Some(Requested) }
+    > SetTimer(Drain, Some(MonoTime(9609000000)))
+    > SetTimer(Grace, Some(MonoTime(10109000000)))
+    > Emit(Lifecycle(Draining))
+9143 op 4/1 done stop
+    > SetTimer(Gen(GenId(4)), Some(MonoTime(13143000000)))
+9229 op 4/1 segment 67 128640 more
+    > Tts(OpTag { generation: GenId(4), epoch: Epoch(1) }, Speak { text: TextRef { start: 0, len: 14 } }) "monday? thanks"
+    > Tts(OpTag { generation: GenId(4), epoch: Epoch(1) }, Finish)
+9437 op 4/1 segment 81 155520 more
+9494 op 4/1 segment 81 155520 last
+9609 timer drain
+    = #21 LifecycleChanged { to: Closing, reason: Some(Requested) }
+    = #22 EpochAdvanced { to: Epoch(2), cause: Closing }
+    = #23 TurnDismissed { turn: TurnId(3), who: ParticipantId(1), reason: Closed }
+    = #24 LifecycleChanged { to: Closed, reason: Some(Requested) }
+    > SetTimer(Gen(GenId(4)), None)
+    > SetTimer(Checkpoint, None)
+    > Emit(Agent { agent: AgentId(0), generation: Some(GenId(4)), activity: Listening })
+    > SetTimer(Eou(TurnId(3)), None)
+    > SetTimer(Overlap(TurnId(3)), None)
+    > SetTimer(TurnMax(TurnId(3)), None)
+    > Stt(Close { who: ParticipantId(1) })
+    > SetTimer(Checkpoint, None)
+    > SetTimer(Drain, None)
+    > SetTimer(Grace, None)
+    > Emit(Lifecycle(Closed))
+9819 speech 1 end 470160
+9886 speech 2 start 474384
+9904 op 0/2 propose 2 "{}"
+9984 transcript 1 411504 470160 final "mm-hm thanks mm-hm naïve"
+10013 control leave 1
+125858 timer turn-max 3

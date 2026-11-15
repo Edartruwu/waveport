@@ -3,10 +3,16 @@
 //! The scenarios tell six stories along every path. This module tells
 //! thousands of stories nobody wrote: a seed decides who is in the
 //! session, when they speak and for how long, what the language model
-//! writes, how late every adapter answers and in which ways it misbehaves.
-//! The kernel is stepped through all of it with a [`Monitor`] watching, so
-//! every run checks every invariant after every step, and at the end
-//! checks that nothing was left unfinished.
+//! writes and which tools it calls, how late every adapter answers and in
+//! which ways it misbehaves, and when the process dies. The kernel is
+//! stepped through all of it with a [`Monitor`] watching, so every run
+//! checks every invariant after every step, and at the end checks that
+//! nothing was left unfinished.
+//!
+//! A [`Journal`] keeps what the kernel journals. Now and then it is
+//! checked that the journal alone rebuilds what the kernel holds, and
+//! when the process dies the session goes on from the journal: from what
+//! of it had reached the disk.
 //!
 //! A run is a pure function of its profile and its seed. A failure names
 //! both, and [`explain`] replays it with a log.
@@ -14,14 +20,16 @@
 use core::fmt::Write as _;
 use core::time::Duration;
 
-use waveport_domain::command::{Command, LlmCmd, PlayoutCmd, SenseCmd, TtsCmd};
-use waveport_domain::config::KernelConfig;
+use waveport_domain::command::{Command, LlmCause, LlmCmd, PlayoutCmd, SenseCmd, ToolCmd, TtsCmd};
+use waveport_domain::config::{AgentSpec, Effect, Executor, Gate, KernelConfig, ToolSpec};
 use waveport_domain::event::{
-    CloseReason, ControlInput, Event, Finish, OpEvent, OverlapVerdict, Part, RetryClass, TimerId,
-    ToolEvent, VadEdge,
+    CloseReason, ControlInput, Event, Finish, HandoffContext, OpEvent, OverlapVerdict, Part,
+    RetryClass, TimerId, ToolEvent, VadEdge,
 };
-use waveport_domain::fact::{Dismissal, EpochCause, Fact, Lifecycle};
-use waveport_domain::ids::{Epoch, GenId, OpTag, ParticipantId, Prob, Seq, ToolCallId, TurnId};
+use waveport_domain::fact::{Dismissal, EpochCause, Fact, Lifecycle, ToolOutcome};
+use waveport_domain::ids::{
+    AgentId, Epoch, GenId, OpTag, ParticipantId, Prob, Seq, ToolCallId, ToolId, TurnId,
+};
 use waveport_domain::kernel::Kernel;
 use waveport_domain::out::Out;
 use waveport_domain::policy::{AddressedByName, BoxedPolicies};
@@ -29,7 +37,8 @@ use waveport_domain::time::{MediaDur, MediaSpan, MediaTime, MonoTime};
 use waveport_sim::{Schedule, Seed, SeedPlan, SimRng, SimTime};
 
 use crate::check::Report;
-use crate::invariants::{Monitor, Rule, Violation};
+use crate::invariants::{Journal, Monitor, Rule, Violation};
+use crate::trace::Trace;
 
 type Ms = u64;
 
@@ -63,16 +72,20 @@ pub enum Profile {
     /// silent before or after, and one of the two closing timers may be
     /// lost.
     Shutdown,
+    /// The process dies, up to three times, and the session goes on from
+    /// what of its journal had reached the disk.
+    Crashes,
 }
 
 impl Profile {
     /// Every profile.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Calm,
         Self::Chaos,
         Self::Stalls,
         Self::Duplicates,
         Self::Shutdown,
+        Self::Crashes,
     ];
 
     /// The profile's name, as failures print it.
@@ -84,6 +97,7 @@ impl Profile {
             Self::Stalls => "stalls",
             Self::Duplicates => "duplicates",
             Self::Shutdown => "shutdown",
+            Self::Crashes => "crashes",
         }
     }
 
@@ -128,6 +142,14 @@ impl Profile {
                 stale: 200,
                 nonsense: 5,
                 late: 10,
+            },
+            Self::Crashes => Faults {
+                jitter: 80,
+                twice: 30,
+                lost: 30,
+                stale: 100,
+                nonsense: 4,
+                late: 5,
             },
         }
     }
@@ -180,6 +202,30 @@ pub struct Tally {
     pub pauses: u64,
     /// Sessions that closed.
     pub closed: u64,
+    /// Tool calls a language model asked for.
+    pub calls: u64,
+    /// Tool calls sent to a tool outside the session.
+    pub sent: u64,
+    /// Tool calls sent again after the process died.
+    pub resent: u64,
+    /// Tool calls given to another agent to answer.
+    pub delegated: u64,
+    /// Tool calls that ended with their tool's result.
+    pub completed: u64,
+    /// Tool calls that failed.
+    pub failed: u64,
+    /// Tool calls withdrawn before they ran, or undone.
+    pub withdrawn: u64,
+    /// Tool calls of which nobody knows whether they took effect.
+    pub in_doubt: u64,
+    /// Responses started for the results of tool calls.
+    pub continuations: u64,
+    /// Times an agent was given the floor.
+    pub handoffs: u64,
+    /// Times the process died.
+    pub crashes: u64,
+    /// Times the journal was checked against the kernel.
+    pub checks: u64,
     /// A fingerprint of everything the runs emitted, for telling whether
     /// two sweeps did the same.
     pub trace: u64,
@@ -200,6 +246,18 @@ impl Tally {
         self.failures += other.failures;
         self.pauses += other.pauses;
         self.closed += other.closed;
+        self.calls += other.calls;
+        self.sent += other.sent;
+        self.resent += other.resent;
+        self.delegated += other.delegated;
+        self.completed += other.completed;
+        self.failed += other.failed;
+        self.withdrawn += other.withdrawn;
+        self.in_doubt += other.in_doubt;
+        self.continuations += other.continuations;
+        self.handoffs += other.handoffs;
+        self.crashes += other.crashes;
+        self.checks += other.checks;
         self.trace = mix(self.trace, other.trace);
     }
 }
@@ -237,6 +295,22 @@ enum Item {
     Nonsense,
     /// The adapters fall silent.
     Silence,
+    /// The journal has stored every fact up to this one, and says so.
+    Stored(u64),
+    /// The journal keeps a snapshot of the session.
+    Snapshot,
+    /// The journal is checked against the kernel.
+    Check,
+    /// The process dies.
+    Crash,
+}
+
+/// What a language model writes next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Piece {
+    Text(String),
+    /// A request for a tool call, with its arguments.
+    Call(ToolId, String),
 }
 
 /// How a language model's response ends.
@@ -256,8 +330,10 @@ enum Ending {
 struct Job {
     tag: OpTag,
     /// What the model writes, piece by piece.
-    pieces: Vec<String>,
+    pieces: Vec<Piece>,
     next: usize,
+    /// Whether it has asked for a tool call.
+    called: bool,
     ending: Ending,
     paused: bool,
     /// Whether a piece is held back because the model was told to wait.
@@ -320,6 +396,20 @@ struct Person {
 struct Run {
     kernel: Kernel<BoxedPolicies>,
     monitor: Monitor,
+    config: KernelConfig,
+    /// Whether the agent answers only to its name.
+    named: bool,
+    /// What the kernel journaled, as far as it survives.
+    journal: Journal,
+    /// When each fact of the journal was emitted. The first is fact #1.
+    emitted: Vec<Ms>,
+    /// How long the journal takes to store a fact.
+    lag: Ms,
+    /// The highest fact the kernel was told is stored.
+    vouched: u64,
+    /// The calls that must happen at most once and were sent, in any life
+    /// of the session.
+    effects: Vec<ToolCallId>,
     out: Out,
     now: Ms,
     queue: Schedule<Item>,
@@ -333,11 +423,14 @@ struct Run {
     /// A closing timer that is never delivered.
     lost_timer: Option<TimerId>,
     silent: bool,
-    /// The highest turn and response numbers seen, for making up events
-    /// that almost make sense.
-    seen: (u32, u32),
+    /// The highest turn, response and call numbers seen, for making up
+    /// events that almost make sense.
+    seen: (u32, u32, u64),
     tally: Tally,
     log: Option<Vec<String>>,
+    /// The session as the kernel was given it, when it is being written
+    /// down.
+    written: Option<Trace>,
 }
 
 impl Run {
@@ -358,17 +451,68 @@ impl Run {
         config.timing.generation_max = Duration::from_millis(pick(&[4_000, 60_000]));
         config.timing.drain = Duration::from_millis(pick(&[500, 5_000]));
         config.timing.grace = Duration::from_millis(pick(&[500, 2_000]));
-        let mut policies = BoxedPolicies::default();
-        if rng.chance(1, 3) {
-            policies.addressee = Box::new(AddressedByName::new(&["agent"]));
+        config.timing.rollback_wait = Duration::from_millis(pick(&[300, 2_000]));
+        config.timing.stage_wait = Duration::from_millis(pick(&[400, 5_000]));
+        config.limits.open_calls = usize::try_from(pick(&[1, 3, 16])).unwrap_or(16);
+
+        // The tools: some run by the application, and perhaps one that a
+        // second agent answers.
+        for _ in 0..pick(&[0, 1, 2, 4]) {
+            let effect = match pick(&[0, 0, 1, 2]) {
+                0 => Effect::Pure,
+                1 => Effect::Idempotent,
+                _ => Effect::SideEffecting,
+            };
+            let gate = if pick(&[0, 0, 0, 0, 1]) == 1 {
+                Gate::AfterOwnUtterance
+            } else {
+                Gate::None
+            };
+            config.tools.push(ToolSpec {
+                effect,
+                gate,
+                timeout: Duration::from_millis(pick(&[600, 3_000, 10_000])),
+                executor: Executor::External,
+            });
         }
+        let mut agents = vec![AgentSpec::default()];
+        if pick(&[0, 0, 1]) == 1 {
+            agents.push(AgentSpec::default());
+            config.tools.push(ToolSpec {
+                effect: Effect::Pure,
+                gate: Gate::None,
+                timeout: Duration::from_millis(pick(&[1_500, 30_000])),
+                executor: Executor::Agent(AgentId(1)),
+            });
+        }
+        let all = (0..config.tools.len())
+            .filter_map(|index| u16::try_from(index).ok().map(ToolId))
+            .collect::<Vec<_>>();
+        if let Some(front) = agents.first_mut() {
+            front.tools.clone_from(&all);
+        }
+        // Perhaps another agent that can be given the floor.
+        if pick(&[0, 0, 1]) == 1 {
+            agents.push(AgentSpec { tools: all });
+        }
+        config.agents = agents;
+        let lag = pick(&[1, 10, 40]);
+
+        let named = rng.chance(1, 3);
         // The configuration is valid by construction; a default kernel
         // stands in if that ever stops being true, and the run goes on.
-        let kernel = Kernel::new(config, policies).unwrap_or_default();
+        let kernel = Kernel::new(config.clone(), Self::policies(named)).unwrap_or_default();
 
         let mut run = Self {
             monitor: Monitor::new(kernel.view()),
+            journal: Journal::new(kernel.snapshot()),
+            config: kernel.config().clone(),
             kernel,
+            named,
+            emitted: Vec::new(),
+            lag,
+            vouched: 0,
+            effects: Vec::new(),
             out: Out::new(),
             now: 0,
             queue: Schedule::new(),
@@ -380,18 +524,45 @@ impl Run {
             armings: 0,
             lost_timer: None,
             silent: false,
-            seen: (0, 0),
+            seen: (0, 0, 0),
             tally: Tally {
                 runs: 1,
                 ..Tally::default()
             },
             log: log.then(Vec::new),
+            written: None,
         };
         run.plan(profile);
         run
     }
 
+    fn policies(named: bool) -> BoxedPolicies {
+        let mut policies = BoxedPolicies::default();
+        if named {
+            policies.addressee = Box::new(AddressedByName::new(&["agent"]));
+        }
+        policies
+    }
+
+    /// The agents that can be given the floor: those that answer no tool
+    /// calls for others.
+    fn speakers(&self) -> Vec<AgentId> {
+        (0..self.config.agents.len())
+            .filter_map(|index| u8::try_from(index).ok().map(AgentId))
+            .filter(|&agent| {
+                self.config
+                    .tools
+                    .iter()
+                    .all(|tool| tool.executor != Executor::Agent(agent))
+            })
+            .collect()
+    }
+
     /// Decides what the people and the application do.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a list of things that may happen, one after the other"
+    )]
     fn plan(&mut self, profile: Profile) {
         let horizon = self.rng.range(8_000..40_000);
         let people = self.rng.range(1..4);
@@ -447,6 +618,47 @@ impl Run {
         for _ in 0..self.rng.range(0..self.faults.nonsense + 1) {
             let when = self.rng.range(0..horizon + 10_000);
             self.at(when, Item::Nonsense);
+        }
+
+        // The floor is handed from agent to agent, and the parts that
+        // serve the new one are ready soon, or never.
+        let speakers = self.speakers();
+        if speakers.len() > 1 {
+            for _ in 0..self.rng.range(0..3) {
+                let to = *self.rng.choose(&speakers).unwrap_or(&AgentId(0));
+                let context = match self.rng.range(0..3) {
+                    0 => HandoffContext::Full,
+                    1 => HandoffContext::Summary(self.sentence().into()),
+                    _ => HandoffContext::None,
+                };
+                let when = self.rng.range(0..horizon);
+                let handoff = ControlInput::Handoff { to, context };
+                self.at(when, Item::Control(Event::Control(handoff)));
+                let lost = self.faults.lost;
+                if !self.fails(lost.max(100)) {
+                    let ready = when + self.rng.range(20..900);
+                    self.at(
+                        ready,
+                        Item::Control(Event::Control(ControlInput::StageReady)),
+                    );
+                }
+            }
+        }
+
+        // The journal keeps a snapshot now and then, and is checked.
+        for _ in 0..self.rng.range(0..4) {
+            let when = self.rng.range(0..horizon + 5_000);
+            self.at(when, Item::Snapshot);
+        }
+        for _ in 0..self.rng.range(1..4) {
+            let when = self.rng.range(0..horizon + 5_000);
+            self.at(when, Item::Check);
+        }
+        if profile == Profile::Crashes {
+            for _ in 0..self.rng.range(1..4) {
+                let when = self.rng.range(200..horizon + 3_000);
+                self.at(when, Item::Crash);
+            }
         }
 
         let closes = match profile {
@@ -520,7 +732,18 @@ impl Run {
     fn step(&mut self, event: &Event) -> Result<(), Violation> {
         self.tally.steps += 1;
         let now = MonoTime::from_millis(self.now);
+        if let Event::Durable(seq) = event {
+            // Whatever the kernel is told is stored has to be: the journal
+            // is taken at its word.
+            let emitted = u64::try_from(self.emitted.len()).unwrap_or(u64::MAX);
+            self.vouched = self.vouched.max(seq.get().min(emitted));
+        }
         self.kernel.step(now, event, &mut self.out);
+        self.journal.record(&self.out);
+        self.emitted.extend(self.out.facts.iter().map(|_| self.now));
+        if let Some(written) = &mut self.written {
+            written.event(now, event);
+        }
         if let Some(log) = &mut self.log {
             log.push(format!("{:>7} ms  <- {event:?}", self.now));
             for stamped in &self.out.facts {
@@ -540,6 +763,29 @@ impl Run {
         }
         self.monitor
             .observe(now, event, &self.out, self.kernel.view())?;
+        for command in &self.out.cmds {
+            let Command::Tool(call, ToolCmd::Dispatch { tool, .. }) = *command else {
+                continue;
+            };
+            // What no single life of the session can see: a call that
+            // must happen at most once, sent in two of them.
+            let once = self
+                .config
+                .tool(tool)
+                .is_some_and(|spec| spec.effect == Effect::SideEffecting);
+            if once && self.effects.contains(&call) {
+                return Err(Violation {
+                    rule: Rule::Tools,
+                    what: format!(
+                        "call {call} must happen at most once, and was sent in two lives of the \
+                         session"
+                    ),
+                });
+            }
+            if once {
+                self.effects.push(call);
+            }
+        }
 
         let emitted = self.out.cmds.len() << 16 | self.out.facts.len() << 8 | self.out.text.len();
         self.tally.trace = mix(self.tally.trace, u64::try_from(emitted).unwrap_or(u64::MAX));
@@ -586,6 +832,15 @@ impl Run {
                 to: Lifecycle::Closed,
                 ..
             } => tally.closed += 1,
+            Fact::ToolProposed { .. } => tally.calls += 1,
+            Fact::ToolDispatched { attempt, .. } if attempt > 0 => tally.resent += 1,
+            Fact::ToolFinished { outcome, .. } => match outcome {
+                ToolOutcome::Completed => tally.completed += 1,
+                ToolOutcome::Failed => tally.failed += 1,
+                ToolOutcome::Cancelled => tally.withdrawn += 1,
+                ToolOutcome::InDoubt => tally.in_doubt += 1,
+            },
+            Fact::AgentActivated { .. } => tally.handoffs += 1,
             _ => {}
         }
     }
@@ -607,6 +862,7 @@ impl Run {
             tag,
             pieces: Vec::new(),
             next: 0,
+            called: false,
             ending: Ending::Done,
             paused: false,
             held: false,
@@ -629,8 +885,10 @@ impl Run {
         self.jobs.len() - 1
     }
 
-    /// What the language model is going to write for a response.
-    fn write(&mut self) -> (Vec<String>, Ending) {
+    /// What the language model is going to write for a response, and the
+    /// tool calls it is going to ask for. `floor` says that the response
+    /// is one that speaks.
+    fn write(&mut self, floor: bool) -> (Vec<Piece>, Ending) {
         let mut text = String::new();
         if !self.rng.chance(1, 12) {
             for _ in 0..self.rng.range(1..6) {
@@ -653,12 +911,31 @@ impl Run {
             piece.push(character);
             size -= 1;
             if size == 0 {
-                pieces.push(core::mem::take(&mut piece));
+                pieces.push(Piece::Text(core::mem::take(&mut piece)));
                 size = self.rng.range(1..25);
             }
         }
         if !piece.is_empty() {
-            pieces.push(piece);
+            pieces.push(Piece::Text(piece));
+        }
+        // A model that speaks asks for tools now and then; one that
+        // answers a call for another agent has none, and asks anyway once
+        // in a while.
+        let tools = u64::try_from(self.config.tools.len()).unwrap_or(0);
+        let asks = if floor {
+            tools > 0 && self.rng.chance(2, 5)
+        } else {
+            self.rng.chance(1, 10)
+        };
+        if asks {
+            for _ in 0..self.rng.range(1..4) {
+                // Now and then a tool that does not exist.
+                let tool = ToolId(u16::try_from(self.rng.range(0..tools + 1)).unwrap_or(0));
+                let args = format!("{{\"n\":{}}}", self.rng.range(0..100));
+                let most = u64::try_from(pieces.len()).unwrap_or(0);
+                let at = usize::try_from(self.rng.range(0..most + 1)).unwrap_or(0);
+                pieces.insert(at.min(pieces.len()), Piece::Call(tool, args));
+            }
         }
         let lost = self.faults.lost;
         let (hangs, fails) = (self.fails(lost), self.fails(lost));
@@ -721,9 +998,22 @@ impl Run {
             Command::Llm(tag, llm) => {
                 let index = self.job_or_new(tag);
                 match llm {
-                    LlmCmd::Start { .. } => {
-                        self.tally.replies += 1;
-                        let (pieces, ending) = self.write();
+                    LlmCmd::Start { cause, .. } => {
+                        let floor = match cause {
+                            LlmCause::Reply { .. } => true,
+                            LlmCause::Continuation { .. } => {
+                                self.tally.continuations += 1;
+                                true
+                            }
+                            LlmCause::Delegated { .. } => {
+                                self.tally.delegated += 1;
+                                false
+                            }
+                        };
+                        if floor {
+                            self.tally.replies += 1;
+                        }
+                        let (pieces, ending) = self.write(floor);
                         if let Some(job) = self.jobs.get_mut(index) {
                             job.pieces = pieces;
                             job.ending = ending;
@@ -845,7 +1135,45 @@ impl Run {
             Command::Emit(waveport_domain::command::ClientEvent::UserSpeaking { turn, .. }) => {
                 self.seen.0 = self.seen.0.max(turn.get());
             }
-            Command::Emit(_) | Command::Stt(_) | Command::Tool(..) | Command::AwaitDurable(_) => {}
+            Command::Tool(call, ToolCmd::Dispatch { .. }) => {
+                self.tally.sent += 1;
+                self.seen.2 = self.seen.2.max(call.get());
+                if self.fails(lost) {
+                    return;
+                }
+                // Most tools answer soon, and some take their time.
+                let slow = if self.rng.chance(1, 6) {
+                    self.rng.range(0..12_000)
+                } else {
+                    0
+                };
+                let when = now + self.delay(20..1_500) + slow;
+                let news = if self.rng.chance(1, 6) {
+                    ToolEvent::Failed {
+                        class: RetryClass::Transient,
+                        message: self.words(3).into(),
+                    }
+                } else {
+                    ToolEvent::Completed {
+                        result: format!("{{\"call\":{call}}}").into(),
+                    }
+                };
+                self.at(when, Item::Report(Event::Tool(call, news)));
+            }
+            Command::Tool(call, ToolCmd::Cancel) => {
+                // Some tools undo what they did and say so.
+                if self.rng.chance(1, 2) && !self.fails(lost) {
+                    let when = now + self.delay(20..900);
+                    self.at(when, Item::Report(Event::Tool(call, ToolEvent::RolledBack)));
+                }
+            }
+            Command::AwaitDurable(seq) => {
+                if !self.fails(lost) {
+                    let when = now + self.lag + self.rng.range(0..self.faults.jitter / 8 + 1);
+                    self.at(when, Item::Stored(seq.get()));
+                }
+            }
+            Command::Emit(_) | Command::Stt(_) => {}
         }
     }
 
@@ -867,11 +1195,26 @@ impl Run {
     }
 
     fn happen(&mut self, item: Item) -> Result<(), Violation> {
-        let adapter = !matches!(item, Item::Control(_) | Item::Timer(..) | Item::Silence);
+        let adapter = !matches!(
+            item,
+            Item::Control(_)
+                | Item::Timer(..)
+                | Item::Silence
+                | Item::Snapshot
+                | Item::Check
+                | Item::Crash
+        );
         if self.silent && adapter {
             return Ok(());
         }
         match item {
+            Item::Stored(seq) => self.report(&Event::Durable(Seq(seq))),
+            Item::Snapshot => {
+                self.journal.keep(self.kernel.snapshot());
+                self.check()
+            }
+            Item::Check => self.check(),
+            Item::Crash => self.crash(),
             Item::Report(event) => self.report(&event),
             Item::Control(event) => {
                 if let Event::Control(ControlInput::Join { who }) = &event
@@ -948,13 +1291,26 @@ impl Run {
         }
         let op = if let Some(piece) = job.pieces.get(job.next) {
             job.next += 1;
-            OpEvent::LlmDelta {
-                text: piece.as_str().into(),
+            match piece {
+                Piece::Text(text) => OpEvent::LlmDelta {
+                    text: text.as_str().into(),
+                },
+                Piece::Call(tool, args) => {
+                    job.called = true;
+                    OpEvent::ToolProposed {
+                        tool: *tool,
+                        args: args.as_str().into(),
+                    }
+                }
             }
         } else {
             match job.ending {
                 Ending::Done => OpEvent::LlmDone {
-                    finish: Finish::Stop,
+                    finish: if job.called {
+                        Finish::ToolCalls
+                    } else {
+                        Finish::Stop
+                    },
                 },
                 Ending::Fails => OpEvent::Failed {
                     part: Part::Think,
@@ -963,11 +1319,84 @@ impl Run {
                 Ending::Hangs => return Ok(()),
             }
         };
-        if matches!(op, OpEvent::LlmDelta { .. }) {
+        if matches!(op, OpEvent::LlmDelta { .. } | OpEvent::ToolProposed { .. }) {
             let when = self.now + self.delay(5..60);
             self.at(when, Item::Write(tag));
         }
         self.report(&Event::Op(tag, op))
+    }
+
+    /// Checks that the journal alone adds up to what the kernel holds.
+    fn check(&mut self) -> Result<(), Violation> {
+        self.tally.checks += 1;
+        self.journal.check(&self.kernel)
+    }
+
+    /// The process dies. Everything the adapters were doing is gone, and
+    /// so is what the journal had not stored. The session is rebuilt from
+    /// the rest and wakes when its client is back.
+    fn crash(&mut self) -> Result<(), Violation> {
+        self.check()?;
+        self.tally.crashes += 1;
+        let now = self.now;
+        let by_now = self
+            .emitted
+            .iter()
+            .take_while(|&&at| at + self.lag <= now)
+            .count();
+        let stored = u64::try_from(by_now).unwrap_or(u64::MAX).max(self.vouched);
+        let total = self.emitted.len();
+        self.emitted
+            .truncate(usize::try_from(stored).unwrap_or(usize::MAX));
+        self.journal.cut(Seq(stored));
+        if let Some(log) = &mut self.log {
+            log.push(format!(
+                "{now:>7} ms  THE PROCESS DIES: {stored} of {total} facts had been stored"
+            ));
+        }
+        if let Some(written) = &mut self.written {
+            written.restart(Seq(stored));
+        }
+
+        let Some((snapshot, tail, text)) = self.journal.latest() else {
+            return Ok(());
+        };
+        let policies = Self::policies(self.named);
+        let rebuilt = Kernel::restore(self.config.clone(), policies, snapshot, tail, text);
+        let kernel = rebuilt.map_err(|error| Violation {
+            rule: Rule::Restore,
+            what: format!("the session cannot be rebuilt from its journal: {error}"),
+        })?;
+        self.monitor = Monitor::restored(kernel.view(), self.journal.speech());
+        self.kernel = kernel;
+        self.vouched = stored;
+
+        // What the people and the application are going to do is still
+        // going to happen. What the adapters were doing is not.
+        self.jobs.clear();
+        self.timers.clear();
+        let mut kept = Vec::new();
+        while let Some((due, item)) = self.queue.pop() {
+            let survives = matches!(
+                item,
+                Item::Control(_)
+                    | Item::Speak { .. }
+                    | Item::Nonsense
+                    | Item::Silence
+                    | Item::Snapshot
+                    | Item::Check
+                    | Item::Crash
+            );
+            if survives {
+                kept.push((due, item));
+            }
+        }
+        for (due, item) in kept {
+            self.queue.push(due, item);
+        }
+        let back = now + self.rng.range(20..1_500);
+        self.at(back, Item::Control(Event::Control(ControlInput::Attached)));
+        Ok(())
     }
 
     /// Playback reports how far it has got.
@@ -1111,7 +1540,10 @@ impl Run {
             small
         };
         let coin = self.rng.chance(1, 2);
-        match self.rng.range(0..14) {
+        let call = ToolCallId(self.rng.range(0..self.seen.2 + 3));
+        let tools = u64::try_from(self.config.tools.len()).unwrap_or(0);
+        let agents = u64::try_from(self.config.agents.len()).unwrap_or(0);
+        match self.rng.range(0..16) {
             0 => Event::Eou {
                 turn,
                 p: Prob::from_basis_points(u16::try_from(any % 20_000).unwrap_or(0)),
@@ -1124,7 +1556,7 @@ impl Run {
                     OverlapVerdict::Noise
                 },
             },
-            2 => Event::Timer(match self.rng.range(0..9) {
+            2 => Event::Timer(match self.rng.range(0..10) {
                 0 => TimerId::Eou(turn),
                 1 => TimerId::TurnMax(turn),
                 2 => TimerId::Overlap(turn),
@@ -1133,7 +1565,8 @@ impl Run {
                 5 => TimerId::Drain,
                 6 => TimerId::Grace,
                 7 => TimerId::StageAck,
-                _ => TimerId::ToolTimeout(ToolCallId(any)),
+                8 => TimerId::Rollback(call),
+                _ => TimerId::ToolTimeout(call),
             }),
             3 => Event::Op(
                 tag,
@@ -1200,12 +1633,34 @@ impl Run {
                 }
             }
             11 => Event::Tool(
-                ToolCallId(any),
-                ToolEvent::Completed {
-                    result: "{}".into(),
+                call,
+                match self.rng.range(0..3) {
+                    0 => ToolEvent::Completed {
+                        result: "{}".into(),
+                    },
+                    1 => ToolEvent::Failed {
+                        class: RetryClass::Permanent,
+                        message: "no".into(),
+                    },
+                    _ => ToolEvent::RolledBack,
                 },
             ),
             12 => Event::Durable(Seq(any)),
+            13 => Event::Op(
+                tag,
+                OpEvent::ToolProposed {
+                    tool: ToolId(u16::try_from(self.rng.range(0..tools + 2)).unwrap_or(0)),
+                    args: "{}".into(),
+                },
+            ),
+            14 => Event::Control(ControlInput::Handoff {
+                to: AgentId(u8::try_from(self.rng.range(0..agents + 2)).unwrap_or(0)),
+                context: if coin {
+                    HandoffContext::Full
+                } else {
+                    HandoffContext::None
+                },
+            }),
             _ => Event::Control(match self.rng.range(0..5) {
                 0 => ControlInput::Join { who },
                 1 => ControlInput::Leave { who },
@@ -1216,11 +1671,30 @@ impl Run {
         }
     }
 
+    /// Runs until nothing more is going to happen, and hands what was
+    /// written down of the session to `keep`.
+    fn finish_with(mut self, keep: impl FnOnce(Trace)) -> Result<Tally, Violation> {
+        let outcome = self.run_out();
+        keep(self.written.take().unwrap_or_default());
+        outcome.map(|()| self.tally)
+    }
+
     /// Runs until nothing more is going to happen.
     fn finish(mut self) -> Result<(Tally, Vec<String>), (Violation, Vec<String>)> {
+        let outcome = self.run_out();
+        let log = self.log.take().unwrap_or_default();
+        match outcome {
+            Ok(()) => Ok((self.tally, log)),
+            Err(violation) => Err((violation, log)),
+        }
+    }
+
+    fn run_out(&mut self) -> Result<(), Violation> {
         let outcome = loop {
             let Some((due, item)) = self.queue.pop() else {
-                break self.monitor.at_rest(self.kernel.view());
+                break self
+                    .check()
+                    .and_then(|()| self.monitor.at_rest(self.kernel.view()));
             };
             self.now = self.now.max(due.as_nanos() / 1_000_000);
             if let Err(violation) = self.happen(item) {
@@ -1234,11 +1708,7 @@ impl Run {
             }
         };
         self.tally.trace = mix(self.tally.trace, self.kernel.fingerprint());
-        let log = self.log.take().unwrap_or_default();
-        match outcome {
-            Ok(()) => Ok((self.tally, log)),
-            Err(violation) => Err((violation, log)),
-        }
+        outcome
     }
 }
 
@@ -1271,6 +1741,45 @@ pub fn explain(profile: Profile, seed: u64) -> String {
         let _ = writeln!(text, "  {line}");
     }
     text
+}
+
+/// A session written down: everything needed to run a kernel through it
+/// again.
+#[derive(Debug)]
+pub struct Recorded {
+    /// The configuration of its kernel.
+    pub config: KernelConfig,
+    /// Whether its agent answers only to its name.
+    named: bool,
+    /// What the kernel was given.
+    pub trace: Trace,
+}
+
+impl Recorded {
+    /// The policies of its kernel.
+    #[must_use]
+    pub fn policies(&self) -> BoxedPolicies {
+        Run::policies(self.named)
+    }
+}
+
+/// Runs the session that belongs to `seed` under `profile` and writes
+/// down what its kernel was given.
+///
+/// # Errors
+///
+/// A step broke an invariant, or the session was left unfinished.
+pub fn record(profile: Profile, seed: u64) -> Result<Recorded, Violation> {
+    let mut run = Run::new(profile, seed, false);
+    run.written = Some(Trace::default());
+    let (config, named) = (run.config.clone(), run.named);
+    let mut trace = Trace::default();
+    let outcome = run.finish_with(|written| trace = written);
+    outcome.map(|_| Recorded {
+        config,
+        named,
+        trace,
+    })
 }
 
 /// Runs `seeds` sessions under `profile`, each of them twice to see that
@@ -1315,7 +1824,8 @@ pub fn sweep(profile: Profile, seeds: u64) -> Result<Tally, Report> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Job, Profile, explain, run};
+    use super::{Job, Profile, explain, record, run};
+    use crate::trace::{Entry, Trace, replay};
     use waveport_domain::ids::{Epoch, GenId, OpTag};
 
     fn job(marks: &[(u32, u32)], position: u32) -> Job {
@@ -1326,6 +1836,7 @@ mod tests {
             },
             pieces: Vec::new(),
             next: 0,
+            called: false,
             ending: super::Ending::Done,
             paused: false,
             held: false,
@@ -1373,5 +1884,35 @@ mod tests {
         );
         assert!(told.contains(" ms  <- "), "{told}");
         assert!(told.contains(" earlier lines"), "{told}");
+    }
+
+    #[test]
+    fn a_session_written_down_reads_back_and_replays() {
+        let mut restarts = 0;
+        for (index, profile) in (0_u64..).zip(Profile::ALL) {
+            for seed in 0..25 {
+                let seed = (index << 32) + seed;
+                let recorded = record(profile, seed).unwrap();
+                let text = recorded.trace.to_string();
+                assert_eq!(Trace::parse(&text).as_ref(), Ok(&recorded.trace), "{seed}");
+                // The kernel does the same without the world that made
+                // the session up, and under a monitor that knows nothing
+                // of it.
+                let replayed = replay(&recorded.config, || recorded.policies(), &recorded.trace);
+                let replayed = replayed.unwrap();
+                assert_eq!(
+                    Trace::parse(&replayed).as_ref(),
+                    Ok(&recorded.trace),
+                    "{seed}"
+                );
+                restarts += recorded
+                    .trace
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry, Entry::Restart(_)))
+                    .count();
+            }
+        }
+        assert!(restarts >= 25, "{restarts}");
     }
 }
