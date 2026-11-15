@@ -60,6 +60,17 @@ pub trait Journal: Send + Sync + 'static {
         lease: Lease,
         snapshot: Snapshot,
     ) -> BoxFuture<'_, Result<(), JournalError>>;
+
+    /// Says that the session is waiting for what it has handed over to be
+    /// stored: a tool with side effects is held back until it is.
+    ///
+    /// A journal may wait a little for more to store in one go, which
+    /// costs a session nothing as long as nothing waits for the answer.
+    /// This asks it not to. A journal that never waits has nothing to do,
+    /// which is what this does unless it is implemented.
+    fn hurry(&self, session: SessionId) {
+        let _ = session;
+    }
 }
 
 /// Records to add, one for each fact, numbered from `first` without gaps.

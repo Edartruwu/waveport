@@ -785,8 +785,13 @@ async fn the_memory_journal_keeps_the_rules() {
     journal_session(&journal.clone(), SessionId(2))
         .await
         .unwrap();
-    assert_eq!(journal.records(SessionId(1)).len(), 3, "4, 5 and 6");
+    // A new owner is given the snapshot and what follows it: records 4,
+    // 5 and 6. A test can still look at all six.
+    let (state, after) = journal.kept(SessionId(1));
+    assert_eq!((state.unwrap().upto, after), (Seq(3), 3));
+    assert_eq!(journal.records(SessionId(1)).len(), 6);
     assert_eq!(journal.records(SessionId(3)), Vec::<bytes::Bytes>::new());
+    assert_eq!(journal.kept(SessionId(3)), (None, 0));
 
     // A session that is not new is not one to check with.
     let broken = journal_session(&journal, SessionId(1)).await.unwrap_err();
