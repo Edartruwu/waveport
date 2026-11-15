@@ -12,9 +12,15 @@ use core::net::SocketAddr;
 use core::time::Duration;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
 /// How an answer that arrives in pieces comes to its end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,12 +315,511 @@ async fn answer_with(stream: &mut TcpStream, answer: HttpAnswer) -> std::io::Res
     }
 }
 
+/// One thing a WebSocket server does. A script is a list of them, done
+/// in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsStep {
+    /// Refuses the connection with this status and body, as a provider
+    /// refuses a key it does not know. Only as the first step.
+    Refuse(u16, String),
+    /// Sends a message of text.
+    Say(String),
+    /// Sends a message of bytes.
+    SayBytes(Vec<u8>),
+    /// Waits for a message of text that has this in it. Whatever arrives
+    /// before it is noted and passed over.
+    Hear(String),
+    /// Waits for a message of bytes.
+    HearBytes,
+    /// Waits this long.
+    Pause(Duration),
+    /// Closes the connection with a code and a reason.
+    Close(u16, String),
+    /// Drops the connection without a word.
+    Cut,
+}
+
+impl WsStep {
+    /// A script from its text, which reads as a record of the wire does.
+    /// Each line is one step, by how it begins:
+    ///
+    /// | Line | Step |
+    /// |---|---|
+    /// | `< text` | say `text` |
+    /// | `> text` | wait for a message with `text` in it |
+    /// | `>b` | wait for a message of bytes |
+    /// | `~ 20` | wait 20 ms |
+    /// | `! 1011 reason` | close with a code and a reason |
+    /// | `? 401 body` | refuse the connection with a status and a body |
+    /// | `x` | drop the connection |
+    ///
+    /// Empty lines and lines that begin with `#` say nothing.
+    ///
+    /// # Panics
+    ///
+    /// A line is none of these.
+    #[must_use]
+    #[expect(
+        clippy::panic,
+        reason = "a test whose script cannot be read has failed"
+    )]
+    pub fn script(text: &str) -> Vec<Self> {
+        let number = |text: &str, line: &str| -> (u64, String) {
+            let (number, rest) = text.split_once(' ').unwrap_or((text, ""));
+            let Ok(number) = number.parse() else {
+                panic!("no number in the line {line:?} of a script")
+            };
+            (number, rest.to_owned())
+        };
+        let mut steps = Vec::new();
+        for line in text.lines() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let step = if let Some(said) = line.strip_prefix("< ") {
+                Self::Say(said.to_owned())
+            } else if let Some(heard) = line.strip_prefix("> ") {
+                Self::Hear(heard.to_owned())
+            } else if line == ">b" {
+                Self::HearBytes
+            } else if let Some(wait) = line.strip_prefix("~ ") {
+                Self::Pause(Duration::from_millis(number(wait, line).0))
+            } else if let Some(close) = line.strip_prefix("! ") {
+                let (code, reason) = number(close, line);
+                Self::Close(u16::try_from(code).unwrap_or(1011), reason)
+            } else if let Some(refusal) = line.strip_prefix("? ") {
+                let (status, body) = number(refusal, line);
+                Self::Refuse(u16::try_from(status).unwrap_or(500), body)
+            } else if line == "x" {
+                Self::Cut
+            } else {
+                panic!("the line {line:?} of a script is not a step")
+            };
+            steps.push(step);
+        }
+        steps
+    }
+}
+
+/// A message a WebSocket server was sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsHeard {
+    /// Text.
+    Text(String),
+    /// Bytes.
+    Bytes(Vec<u8>),
+}
+
+impl WsHeard {
+    /// The text, if it is text.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Bytes(_) => None,
+        }
+    }
+}
+
+/// A connection a WebSocket server was asked for, and what it was sent
+/// on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WsSeen {
+    /// The path that was asked for, with what follows a `?` in it.
+    pub path: String,
+    /// The headers of the request, with their names in lower case.
+    pub headers: Vec<(String, String)>,
+    /// The messages, in order.
+    pub messages: Vec<WsHeard>,
+}
+
+impl WsSeen {
+    /// The value of a header, by its name in lower case.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The messages of text, in order.
+    pub fn texts(&self) -> impl Iterator<Item = &str> {
+        self.messages.iter().filter_map(WsHeard::text)
+    }
+}
+
+/// A WebSocket server on this machine that follows a script: the first
+/// connection the first script, and so on. Connections beyond the scripts
+/// get the last one again.
+///
+/// A script that has come to its end without closing the connection
+/// leaves it open, and the server goes on noting what it is sent until
+/// the other side leaves.
+///
+/// It stops when it is dropped.
+#[derive(Debug)]
+pub struct WsServer {
+    address: SocketAddr,
+    seen: Arc<Mutex<Vec<WsSeen>>>,
+    over: watch::Receiver<usize>,
+    serving: JoinHandle<()>,
+}
+
+impl WsServer {
+    /// Starts a server.
+    ///
+    /// # Panics
+    ///
+    /// The machine gives it no port to listen on.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a test that cannot be set up has failed"
+    )]
+    pub async fn start(scripts: Vec<Vec<WsStep>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_server = Arc::clone(&seen);
+        let (ended, over) = watch::channel(0_usize);
+        let serving = tokio::spawn(async move {
+            let mut served = 0_usize;
+            while let Ok((stream, _)) = listener.accept().await {
+                let script = scripts.get(served).or_else(|| scripts.last()).cloned();
+                let connection = Connection {
+                    index: served,
+                    seen: Arc::clone(&seen_by_server),
+                };
+                connection.note(|_| {});
+                served += 1;
+                let ended = ended.clone();
+                tokio::spawn(async move {
+                    connection.serve(stream, script.unwrap_or_default()).await;
+                    ended.send_modify(|count| *count += 1);
+                });
+            }
+        });
+        Self {
+            address,
+            seen,
+            over,
+            serving,
+        }
+    }
+
+    /// The address of `path` on this server.
+    #[must_use]
+    pub fn url(&self, path: &str) -> String {
+        format!("ws://{}{path}", self.address)
+    }
+
+    /// The connections so far, in order, with what was sent on each.
+    #[must_use]
+    pub fn connections(&self) -> Vec<WsSeen> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Waits until `count` connections are over, so that all that was
+    /// sent on them has been noted, and gives them back.
+    pub async fn over(&self, count: usize) -> Vec<WsSeen> {
+        let mut over = self.over.clone();
+        // An error means the server is gone, and nothing more will come.
+        let _ = over.wait_for(|ended| *ended >= count).await;
+        self.connections()
+    }
+}
+
+impl Drop for WsServer {
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+/// One connection to a [`WsServer`], and where what it is sent is noted.
+struct Connection {
+    index: usize,
+    seen: Arc<Mutex<Vec<WsSeen>>>,
+}
+
+impl Connection {
+    fn note(&self, change: impl FnOnce(&mut WsSeen)) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.len() <= self.index {
+            seen.resize_with(self.index + 1, WsSeen::default);
+        }
+        if let Some(connection) = seen.get_mut(self.index) {
+            change(connection);
+        }
+    }
+
+    async fn serve(&self, mut stream: TcpStream, script: Vec<WsStep>) {
+        if let Some(WsStep::Refuse(status, body)) = script.first() {
+            self.refuse(&mut stream, *status, body).await;
+            return;
+        }
+
+        #[expect(
+            clippy::result_large_err,
+            reason = "the type of the callback is the library's"
+        )]
+        let asked = |request: &Request, response: Response| {
+            let path = request
+                .uri()
+                .path_and_query()
+                .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+            let headers = request
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                    (name.as_str().to_owned(), value)
+                })
+                .collect();
+            self.note(|seen| {
+                seen.path = path;
+                seen.headers = headers;
+            });
+            Ok(response)
+        };
+        let Ok(mut socket) = tokio_tungstenite::accept_hdr_async(stream, asked).await else {
+            return;
+        };
+
+        for step in script {
+            match step {
+                WsStep::Refuse(..) => {}
+                WsStep::Say(text) => {
+                    if socket.send(Message::text(text)).await.is_err() {
+                        return;
+                    }
+                }
+                WsStep::SayBytes(bytes) => {
+                    if socket.send(Message::binary(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                WsStep::Hear(wanted) => loop {
+                    match self.heard(&mut socket).await {
+                        Some(WsHeard::Text(text)) if text.contains(&wanted) => break,
+                        Some(_) => {}
+                        None => return,
+                    }
+                },
+                WsStep::HearBytes => loop {
+                    match self.heard(&mut socket).await {
+                        Some(WsHeard::Bytes(_)) => break,
+                        Some(WsHeard::Text(_)) => {}
+                        None => return,
+                    }
+                },
+                WsStep::Pause(pause) => tokio::time::sleep(pause).await,
+                WsStep::Close(code, reason) => {
+                    let frame = CloseFrame {
+                        code: code.into(),
+                        reason: reason.into(),
+                    };
+                    let _ = socket.close(Some(frame)).await;
+                    // Until the other side has answered the close.
+                    while self.heard(&mut socket).await.is_some() {}
+                    return;
+                }
+                WsStep::Cut => return,
+            }
+        }
+        while self.heard(&mut socket).await.is_some() {}
+    }
+
+    /// Answers a request for a connection with a status, as a server
+    /// does that will not have it.
+    async fn refuse(&self, stream: &mut TcpStream, status: u16, body: &str) {
+        if let Some(request) = read_request(stream).await {
+            self.note(|seen| {
+                let path = request.line.split(' ').nth(1).unwrap_or_default();
+                path.clone_into(&mut seen.path);
+                seen.headers = request.headers;
+            });
+        }
+        let refusal = format!(
+            "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(refusal.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// The next message of text or of bytes, noted. `None` when the other
+    /// side has left.
+    async fn heard(&self, socket: &mut WebSocketStream<TcpStream>) -> Option<WsHeard> {
+        loop {
+            let heard = match socket.next().await {
+                Some(Ok(Message::Text(text))) => WsHeard::Text(text.as_str().to_owned()),
+                Some(Ok(Message::Binary(bytes))) => WsHeard::Bytes(bytes.to_vec()),
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return None,
+                Some(Ok(_)) => continue,
+            };
+            self.note(|seen| seen.messages.push(heard.clone()));
+            return Some(heard);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-    use super::{HttpAnswer, HttpServer};
+    use super::{HttpAnswer, HttpServer, WsHeard, WsServer, WsStep};
+
+    #[test]
+    fn a_script_reads_as_a_record_of_the_wire() {
+        let script = WsStep::script(
+            "# A session.\n\
+             > hello\n\
+             < {\"type\":\"ready\"}\n\
+             \n\
+             >b\n\
+             ~ 20\n\
+             ! 1011 gone away\n\
+             x\n",
+        );
+        assert_eq!(
+            script,
+            [
+                WsStep::Hear("hello".to_owned()),
+                WsStep::Say("{\"type\":\"ready\"}".to_owned()),
+                WsStep::HearBytes,
+                WsStep::Pause(Duration::from_millis(20)),
+                WsStep::Close(1011, "gone away".to_owned()),
+                WsStep::Cut,
+            ]
+        );
+        assert_eq!(
+            WsStep::script("? 401 {\"error\":\"no\"}"),
+            [WsStep::Refuse(401, "{\"error\":\"no\"}".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_websocket_server_follows_its_script_and_says_what_it_was_sent() {
+        let server = WsServer::start(vec![
+            WsStep::script(
+                "< {\"type\":\"created\"}\n\
+                 > \"type\":\"go\"\n\
+                 < {\"type\":\"going\"}\n\
+                 >b\n\
+                 < {\"type\":\"heard\"}\n",
+            ),
+            WsStep::script("< last words\n! 4002 that is all"),
+        ])
+        .await;
+
+        let mut request = server
+            .url("/v1/live?mode=test")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("x-extra", "Yes".parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let mut said = Vec::new();
+        socket
+            .send(Message::text("{\"type\":\"wait\"}"))
+            .await
+            .unwrap();
+        socket
+            .send(Message::text("{\"type\":\"go\"}"))
+            .await
+            .unwrap();
+        socket
+            .send(Message::binary(vec![1_u8, 2, 3]))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let message = socket.next().await.unwrap().unwrap();
+            said.push(message.into_text().unwrap().as_str().to_owned());
+        }
+        assert_eq!(
+            said,
+            [
+                "{\"type\":\"created\"}",
+                "{\"type\":\"going\"}",
+                "{\"type\":\"heard\"}"
+            ]
+        );
+        // The script is over, and what comes now is still noted.
+        socket
+            .send(Message::text("{\"type\":\"bye\"}"))
+            .await
+            .unwrap();
+        socket.close(None).await.unwrap();
+
+        let seen = server.over(1).await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "/v1/live?mode=test");
+        assert_eq!(seen[0].header("x-extra"), Some("Yes"));
+        assert_eq!(
+            seen[0].messages,
+            [
+                WsHeard::Text("{\"type\":\"wait\"}".to_owned()),
+                WsHeard::Text("{\"type\":\"go\"}".to_owned()),
+                WsHeard::Bytes(vec![1, 2, 3]),
+                WsHeard::Text("{\"type\":\"bye\"}".to_owned()),
+            ]
+        );
+        assert_eq!(seen[0].texts().count(), 3);
+
+        // The second connection gets the second script: a close with a
+        // complaint.
+        let (mut socket, _) = tokio_tungstenite::connect_async(server.url("/"))
+            .await
+            .unwrap();
+        let first = socket.next().await.unwrap().unwrap();
+        assert_eq!(first.into_text().unwrap().as_str(), "last words");
+        match socket.next().await.unwrap().unwrap() {
+            Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, CloseCode::Library(4002));
+                assert_eq!(frame.reason.as_str(), "that is all");
+            }
+            other => panic!("{other:?}"),
+        }
+        drop(socket);
+        assert_eq!(server.over(2).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_server_can_refuse_or_drop_a_connection() {
+        let server = WsServer::start(vec![
+            WsStep::script("? 401 {\"error\":\"no such key\"}"),
+            WsStep::script("< one\nx"),
+        ])
+        .await;
+
+        let refused = tokio_tungstenite::connect_async(server.url("/v1/live")).await;
+        let error = refused.unwrap_err().to_string();
+        assert!(error.contains("401"), "{error}");
+        let seen = server.over(1).await;
+        assert_eq!(seen[0].path, "/v1/live");
+        assert!(seen[0].header("sec-websocket-key").is_some());
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(server.url("/"))
+            .await
+            .unwrap();
+        let first = socket.next().await.unwrap().unwrap();
+        assert_eq!(first.into_text().unwrap().as_str(), "one");
+        // Gone, with no close.
+        assert!(matches!(socket.next().await, Some(Err(_)) | None));
+    }
 
     async fn ask(server: &HttpServer, body: &str) -> String {
         let address = server.url("");
