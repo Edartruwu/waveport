@@ -84,6 +84,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
+      # The models that listen, and the library that runs them, are not in
+      # the repository. They are fetched, each checked against the digest
+      # that `assets/assets.lock.toml` pins, and kept from one run to the
+      # next. This step follows the cache of the build so that its own
+      # saving comes first, before that cache tidies `target/`.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/assets
+          key: assets-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('assets/assets.lock.toml') }}
+      - run: cargo xtask fetch-assets
       - run: cargo nextest run --workspace --all-features --locked --profile ci
       # nextest does not run documentation tests.
       - run: cargo test --workspace --doc --all-features --locked
