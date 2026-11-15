@@ -1,0 +1,23 @@
+# This file replaces the workspace `clippy.toml` for this crate, so it repeats
+# the workspace keys first. `cargo xtask lint-sync` checks they stay equal.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# The media path is domain code: no clocks, no sockets, no threads, and no
+# collections whose iteration order changes from run to run.
+disallowed-types = [
+    { path = "std::time::Instant", reason = "media code receives time as an argument" },
+    { path = "std::time::SystemTime", reason = "no wall clock in the media path" },
+    { path = "std::collections::HashMap", reason = "iteration order is randomised; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is randomised; use BTreeSet" },
+    { path = "std::net::UdpSocket", reason = "no sockets in the media path" },
+    { path = "std::net::TcpStream", reason = "no sockets in the media path" },
+    { path = "std::net::TcpListener", reason = "no sockets in the media path" },
+    { path = "std::fs::File", reason = "no file I/O in the media path" },
+]
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "no threads in the media path" },
+    { path = "std::thread::sleep", reason = "no blocking in the media path" },
+]

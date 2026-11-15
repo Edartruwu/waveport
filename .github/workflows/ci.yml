@@ -1,0 +1,235 @@
+# Every gate, on every pull request and on main.
+#
+# The commands here are the ones `cargo xtask ci` runs locally; a test in
+# xtask/src/ci.rs fails if the two drift apart. `ci-ok` is the one job branch
+# protection needs to require.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Warnings fail the build in CI and in `cargo xtask ci`, not while developing.
+  CARGO_BUILD_WARNINGS: deny
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # With no argument, rustup installs what rust-toolchain.toml pins.
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
+
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: cargo xtask arch-check
+      - run: cargo xtask tier-check
+      - run: cargo xtask lint-sync
+
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: cargo clippy --workspace --all-targets --all-features --locked
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest run --workspace --all-features --locked --profile ci
+      # nextest does not run documentation tests.
+      - run: cargo test --workspace --doc --all-features --locked
+
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: cargo doc --workspace --no-deps --all-features --locked
+
+  features:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack@0.6.46
+      - run: cargo hack check --feature-powerset --workspace --locked
+      # The domain builds for a target that has no operating system, which
+      # proves it uses no sockets, clocks, threads or files.
+      - run: cargo check -p waveport-domain --target x86_64-unknown-none --locked
+
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # An older compiler may warn about things the pinned one accepts.
+      CARGO_BUILD_WARNINGS: warn
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # The version `rust-version` in Cargo.toml promises.
+      - run: rustup toolchain install 1.98 --profile minimal
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack@0.6.46
+      - run: cargo hack check --rust-version --workspace --all-targets --locked
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny check
+
+  semver-self-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.51.0
+      # Proves the tool still tells a compatible change from a breaking one.
+      # The gate itself runs in pr-meta.yml, where the title is known.
+      - run: cargo xtask semver --self-test
+
+  miri:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # The date is pinned in xtask/src/ci.rs; change both together.
+      - run: rustup toolchain install nightly-2026-11-14 --profile minimal --component miri --component rust-src
+      - uses: Swatinem/rust-cache@v2.9.3
+      # The only crate with `unsafe` code.
+      - run: rustup run nightly-2026-11-14 cargo miri test -p waveport-alloc-counter
+
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The base revision is measured from a worktree.
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: cargo bench -p waveport-benches --bench wall_smoke --locked -- --test
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install --yes valgrind
+      # Must be the version of the `gungraun` crate in Cargo.lock.
+      - run: cargo install --locked gungraun-runner --version 0.20.0
+      - name: Instruction counts
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            cargo xtask bench-ir --base "$BASE_SHA"
+          else
+            cargo xtask bench-ir
+          fi
+
+  # The single required check. It fails unless every job above succeeded.
+  ci-ok:
+    if: always()
+    needs:
+      - fmt
+      - policy
+      - clippy
+      - test
+      - docs
+      - features
+      - msrv
+      - deny
+      - semver-self-test
+      - miri
+      - bench
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check that every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" != "success" ]; then
+              echo "a required job finished with: $result"
+              exit 1
+            fi
+          done

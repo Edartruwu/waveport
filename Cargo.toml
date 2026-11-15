@@ -1,0 +1,95 @@
+[workspace]
+resolver = "3"
+members = ["benches", "crates/core/*", "crates/testing/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+authors = ["The Waveport Authors"]
+repository = "https://github.com/Edartruwu/waveport"
+# Flipped per crate at its first release.
+publish = false
+
+[workspace.lints.rust]
+# `forbid` cannot be lowered. The few crates that need `unsafe` do not inherit
+# this table; see CONTRIBUTING.md and `cargo xtask lint-sync`.
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[workspace.lints.cargo]
+unknown_lints = "deny"
+unused_dependencies = "warn"
+
+# Architecture policy, read by `cargo xtask arch-check`.
+[workspace.metadata.waveport.arch]
+# Async runtimes and executors. The domain, ports and protocol layers must not
+# reach any of these, directly or transitively.
+runtime-crates = [
+    "tokio",
+    "tokio-util",
+    "tokio-stream",
+    "async-std",
+    "smol",
+    "async-io",
+    "async-executor",
+    "futures-executor",
+    "glommio",
+    "monoio",
+    "mio",
+]
+# Entropy sources and sockets: the same layers must stay deterministic.
+nondeterminism-crates = ["getrandom", "socket2"]
+
+# Third-party crates each inner layer may depend on directly. Adding one is a
+# reviewed change to this file.
+[workspace.metadata.waveport.arch.allowed-external]
+domain = []
+ports = []
+protocol = []
+
+# Crates allowed to contain `unsafe` code, read by `cargo xtask lint-sync`.
+[workspace.metadata.waveport.unsafe]
+allowed = ["waveport-alloc-counter"]
+
+# Only what the workspace uses today. `default-features = false` here lets
+# each member opt in, which also works on the minimum supported Cargo.
+[workspace.dependencies]
+waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", version = "0.1.0" }
+waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
+
+serde = { version = "1.0.229", default-features = false }
+serde_json = { version = "1.0.154", default-features = false }
+toml = "1.2.1"
+
+# Benchmark harnesses, used only by the `benches` package.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+gungraun = "0.20.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# A panic ends one session, not the process.
+panic = "unwind"
+debug = "line-tables-only"
+
+[profile.bench]
+# Instruction-count benchmarks need symbols.
+debug = true

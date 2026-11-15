@@ -1,0 +1,20 @@
+[package]
+name = "waveport-runtime"
+description = "Waveport session runtime: drives the session kernel and its adapters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "application"
+stability = "experimental"
+
+[lib]
+bench = false
+
+[lints]
+workspace = true

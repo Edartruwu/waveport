@@ -1,0 +1,16 @@
+# Test runner configuration; see https://nexte.st/docs/configuration/.
+
+[profile.default]
+# A test that runs this long is reported as slow, and stopped after four
+# such periods (two minutes).
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.ci]
+# Run everything, so one failure does not hide the others.
+fail-fast = false
+# A test that only passes when retried is a failing test.
+retries = 0
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"

@@ -1,0 +1,37 @@
+# Opens or updates the release pull request: version bumps and the changelog,
+# computed from the commits since the last tag. Nothing is published.
+#
+# Started by hand only. It needs the secret RELEASE_PLZ_TOKEN: a token that
+# may push a branch and open a pull request. The default token would also
+# work, but pull requests it opens do not start the `ci` workflow.
+name: release-plz
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # Versions come from tags, so the whole history is needed.
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: release-plz/action@v0.5.148
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

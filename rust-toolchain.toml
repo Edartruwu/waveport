@@ -1,0 +1,7 @@
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+# `x86_64-unknown-none` has no `std`: building `waveport-domain` for it proves
+# the domain is free of I/O, clocks and threads.
+targets = ["x86_64-unknown-none"]

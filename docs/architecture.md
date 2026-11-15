@@ -1,6 +1,6 @@
 # Waveport architecture and technical spec
 
-**Status (14 November 2026):** design spec. Nothing here is implemented yet. Every latency, memory and density figure is a design target to be validated by benchmark, not a measurement.
+**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist; none of the product described here is implemented yet. Every latency, memory and density figure is a design target to be validated by benchmark, not a measurement.
 
 See also the [roadmap](../ROADMAP.md) and the [ecosystem inventory](ecosystem.md).
 
@@ -26,17 +26,22 @@ Waveport is a hexagonal (ports and adapters) system with a domain-driven core. D
    └──────────────────────────────────────────────────────────────┘
 ```
 
+`waveport-protocol` stands beside this picture. It defines what crosses a process boundary (the client protocol, the control API, the out-of-process adapter protocol and the journal record format), depends on no workspace crate, and is used by the application layer, adapters and every client SDK.
+
 ## 2. Layers and the dependency rule
 
 | Layer | Crates | Rules |
 |---|---|---|
-| Domain | `waveport-domain` (includes the session kernel), `waveport-media` | Pure Rust: no async runtime, no sockets, no wall clock. `unsafe` is forbidden, except named DSP hot loops that run under Miri |
+| Domain | `waveport-domain` (includes the session kernel), `waveport-media` | Pure Rust: no async runtime, no sockets, no wall clock. `unsafe` is forbidden, except named DSP hot loops that run under Miri. `waveport-domain` is `no_std` with `alloc`, and CI builds it for a target with no operating system, so the compiler enforces the rule. `waveport-media` uses `std`, because it wraps DSP libraries, and is held to the rule by Clippy bans |
 | Ports | `waveport-ports` | Traits and capability types only; depends on the domain |
+| Protocol | `waveport-protocol` | Wire formats only. Depends on no workspace crate, so that a client SDK never links the kernel |
 | Application | `waveport-runtime`, `waveport-control` | Use cases: run a session, dispatch, drain, migrate, hand off. Depends on domain, ports and Tokio |
 | Adapters | `crates/adapters/**` | One crate per provider or technology. Depend on ports, never on each other |
 | Composition roots | `waveportd`, the `waveport` CLI, language bindings | The only places where adapters are chosen and wired |
+| Testing | `crates/testing/**` | Simulation harness, allocation counter, test kit. Never a dependency of code that ships |
+| Tooling | `xtask`, `benches` | Repository gates and benchmarks. `xtask` depends on no workspace crate, so the gates build even when product crates do not |
 
-`xtask arch-check` enforces the rule from `cargo metadata`. It fails when a domain crate depends on Tokio or on any adapter, when the ports crate depends on anything but the domain, or when one adapter depends on another.
+`cargo xtask arch-check` enforces the rule from `cargo metadata`. It fails when a domain, ports or protocol crate reaches an async runtime or an entropy source through any chain of dependencies, when a dependency crosses layers the wrong way, when one adapter reaches another, and when an inner layer gains a third-party dependency that is not allow-listed. [CONTRIBUTING.md](../CONTRIBUTING.md#layers-and-the-dependency-rule) lists every rule.
 
 ## 3. Bounded contexts
 
@@ -454,7 +459,9 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 
 ```
 waveport/
-├─ Cargo.toml, rust-toolchain.toml, deny.toml, clippy.toml, xtask/
+├─ Cargo.toml, rust-toolchain.toml, deny.toml, clippy.toml, release-plz.toml
+├─ xtask/          repository gates, run as `cargo xtask <command>`
+├─ benches/        waveport-benches: wall-clock and instruction-count benchmarks
 ├─ crates/
 │  ├─ core/        waveport-domain · -media · -ports · -runtime · -control · -protocol
 │  ├─ adapters/
@@ -468,66 +475,25 @@ waveport/
 │  │  └─ tools/       MCP · HTTP · WASM
 │  ├─ bindings/    python · node · wasm-host · c-abi
 │  ├─ client/      client-core (shared by every client SDK)
-│  └─ testing/     waveport-sim · -testkit · -evals
+│  └─ testing/     waveport-sim · -alloc-counter · -testkit · -evals
 ├─ apps/           waveportd · waveport-cli · console (web UI) · operator
 ├─ sdks/           js · react · swift · kotlin · react-native · flutter · embedded
 ├─ models/         training and evaluation code for the open models
 ├─ deploy/         Dockerfiles · Helm chart · examples
-└─ docs/ · examples/ · benches/
+└─ docs/ · examples/
 ```
 
-Root manifest (a sketch; feature lists are set when each dependency is first added):
+`xtask/`, `benches/`, `crates/core/`, `crates/testing/` (without `-evals`) and `docs/` exist today. The rest is added in the phase that needs it.
 
-```toml
-[workspace]
-resolver = "3"
-members = [
-    "crates/core/*",
-    "crates/adapters/*/*",
-    "crates/bindings/*",
-    "crates/client/*",
-    "crates/testing/*",
-    "apps/waveportd",
-    "apps/waveport-cli",
-    "apps/operator",
-    "xtask",
-]
+The root [`Cargo.toml`](../Cargo.toml) is the source of truth for workspace members, lint levels, profiles and dependency versions. What it does not say by itself:
 
-[workspace.package]
-edition = "2024"
-rust-version = "1.98"
-license = "Apache-2.0"
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "warn"
-unreachable_pub = "warn"
-
-[workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-indexing_slicing = "deny"
-
-[workspace.dependencies]
-tokio = "~1.53"            # long-term-support line
-bytes = "1.12"
-str0m = "=0.25.0"          # exact pin: breaks API on most minor releases
-rsipstack = "=0.8.5"       # exact pin: 88 releases in twelve months
-ort = "=2.0.0-rc.15"       # exact pin: release candidate
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "unwind"           # a panic ends one session, not the process
-debug = "line-tables-only"
-```
-
-- Crates that need `unsafe` (DSP hot loops, FFI, bindings) do not inherit the workspace lint table. They declare their own, with `unsafe_code = "deny"` and an `#[allow]` plus a safety comment at each site, and they run under Miri.
-- The Clippy denials for `unwrap`, `expect`, `panic` and indexing are relaxed inside tests through `clippy.toml`.
-- CI treats warnings as errors.
+- **Only dependencies in use are declared.** Cargo and `cargo deny` reject unused ones. The pins already decided for later phases are: `tokio` `~1.53` (the long-term-support line); `str0m` `=0.25.0`, exact, because it breaks its API on most minor releases; `rsipstack` `=0.8.5`, exact, because it had 88 releases in twelve months; `ort` `=2.0.0-rc.15`, exact, because it is a release candidate.
+- **Each crate declares its layer and stability tier** under `[package.metadata.waveport]`. The lists `arch-check` uses (async runtimes, entropy crates, third-party crates each inner layer may use) are under `[workspace.metadata.waveport]`.
+- **`unsafe` is forbidden workspace-wide.** Crates that need it (DSP hot loops, FFI, bindings) do not inherit the workspace lint table. They carry a copy with `unsafe_code = "deny"`, mark each site with `#[expect]` and a safety comment, and run under Miri. `cargo xtask lint-sync` fails if the copy drifts. Today the only such crate is `waveport-alloc-counter`.
+- **The Clippy denials** for `unwrap`, `expect`, `panic` and indexing are relaxed inside tests through `clippy.toml`.
+- **The release profile keeps unwinding** (`panic = "unwind"`): a panic ends one session, not the process.
+- **New dependency versions wait seven days** before they can be selected (`.cargo/config.toml`).
+- **CI treats warnings as errors.**
 
 ## 16. Tech stack
 
@@ -596,7 +562,7 @@ Multi-provider LLM crates (`genai`, `rig`) are rejected as foundations: they hav
 | Errors | Typed errors per port with a retry class. Catch-all error types only in binaries |
 | Features | Additive only. Each provider crate is opt-in. The feature powerset of core crates is checked in CI |
 | Supply chain | Licence allow-list, advisory and duplicate checks on every pull request. Lockfile committed. Cargo 1.100 dependency cooldowns on, because crates.io filled with high-churn voice and SIP crates in 2026 |
-| API stability | Three tiers: stable, preview, experimental. Semver check and public-API diff on every pull request. Deprecations live at least two minor releases and six months |
+| API stability | Three tiers: stable, preview, experimental; see the [stability policy](stability.md). Semver check and public-API diff on every pull request. Deprecations live at least two minor releases and six months |
 | Release build | Fat LTO, one codegen unit, unwinding kept on, profile-guided optimisation for `waveportd`, a non-glibc allocator |
 | Testing | See section 14. Provider contract tests run against recorded fixtures on every pull request and against live providers nightly |
 
