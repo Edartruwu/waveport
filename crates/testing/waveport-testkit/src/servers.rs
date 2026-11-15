@@ -315,6 +315,10 @@ async fn answer_with(stream: &mut TcpStream, answer: HttpAnswer) -> std::io::Res
     }
 }
 
+/// How long a server that has closed a connection waits for the other
+/// side to answer before it drops the connection.
+const CLOSE_WAIT: Duration = Duration::from_millis(500);
+
 /// One thing a WebSocket server does. A script is a list of them, done
 /// in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -333,7 +337,8 @@ pub enum WsStep {
     HearBytes,
     /// Waits this long.
     Pause(Duration),
-    /// Closes the connection with a code and a reason.
+    /// Closes the connection with a code and a reason, and drops it once
+    /// the other side has answered, or after half a second.
     Close(u16, String),
     /// Drops the connection without a word.
     Cut,
@@ -623,8 +628,11 @@ impl Connection {
                         reason: reason.into(),
                     };
                     let _ = socket.close(Some(frame)).await;
-                    // Until the other side has answered the close.
-                    while self.heard(&mut socket).await.is_some() {}
+                    // Until the other side has answered the close, but
+                    // not for ever: a connection that nobody reads at
+                    // the other end never answers.
+                    let answered = async { while self.heard(&mut socket).await.is_some() {} };
+                    let _ = tokio::time::timeout(CLOSE_WAIT, answered).await;
                     return;
                 }
                 WsStep::Cut => return,
