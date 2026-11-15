@@ -105,7 +105,8 @@ pub struct FrameOut<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TransportControl {
     /// Discard the audio of this response that the far end holds and has
-    /// not played. A transport that cannot
+    /// not played. It follows the last frame of the response: none of its
+    /// frames is sent after it. A transport that cannot
     /// ([`RemoteBuffer::clearable`]) takes the request and does nothing.
     Clear {
         /// The response.

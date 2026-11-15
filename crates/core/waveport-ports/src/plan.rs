@@ -195,7 +195,10 @@ pub enum Shortfall {
     TranscriptsNotOnRequest,
     /// The synthesiser does not say where the words are in its audio. An
     /// interrupted response is cut by share of characters, and the cut
-    /// can be a few words away from what was heard.
+    /// can be a few words away from what was heard. That is so inside a
+    /// piece of text whose audio has all arrived. Inside one whose audio
+    /// is still arriving nothing is known yet, and the cut is where the
+    /// piece begins.
     CoarseSpokenText,
     /// The far end does not say what it has played. What was heard is
     /// worked out from the pace, and is ahead of the truth by whatever
