@@ -58,6 +58,7 @@ CI runs the same commands; a test in `xtask/src/ci.rs` fails if the workflows an
 | `deny` | `cargo deny check` | Advisories, licences, duplicate versions and sources |
 | `semver` | `cargo xtask semver` | No undeclared breaking change in a stable or preview crate |
 | `bench-smoke` | `cargo bench -p waveport-benches --bench wall_smoke --locked -- --test` | The wall-clock benchmarks still run |
+| `loom` | `cargo test --release --locked -p waveport-runtime --lib --target-dir target/loom` with `RUSTFLAGS="--cfg waveport_loom"` | What a session and the compute plane hand each other arrives whole and wakes whoever waits for it, however the threads take turns |
 | `miri` | `cargo miri test -p waveport-alloc-counter` on the pinned nightly | The one crate with `unsafe` code has no undefined behaviour in its tests |
 | `bench-ir` | `cargo xtask bench-ir --base <rev>` | No benchmark executes more than 2% more instructions than at the base revision |
 
@@ -172,7 +173,7 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-domain --test simulat
 WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay
 ```
 
-**Every night.** The `scheduled` workflow runs 200,000 random sessions per profile, other ones each night, and the larger sessions of `tests/model.rs`.
+**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile and 1,000 of the runtime per story and profile (see below), other ones each night, and the larger sessions of `tests/model.rs`.
 
 **Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps and of rebuilding a session from its journal, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
 
@@ -186,7 +187,26 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-media --test network
 
 **Ports.** `waveport-testkit` has a fake of every port (`fakes`). They keep time by Tokio's clock, so a test under `#[tokio::test(start_paused = true)]` takes no real time and runs the same way every time. Each fake follows a script and says what it can do; change its `caps` and it behaves as it says. `conformance` holds the rules of each port as functions that take any implementation: an adapter's tests call them against a recorded server, and its `live_*` tests against the provider. A new rule goes there, together with a case in `tests/conformance.rs` that breaks it, to show that the check sees it.
 
-`tests/voice_loop.rs` runs whole conversations through the fakes, with the real kernel and audio path: a question answered, an interruption, a tool call, and the interruption again with parts that can do less. The loop that joins the parts there is test code and stands in for the runtime. When you change a port, these are the tests that say whether a session can still be run through it.
+**Sessions.** `waveport-runtime` runs whole sessions on those fakes. `tests/sessions.rs` holds conversations written by hand, one for each thing a session has to do or to live through: a question answered, an interruption, a tool call, parts that can do less, a line that closes, a recogniser that fails, a journal that fails or is taken over, a process that dies. `tests/shards.rs` runs sessions on real threads. When you change a port or the session, these say whether a session can still be run. A fault the simulation finds gets a conversation here that fails without the fix: the simulation finds it again only under the seed that has it.
+
+**Session simulation.** `tests/simulation/` makes sessions up from seeds and runs them on the real session actor, with the kernel's monitor on every step. A seed decides who calls and what they say, how late every part answers, what the line does to the packets, which parts fail, what the application asks, and at which records of its journal the process dies. `stories` tells the six kernel scenarios again, and `sweeps` makes up sessions nobody wrote under four profiles (calm, chaos, crashes, shutdown). Beyond the invariants, `world.rs` checks every run on what the far end was sent, that nothing is in the conversation that the far end did not play, that no tool with an effect was called early or twice, and that a session rebuilt from the journal is the session that wrote it. A new rule about what a session may do to the world goes there.
+
+An ordinary run has ten sessions per test. When you change the session, run more once; a release build does 10,000 in about two minutes. A failure prints its seed, and that seed alone prints every step of its session:
+
+```sh
+WAVEPORT_SIM_SEEDS=1000 cargo test --release -p waveport-runtime --test simulation
+WAVEPORT_SIM_SEED=12 cargo test --release -p waveport-runtime --test simulation sweeps::shutdown
+```
+
+With `-- --nocapture` each test prints what its sessions did, counted: turns, interruptions, tool calls and how they ended, processes that died. A sweep in which something stopped happening passes while it tests nothing, so look at the counts when you change what a profile makes up.
+
+**Threads.** A session never leaves its thread, and the listening models run on others. Everything the two sides share is in `src/handoff.rs` of the runtime, and its tests try every way the threads of a small case can take turns, with [loom](https://docs.rs/loom). They are in a build of their own, which the gate `loom` makes:
+
+```sh
+cargo xtask ci --only loom
+```
+
+If you change what crosses between a session and the compute plane, change it there and add a schedule for it. Check that the schedule fails when the code is wrong: put the wake-up before the answer, or the head of a frame before its samples, and loom has to report a thread that never wakes. Under `--cfg waveport_loom` the rest of the crate is not built, and the rings are stand-ins of which every operation is one step: the real ones are `rtrb`'s.
 
 **Adapter kit.** The WebSocket and HTTP clients are tested against servers that the tests start on the loopback interface; nothing leaves the machine. A test of a connection that is refused has to accept a timeout as well: Windows takes about two seconds to refuse a closed port on the loopback interface.
 
