@@ -4,9 +4,9 @@ Waveport is an open-source platform for real-time voice and multimodal AI agents
 
 ## Status
 
-**Foundations, the first measurements, the session kernel and the audio path.** The repository holds the workspace, the quality gates, the test and benchmark harnesses, and the first product code. The session kernel decides who has the floor, what the agent says and how much of it was heard, which tool calls run and what became of each, and what a session is after its process died. The audio path turns the packets of a transport into audio in order and the audio of speech synthesis into frames handed over at the pace they are heard, and knows how much of a response has been heard. Both are libraries with no I/O. Nothing here runs a voice session yet.
+**Foundations, the first measurements, the session kernel, the audio path and the ports.** The repository holds the workspace, the quality gates, the test and benchmark harnesses, and the first product code. The session kernel decides who has the floor, what the agent says and how much of it was heard, which tool calls run and what became of each, and what a session is after its process died. The audio path turns the packets of a transport into audio in order and the audio of speech synthesis into frames handed over at the pace they are heard, and knows how much of a response has been heard. Both are libraries with no I/O. The ports are the traits that a provider, a transport, a store or a tool implements, each with a statement of what it can do, and a planner that decides from those statements how a session is run and names what it will do less well. Nothing here runs a voice session yet, except in the tests, where fakes of every port hold whole conversations with the real kernel and audio path.
 
-Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel is the second: it passes the six scenarios written before it, and its invariants are checked on random sessions and on every path through small ones. The audio path is the third: Opus and G.711, the change of rate, a reorder buffer, pacing and the playout ledger, with no allocation per frame. The ports, the runtime, providers and the first voice loop come next.
+Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel is the second: it passes the six scenarios written before it, and its invariants are checked on random sessions and on every path through small ones. The audio path is the third: Opus and G.711, the change of rate, a reorder buffer, pacing and the playout ledger, with no allocation per frame. The ports are the fourth, with the plumbing adapters share: a stream helper, WebSocket and HTTP clients and a parser for server-sent events. The runtime, providers and the first voice loop come next.
 
 ## Documents
 
@@ -27,14 +27,15 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 |---|---|
 | `crates/core/waveport-domain` | Domain model and the session kernel. `no_std`: no sockets, clocks or threads |
 | `crates/core/waveport-media` | The per-frame audio path: reordering, decoding, resampling, pacing |
-| `crates/core/waveport-ports` | The traits adapters implement |
+| `crates/core/waveport-ports` | The traits adapters implement, what each can say it does, and the session planner |
+| `crates/core/waveport-adapter-kit` | What adapters share: a stream helper, WebSocket and HTTP clients, server-sent events, retry classes |
 | `crates/core/waveport-runtime` | Application layer: runs sessions |
 | `crates/core/waveport-control` | Application layer: runs the fleet |
 | `crates/core/waveport-protocol` | Wire formats: client protocol, control API, journal records. Depends on no other crate |
 | `crates/testing/waveport-sim` | Deterministic simulation: seeded runs with a virtual clock |
 | `crates/testing/waveport-kernel-sim` | The session kernel under test: scenarios explored along every path, random sessions, every path through small sessions, and recorded sessions replayed, with the invariants checked at every step |
 | `crates/testing/waveport-alloc-counter` | Counting allocator, to prove a code path does not allocate |
-| `crates/testing/waveport-testkit` | Shared test helpers |
+| `crates/testing/waveport-testkit` | Fakes of every port, the checks every implementation of a port has to pass, and whole sessions run on the fakes |
 | `benches/` | Wall-clock and instruction-count benchmarks |
 | `xtask/` | The repository's gates, run as `cargo xtask <command>` |
 | `assets/` | The lock file that pins model files; `cargo xtask fetch-assets` downloads them |

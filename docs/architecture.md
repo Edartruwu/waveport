@@ -1,6 +1,6 @@
 # Waveport architecture and technical spec
 
-**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the session kernel (section 4) exists: it takes turns, speaks, keeps the conversation, runs tool calls, lets a second agent answer a call or take the floor, closes, and is rebuilt from its journal after a crash. The audio path (`waveport-media`) exists too: Opus and G.711, the change of rate, the inbound path and the outbound path of sections 4.6 and 5, with no allocation per frame. Nothing joins the two yet: no port, no adapter, no runtime. All six of the kernel's scenarios (section 14) pass, and its ten invariants (section 13) are checked on random sessions and on every path through small ones in every test run. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
+**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the session kernel (section 4) exists: it takes turns, speaks, keeps the conversation, runs tool calls, lets a second agent answer a call or take the floor, closes, and is rebuilt from its journal after a crash. The audio path (`waveport-media`) exists too: Opus and G.711, the change of rate, the inbound path and the outbound path of sections 4.6 and 5, with no allocation per frame. The ports of section 8 exist (`waveport-ports`), with the planner of section 6 that decides how a session is run from what its parts can do, and so does what adapters share (`waveport-adapter-kit`). No adapter and no runtime exists yet. In the tests a fake of every port runs whole conversations through the kernel and the audio path, joined by a small loop that the runtime will replace. All six of the kernel's scenarios (section 14) pass, and its ten invariants (section 13) are checked on random sessions and on every path through small ones in every test run. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
 
 See also the [roadmap](../ROADMAP.md) and the [ecosystem inventory](ecosystem.md).
 
@@ -167,7 +167,7 @@ No priority lanes are needed. Pipecat has them because slow work sits in line; h
 
 ### 4.6 Spoken-text reconciliation
 
-- Text-to-speech and speech-to-speech adapters attach alignment marks `(text_offset, sample_offset)` to the audio they return. The marks stay with the audio, in the media plane's playout ledger; the kernel stores none. A provider without word timing yields one mark per segment, and the ledger interpolates inside the segment by share of characters.
+- Text-to-speech and speech-to-speech adapters attach alignment marks `(text_offset, sample_offset)` to the audio they return. The marks stay with the audio, in the media plane's playout ledger; the kernel stores none. A provider without word timing yields one mark per segment, and the ledger interpolates inside the segment by share of characters. That mark arrives when the segment's audio ends; a response interrupted before then is cut where the segment begins.
 - `Playout` reports how far playback has got: audio handed to the transport, audio acknowledged, and how much of the text has been heard in full, which is the last mark at or before `played_upto − estimated_client_buffer`. It uses transport playout acknowledgements where they exist.
 - The runtime delivers the latest report to the kernel ahead of any other event, so an interruption is decided on what had been heard by then. A final position sent after the stop would carry the tag of a response that is no longer live, and be dropped.
 - On completion or interruption the kernel commits exactly one assistant item: the planned text cut at the heard offset, flagged `truncated` when cut. A response of which nothing was heard commits nothing.
@@ -186,6 +186,7 @@ The classifier is a port. Phase 1 ships a voice-activity-only policy; phase 5 sh
 
 Around these three steps the kernel keeps to a few rules:
 
+- Where the far end can discard audio it holds, it is told to at a `BargeIn`, after the fade has gone out: no frame of a response follows the request to discard it. What the far end had played by then is what was heard.
 - A turn does not end while it is undecided what its speech over the agent was. Speech taken for a backchannel or for noise is dismissed with its words, for that stated reason. A `BargeIn` verdict that arrives after the timeout still counts for as long as the turn is open.
 - A response is not played while a user turn is open: the agent waits for a gap. If a newer turn meant for the agent is committed before anyone has heard the response, the response is replaced; once it is being heard, the next one waits for it.
 - What the application asks the agent to say takes the floor at once, is never replaced by a response, and is not an answer: a turn that was owed a response is still owed one afterwards.
@@ -252,6 +253,19 @@ A `BrainProfile` states which port fills each of three roles (hear, think, speak
 | Multi-party | Every perception event carries a `ParticipantId`; speaker is mandatory on turns and messages. `Floor` tracks N holders, and an `AddresseePolicy` decides whether the agent is addressed. One-to-one is N = 1 with the policy `Always` |
 | Text-only | A session with zero tracks and no transport. A text input opens and commits a turn in one step, and "played" means delivered |
 
+Every port says what it can do (section 8.2), and a pure function decides from that how the session is run: `plan(&AgentNeeds, &BrainProfile, &TransportCaps) -> Result<SessionPlan, PlanError>`. It runs before the session starts. For a cascaded session it settles:
+
+| Question | Answer |
+|---|---|
+| The rate of the audio handed to the recogniser | 16 kHz, or the nearest rate the recogniser takes |
+| Whether the recogniser is asked for a final transcript when a turn ends | Yes if it can be asked; otherwise the turn waits until the recogniser notices |
+| The rate speech is synthesised at | 24 kHz, or less if the wire carries less, or the nearest rate the synthesiser gives |
+| How the synthesiser's marks are read | As exact times when it gives word or character times; otherwise spread over the audio by share of characters |
+| Whether what was heard is what the far end says it played | Yes if it says; otherwise it is worked out from the pace at which audio was sent |
+| Whether the far end is told to discard audio at an interruption | Yes if it can |
+
+A session that cannot be run at all is refused: no rate in common, or an agent with tools and a model without tool calls. A session that can be run, but less well than with better parts, is run, and the plan lists each `Shortfall` so that it can be shown and logged: transcript times no finer than the audio sent, transcripts that cannot be asked for, spoken text cut by share of characters, playback that is estimated, audio that cannot be taken back. Nothing degrades silently. A speech-to-speech profile is refused for now, by name.
+
 ## 7. Flows on speech-to-speech models
 
 Each realtime adapter declares what it can do:
@@ -269,7 +283,7 @@ pub struct RealtimeCaps {
 }
 ```
 
-A pure `plan(&AgentDef, &Caps) -> Result<SessionPlan, PlanError>` runs at session start and at every handoff. It picks the strongest strategy available and fails loudly instead of degrading silently:
+The planner of section 6 will decide this too, at session start and at every handoff. It picks the strongest strategy available and fails loudly instead of degrading silently:
 
 1. **Live:** update the provider session at the transition, behind a barrier. The next response is not created until the update is acknowledged.
 2. **Per response:** each response request carries the node's instructions and tools.
@@ -291,71 +305,109 @@ The flow is a kernel-side state machine, so its guarantees never depend on what 
 
 Stable Rust 1.100 has no `async fn` through `dyn`, no return-type notation, no async drop and no generators. The design depends on none of them. Poll-style receive halves are object-safe without boxing each call, and boxed futures are written by hand where a call happens a few times per turn.
 
-Adapters hold no interruption logic. The runtime's drivers own tagging, cancellation by drop, retries and metrics. A helper builds both halves of a stream port from an ordinary select loop over bounded channels.
+Adapters hold no interruption logic. The runtime's drivers own tagging, cancellation by drop, retries and metrics. A helper in the adapter kit builds both halves of a stream port from one `async` block that reads commands and sends events over bounded queues. The receive half owns that block and runs it whenever it is polled, so an adapter spawns no task, and dropping the receive half ends the stream and everything it holds. A send half that is behind says `Full` and takes nothing; it never waits.
 
-### 8.2 Driven ports (sketches)
+### 8.2 Driven ports
+
+As built in `waveport-ports`, in outline:
 
 ```rust
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Speech-to-text. `Llm` and `Tts` have the same three-trait shape.
+/// Speech-to-text. `Tts` has the same shape, with `try_speak` and `try_finish`.
 pub trait Stt: Send + Sync + 'static {
-    fn caps(&self) -> SttCaps;
-    fn open(&self, cfg: SttConfig)
-        -> BoxFuture<'_, Result<(Box<dyn SttTx>, Box<dyn SttRx>), PortError>>;
+    fn caps(&self) -> SttCaps; // rates, interim results, timing, who decides a transcript is final
+    fn open(&self, config: SttConfig) -> BoxFuture<'_, Result<SttStream, PortError>>;
 }
+pub struct SttStream { pub tx: Box<dyn SttTx>, pub rx: Pin<Box<dyn SttRx>> }
 pub trait SttTx: Send {
     fn try_send(&mut self, audio: AudioRef<'_>) -> Result<(), Full>;
-    fn finalize(&mut self);
+    fn try_finalize(&mut self) -> Result<(), Full>;
 }
 pub trait SttRx: Send {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>)
         -> Poll<Option<Result<SttEvent, PortError>>>;
 }
 
+/// A language model has no send half: a request is whole when it starts.
+pub trait Llm: Send + Sync + 'static {
+    fn caps(&self) -> LlmCaps; // tool calls, several at once
+    fn start<'a>(&'a self, request: LlmRequest<'a>)
+        -> BoxFuture<'a, Result<Pin<Box<dyn LlmRx>>, PortError>>;
+}
+
+pub trait Transport: Send + 'static {
+    fn caps(&self) -> TransportCaps; // codec each way, remote buffer (clearable, says what it played), text
+    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
+    fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full>;
+    fn try_control(&mut self, control: TransportControl) -> Result<(), Full>; // Clear
+}
+
+pub trait Journal: Send + Sync + 'static {
+    fn acquire(&self, session: SessionId) -> BoxFuture<'_, Result<Recovered, JournalError>>;
+    fn append(&self, session: SessionId, lease: Lease, batch: Batch)
+        -> BoxFuture<'_, Result<Seq, JournalError>>;
+    fn snapshot(&self, session: SessionId, lease: Lease, snapshot: Snapshot)
+        -> BoxFuture<'_, Result<(), JournalError>>;
+}
+
+pub trait ToolExecutor: Send + Sync + 'static {
+    fn call<'a>(&'a self, request: ToolRequest<'a>) -> BoxFuture<'a, ToolReply>;
+    fn undo(&self, session: SessionId, call: ToolCallId) -> BoxFuture<'_, bool>;
+}
+
+/// Compute plane: batched across sessions, one instance per compute thread.
+pub trait VadModel: Send + 'static {
+    type State: Default + Send;
+    fn infer(&mut self, frames: &[&[i16]], states: &mut [Self::State], out: &mut [f32])
+        -> Result<(), PortError>;
+}
+```
+
+`TurnModel` and `InterruptionClassifier` have the shape of `VadModel` without the state. `EventSink` is given the facts of each step and the marks of each stage of a turn; it is never called inside the kernel.
+
+What the outline does not show:
+
+- **Audio.** Rates and codecs are named in the domain (`waveport_domain::audio`), so a port or an adapter names a codec without linking one. Audio for a recogniser is lent (`AudioRef`: where it begins, its rate, its samples). Audio from a synthesiser is `PcmBytes`: the bytes as they came off the wire, read as samples where they are used, so an adapter copies nothing.
+- **Marks.** A synthesiser's mark says that the text up to a byte offset ends at a point in the audio. The plan says how they are read (section 6).
+- **The journal.** `acquire` takes a session over: it answers with a lease, the newest snapshot, the records since, and the number of the next record. Whoever held the session before is fenced from then on. An `append` is taken only with the current lease and the expected number, and answers with the number of the last record that is safe; the records are bytes the journal does not read.
+- **Tools.** `undo` takes back a call whose effect the kernel has given up on (section 4.8), and says whether it could.
+- **Errors** carry a retry class: transient, rate-limited (with how long to wait, where the provider says), not authorised, permanent or timed out.
+
+Not built yet:
+
+```rust
 /// Send half of a speech-to-speech session. Every command is answered by Ack or Nack.
 pub trait RtTx: Send {
     fn try_audio(&mut self, audio: AudioRef<'_>) -> Result<(), Full>;
     fn try_cmd(&mut self, cmd: RtCmd) -> Result<(), Full>;
     // RtCmd: UpdateSession, InjectItem, CreateResponse, Cancel, Truncate, ToolResult
 }
-
-/// Compute plane: batched across sessions, one instance per compute thread.
-pub trait VadModel: Send + 'static {
-    type State: Default + Send;
-    fn infer(&mut self, frames: &[&[f32]], states: &mut [Self::State], out: &mut [f32]);
-}
-pub trait InterruptionClassifier: Send + 'static {
-    fn infer(&mut self, windows: &[OverlapWindow<'_>], out: &mut [OverlapVerdict]);
-}
-
-pub trait Transport: Send + 'static {
-    fn caps(&self) -> TransportCaps; // codecs, remote buffer (clearable, marks), data, DTMF
-    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
-    fn try_send_media(&mut self, track: TrackId, frame: &EncodedFrame) -> Result<(), Full>;
-    fn try_control(&mut self, ctl: TransportControl) -> Result<(), Full>; // Clear, Mark, Data
-}
-
-pub trait Journal: Send + Sync {
-    fn append(&self, s: SessionId, lease: LeaseEpoch, from: Seq, batch: Bytes)
-        -> BoxFuture<'_, Result<Seq, JournalError>>;
-    fn load(&self, s: SessionId) -> BoxFuture<'_, Result<Recovered, JournalError>>;
-}
 ```
-
-The remaining driven ports:
 
 | Port | Style |
 |---|---|
-| `TurnModel` | Compute plane, same shape as `InterruptionClassifier` |
 | `Denoise` | Synchronous per-stream `process(&mut [f32])` |
-| `Bus`, `ToolExecutor`, `Retriever` | Boxed-future request ports |
+| `Bus`, `Retriever` | Boxed-future request ports |
 | Clock | Lives only in the runtime; the kernel receives `now` and emits `SetTimer` |
-| Telemetry | A subscriber to the domain-event stream plus static per-shard histograms; never a call inside the kernel |
 
-Errors carry a retry class: transient, rate-limited, auth, permanent or timeout.
+### 8.3 What adapters share
 
-### 8.3 Driving ports (sketches)
+`waveport-adapter-kit` holds what every provider adapter would otherwise write for itself:
+
+| Part | What it does |
+|---|---|
+| Stream helper | Both halves of a stream port from one `async` block (section 8.1) |
+| WebSocket client | Connects with a time limit, sends and receives text and binary messages, and turns a close code into a retry class |
+| HTTP client | A POST whose answer is read a piece at a time; a status that is not a success becomes an error with its retry class and the provider's `Retry-After` |
+| Server-sent events | A parser that is given bytes as they arrive, with a limit on the length of an event |
+| Secrets | A key type that prints as `Secret(…)` and is struck out of any text that may be shown |
+| Retry | The class of an HTTP status or a close code, and a backoff with jitter |
+| Timeline | Turns a recogniser's times, counted from the audio it was sent, into media time |
+
+Both clients use one TLS configuration: `rustls` with `ring`, and certificates checked by the platform's own verifier.
+
+### 8.4 Driving ports (sketches)
 
 ```rust
 pub trait SessionControl {
@@ -372,6 +424,8 @@ pub trait Dispatch {
     fn drain(&self, by: MonoTime);
 }
 ```
+
+Neither is built. `SessionControl` comes with the runtime that implements it.
 
 ## 9. Durability
 
@@ -492,7 +546,8 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 | Random networks | A seed makes up the network between a sender and the inbound path: jitter, loss, repeats, outages, bursts, and packets that arrive together. Rules are checked on what comes out: one unbroken timeline, each packet once and in order, never more than 60 ms made up in a row, every deadline in the future, and counters that add up. 500 networks in every test run. The outbound path, the codecs and the change of rate have exact tests of their own: a tone must come through the filter at its level, and one above the band must be 55 dB down |
 | Fuzzing | `step` with structured events; every wire parser (SIP, SDP, RTP, client protocol); journal decode with snapshot round trip |
 | Concurrency checking | The few lock-free structures (rings, batcher) |
-| Port conformance kit | Each adapter's declared capabilities tested nightly against the live provider |
+| Port conformance kit | Functions in `waveport-testkit` that hold any implementation of a port to the port's rules: a model's response ends once and says how, a recogniser's final transcripts are in order and inside the audio it was sent, a synthesiser's audio and marks add up, a journal fences and keeps its numbering, and a stream that is dropped stops. They run in every test run on the fakes, in every combination of what a fake can say it does, and on implementations made to break one rule at a time, to show that each rule is checked. Adapters run them against recorded servers, and nightly against the live provider |
+| Whole sessions on fakes | A fake of every port, on virtual time: a transport whose far end speaks, plays what it is sent and says what it played; a recogniser, a model, a synthesiser and tools that follow a script; a journal in memory. The kernel and the audio path are the real ones. Four conversations are run through the ports and nothing else: a question and its answer heard to the end, an interruption answered on the words that were heard, a tool call and its result, and the same interruption with parts that can do less. The loop that joins the parts is test code until the runtime exists |
 | CI gates | Instruction-count benchmarks for `step` and the per-frame media path; a counting allocator that fails on any allocation in the media path; a 1,000-session soak with flat memory; the density and interruption targets; a `kill -9` test that must resume |
 
 ## 15. Workspace and Cargo spec
@@ -556,7 +611,8 @@ Versions and licences were checked against crates.io on 14 November 2026.
 | Bundled models | Silero VAD v6.2.3 (MIT, 2.3 MB); Smart Turn v3.2 (BSD-2, 8.7 MB) | Pinned by address and SHA-256 in `assets/assets.lock.toml` and fetched by `cargo xtask fetch-assets`; never committed. LiveKit's turn detector cannot be used: its licence restricts it to LiveKit Agents |
 | Local speech (optional) | `sherpa-onnx` 2.0.1 | Local LLMs run out of process behind the OpenAI-compatible adapter |
 | QUIC and MoQ | `quinn` 0.11.12, `web-transport-quinn` 0.13.6, `moq-net` 0.3.23 | Experimental transport; the drafts are still moving |
-| WebSocket, HTTP, gRPC | `tokio-tungstenite` 0.30.0, `axum` 0.8.9, `hyper` 1.12.0, `reqwest` 0.13.5, `tonic` 0.14.9, `prost` 0.14.6 | A breaking `tonic` release is pending |
+| WebSocket, HTTP, gRPC | `tokio-tungstenite` 0.30.0, `axum` 0.8.9, `hyper` 1.12.0, `reqwest` 0.13.5, `tonic` 0.14.9, `prost` 0.14.6 | A breaking `tonic` release is pending. The WebSocket client does not go through a proxy; the HTTP client uses the proxy the environment names |
+| TLS | `rustls` 0.23 with `ring`, `tokio-rustls` 0.26.6, `rustls-platform-verifier` 0.7.1 | No OpenSSL, and no assembler to install on Windows. Certificates are checked by the platform's own verifier, so no list of roots is compiled in |
 | MCP | `rmcp` 3.10.0 | Official SDK |
 | Bus | `async-nats` 0.52.0, `redis` 1.8.2 | `fred` is dormant |
 | Stores | `sqlx` 0.9.0 (Postgres), `redb` 4.6.0 (local journal), `object_store` 0.14.2, `moka` 0.12.16 | Snapshots are versioned serde records, not `rkyv` archives; see section 9 |
