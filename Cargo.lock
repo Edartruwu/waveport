@@ -2556,6 +2556,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "waveport-transport-websocket"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+]
+
+[[package]]
 name = "waveport-tts-cartesia"
 version = "0.1.0"
 dependencies = [

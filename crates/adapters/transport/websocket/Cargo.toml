@@ -1,0 +1,33 @@
+[package]
+name = "waveport-transport-websocket"
+description = "Waveport adapter: a session whose far end connects over a WebSocket, and the client for it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "adapter"
+stability = "experimental"
+
+[lib]
+bench = false
+
+[dependencies]
+waveport-adapter-kit = { workspace = true }
+waveport-domain = { workspace = true }
+waveport-ports = { workspace = true }
+
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true
