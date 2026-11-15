@@ -50,7 +50,7 @@ use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::codec;
 use waveport_runtime::compute::Compute;
 use waveport_runtime::session::{
-    Ended, Parts, Request, Session, SessionInput, SessionSpec, StoreBroken, Tap,
+    Ended, Parts, Request, Session, SessionInput, SessionSpec, StateRule, StoreBroken, Tap,
 };
 use waveport_sim::{Seed, SimRng};
 use waveport_testkit::fakes::{
@@ -181,7 +181,18 @@ impl Plan {
     /// A calm world for `spec`: one caller on a sound card who says
     /// nothing, parts that answer soon and never fail, and a model that
     /// says "Yes." to everything.
-    pub(crate) fn new(seed: u64, spec: SessionSpec) -> Self {
+    pub(crate) fn new(seed: u64, mut spec: SessionSpec) -> Self {
+        // Three sessions in four have their journal keep their state
+        // every few records, so that one that dies is mostly rebuilt
+        // from a state and what follows it. The fourth is rebuilt from
+        // all its records, as every session was before there were
+        // states.
+        if !seed.is_multiple_of(4) {
+            spec.states = StateRule {
+                records: 2 + seed % 7,
+                after: Duration::from_secs(60),
+            };
+        }
         Self {
             seed,
             spec,
@@ -264,6 +275,10 @@ pub(crate) struct Tally {
     pub hung_up: u64,
     pub reopened: u64,
     pub frames: u64,
+    /// States the journal stored.
+    pub states: u64,
+    /// Lives that began from a stored state.
+    pub from_state: u64,
 }
 
 impl Tally {
@@ -293,6 +308,8 @@ impl Tally {
             (&mut self.hung_up, other.hung_up),
             (&mut self.reopened, other.reopened),
             (&mut self.frames, other.frames),
+            (&mut self.states, other.states),
+            (&mut self.from_state, other.from_state),
         ];
         for (sum, more) in pairs {
             *sum += more;
@@ -699,6 +716,7 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
             journal.stop_after(last);
         }
         let (facts, text) = decoded(&journal.records(SESSION))?;
+        tally.from_state += u64::from(journal.kept(SESSION).0.is_some());
         let began_ms = since(Instant::now());
         let fresh = plan.fresh(life, began_ms, resumes_at(&facts));
         let turns = Box::new(ScriptedTurns::always());
@@ -788,6 +806,7 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         let wire = fresh.far_end.log();
         tally.frames += wire.frames.len() as u64;
         tally.reopened += u64::from(session.stats().hearing.recogniser_failures);
+        tally.states += u64::from(session.stats().states.stored);
         if explain {
             log.push(format!(
                 "{:>7} ms  LIFE {life} IS OVER: ended {ended:?}, died {died}",

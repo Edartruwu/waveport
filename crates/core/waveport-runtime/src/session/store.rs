@@ -10,6 +10,14 @@
 //! A store that fails for a while is tried again, with the same records:
 //! none is skipped and none is sent twice under another number. A journal
 //! that says the session has another owner is believed at once.
+//!
+//! A journal may wait a little for more to store in one go. While the
+//! kernel waits for a fact to be safe, the journal is asked not to.
+//!
+//! The session's state as of one of its facts goes the same way, once
+//! every fact up to that one is safe. A state the journal fails to store
+//! is let go of: the records it would have replaced are still there, and
+//! the next state replaces them.
 
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -22,7 +30,7 @@ use waveport_domain::ids::Seq;
 use waveport_domain::text::TextArena;
 use waveport_domain::time::MonoTime;
 use waveport_ports::error::BoxFuture;
-use waveport_ports::journal::{Batch, Journal, JournalError, Lease, SessionId};
+use waveport_ports::journal::{Batch, Journal, JournalError, Lease, SessionId, Snapshot};
 
 use crate::codec::{self, CodecError};
 
@@ -32,6 +40,17 @@ const FIRST_WAIT: Duration = Duration::from_millis(50);
 const LONGEST_WAIT: Duration = Duration::from_secs(2);
 
 type Appending = BoxFuture<'static, Result<Seq, JournalError>>;
+type Keeping = BoxFuture<'static, Result<(), JournalError>>;
+
+/// How the states a session gave its journal fared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateStats {
+    /// States the journal stored.
+    pub stored: u32,
+    /// States that were let go of: the journal failed to store them, or
+    /// a newer one was ready before they could be sent.
+    pub dropped: u32,
+}
 
 /// Why a session can write no more facts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +82,16 @@ pub(crate) struct Store {
     failures: u32,
     /// The number of the last fact that is safe.
     durable: Seq,
+    /// The last fact the kernel said it waits for.
+    awaited: Seq,
+    /// Whether the journal has been asked to hurry with the request
+    /// under way.
+    hurried: bool,
+    /// A state that waits for the facts it includes to be safe.
+    state: Option<Snapshot>,
+    /// The state the journal is storing.
+    keeping: Option<Keeping>,
+    states: StateStats,
     broken: Option<StoreBroken>,
 }
 
@@ -84,8 +113,35 @@ impl Store {
             again: None,
             failures: 0,
             durable: Seq(next.get().saturating_sub(1)),
+            awaited: Seq(0),
+            hurried: false,
+            state: None,
+            keeping: None,
+            states: StateStats::default(),
             broken: None,
         }
+    }
+
+    /// The kernel waits for the fact numbered `seq` to be safe.
+    pub(crate) fn hurry(&mut self, seq: Seq) {
+        self.awaited = self.awaited.max(seq);
+    }
+
+    /// Has the journal store `state`, the session's state as of the fact
+    /// numbered `upto`, once every fact up to that one is safe. A state
+    /// that was still waiting gives way to this one.
+    pub(crate) fn keep(&mut self, upto: Seq, state: Bytes) {
+        if self.broken.is_some() {
+            return;
+        }
+        if self.state.replace(Snapshot { upto, state }).is_some() {
+            self.states.dropped += 1;
+        }
+    }
+
+    /// How the states given to the journal fared.
+    pub(crate) const fn states(&self) -> StateStats {
+        self.states
     }
 
     /// Why nothing more can be written, if that is so.
@@ -131,6 +187,57 @@ impl Store {
         now: MonoTime,
         events: &mut Vec<Event>,
     ) -> bool {
+        let mut changed = self.poll_records(cx, now, events);
+        changed |= self.poll_state(cx, events);
+        // The kernel is held up by what the journal has in hand, so the
+        // journal is told not to wait for more to store with it.
+        if self.appending.is_some() && self.awaited > self.durable && !self.hurried {
+            self.hurried = true;
+            self.journal.hurry(self.session);
+        }
+        changed
+    }
+
+    /// Hands the journal the state that waits, once the facts it
+    /// includes are safe, and sees how the one it is storing fared.
+    fn poll_state(&mut self, cx: &mut Context<'_>, events: &mut Vec<Event>) -> bool {
+        if self.broken.is_some() {
+            return false;
+        }
+        if self.keeping.is_none()
+            && let Some(state) = self.state.take_if(|state| state.upto <= self.durable)
+        {
+            let (journal, session, lease) = (Arc::clone(&self.journal), self.session, self.lease);
+            let keeping = async move { journal.snapshot(session, lease, state).await };
+            self.keeping = Some(Box::pin(keeping));
+        }
+        let Some(keeping) = &mut self.keeping else {
+            return false;
+        };
+        let Poll::Ready(kept) = keeping.as_mut().poll(cx) else {
+            return false;
+        };
+        self.keeping = None;
+        match kept {
+            Ok(()) => self.states.stored += 1,
+            Err(JournalError::Fenced) => {
+                self.broken = Some(StoreBroken::Fenced);
+                events.push(Event::Control(ControlInput::LeaseLost));
+            }
+            // The records the state would have replaced are still there.
+            Err(JournalError::OutOfOrder { .. } | JournalError::Store(_)) => {
+                self.states.dropped += 1;
+            }
+        }
+        true
+    }
+
+    fn poll_records(
+        &mut self,
+        cx: &mut Context<'_>,
+        now: MonoTime,
+        events: &mut Vec<Event>,
+    ) -> bool {
         if self.broken.is_some() {
             return false;
         }
@@ -160,6 +267,7 @@ impl Store {
                 let sent = batch.clone();
                 let appending = async move { journal.append(session, lease, sent).await };
                 self.appending = Some((Box::pin(appending), batch));
+                self.hurried = false;
             }
             let Some((appending, _)) = &mut self.appending else {
                 return changed;

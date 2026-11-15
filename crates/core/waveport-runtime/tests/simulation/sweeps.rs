@@ -352,6 +352,10 @@ fn calm() {
     assert!(tally.completed >= tally.runs / 2, "{tally:?}");
     assert!(tally.continuations >= tally.runs / 3, "{tally:?}");
     assert_eq!(tally.lives, tally.runs, "{tally:?}");
+    // Three sessions in four keep their state as they go, and none was
+    // rebuilt from one, because none died.
+    assert!(tally.states >= tally.runs, "{tally:?}");
+    assert_eq!(tally.from_state, 0, "{tally:?}");
 }
 
 #[test]
@@ -377,6 +381,9 @@ fn crashes() {
     assert!(tally.turns >= tally.runs, "{tally:?}");
     assert!(tally.notices >= tally.runs / 4, "{tally:?}");
     assert!(tally.in_doubt >= tally.runs / 50, "{tally:?}");
+    // And many of them from the state their journal held, not from all
+    // their records.
+    assert!(tally.from_state >= tally.runs / 4, "{tally:?}");
 }
 
 /// A session that is asked to close, or whose line closes, is closed. One

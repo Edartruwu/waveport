@@ -50,7 +50,7 @@ use waveport_media::ingress::Packet;
 use waveport_ports::audio::Rate;
 pub use waveport_ports::control::{SessionEvent, SessionInput};
 use waveport_ports::error::{BoxFuture, Full};
-use waveport_ports::journal::{Journal, JournalError, SessionId};
+use waveport_ports::journal::{Journal, JournalError, Recovered, SessionId};
 use waveport_ports::llm::Llm;
 use waveport_ports::plan::{AgentNeeds, BrainProfile, CascadePlan, PlanError, SessionPlan, plan};
 use waveport_ports::stt::{Stt, SttRx};
@@ -66,7 +66,7 @@ pub use self::hear::HearStats;
 pub use self::speak::SpeakStats;
 use self::speak::{Milestone, Voice};
 use self::store::Store;
-pub use self::store::StoreBroken;
+pub use self::store::{StateStats, StoreBroken};
 use self::think::Mind;
 use crate::codec::{self, CodecError};
 use crate::compute::{Compute, Wants};
@@ -107,6 +107,43 @@ pub struct SessionSpec {
     pub language: Option<String>,
     /// How the answers of the model that listens for speech are judged.
     pub edges: EdgeConfig,
+    /// When the session's state is stored in its journal.
+    pub states: StateRule,
+}
+
+/// When a session has its journal store its state, so that the session
+/// can be rebuilt from there and the records before it let go of.
+///
+/// A state is due once this many records were written since the last
+/// one, or this long has passed since and anything was recorded. It is
+/// taken when a turn or an utterance next enters the conversation, which
+/// is when a session holds least that is only under way. A session in
+/// which neither happens takes it once twice as many records wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateRule {
+    /// How many records are written before a state is due.
+    pub records: u64,
+    /// How long after the last state the next is due.
+    pub after: Duration,
+}
+
+impl StateRule {
+    /// No state is ever stored: a session is rebuilt from all its
+    /// records.
+    pub const NEVER: Self = Self {
+        records: u64::MAX,
+        after: Duration::MAX,
+    };
+}
+
+impl Default for StateRule {
+    /// Every 256 records, or every minute.
+    fn default() -> Self {
+        Self {
+            records: 256,
+            after: Duration::from_secs(60),
+        }
+    }
 }
 
 impl SessionSpec {
@@ -122,6 +159,7 @@ impl SessionSpec {
             tools: Vec::new(),
             language: None,
             edges: EdgeConfig::default(),
+            states: StateRule::default(),
         }
     }
 }
@@ -198,10 +236,18 @@ pub enum StartError {
     Journal(JournalError),
     /// A record of the journal could not be read.
     Record(CodecError),
-    /// The records of the journal do not make a session.
+    /// The state the journal holds of the session could not be read.
+    State(CodecError),
+    /// The state the journal holds says it is as of another record than
+    /// the journal says.
+    StateMoved {
+        /// The record the journal says the state is as of.
+        journal: Seq,
+        /// The record the state says it is as of.
+        state: Seq,
+    },
+    /// The state and the records of the journal do not make a session.
     Restore(RestoreError),
-    /// The journal holds a snapshot, and this build reads none.
-    Snapshot,
 }
 
 impl fmt::Display for StartError {
@@ -221,10 +267,17 @@ impl fmt::Display for StartError {
             Self::Codec(error) => write!(f, "the transport's codec cannot be set up: {error}"),
             Self::Journal(error) => write!(f, "the journal could not be read: {error}"),
             Self::Record(error) => write!(f, "a record of the journal could not be read: {error}"),
+            Self::State(error) => write!(
+                f,
+                "the state the journal holds of the session could not be read: {error}"
+            ),
+            Self::StateMoved { journal, state } => write!(
+                f,
+                "the journal holds a state as of record {}, which says it is as of record {}",
+                journal.get(),
+                state.get()
+            ),
             Self::Restore(error) => write!(f, "the journal does not hold a session: {error}"),
-            Self::Snapshot => {
-                f.write_str("the journal holds a snapshot, which this build cannot read")
-            }
         }
     }
 }
@@ -268,6 +321,8 @@ pub struct SessionStats {
     pub hearing: HearStats,
     /// What went wrong while speaking.
     pub speaking: SpeakStats,
+    /// How the states the session gave its journal fared.
+    pub states: StateStats,
 }
 
 type Calling = BoxFuture<'static, ToolReply>;
@@ -325,6 +380,13 @@ pub struct Session<P: Policies = DefaultPolicies> {
     leaving: Option<MonoTime>,
     /// Whether the transport has said so.
     far_end_told: bool,
+    /// When the session's state is stored.
+    rule: StateRule,
+    /// Where the last audio ends that a turn was spoken in.
+    heard_until: MediaTime,
+    /// The last fact the newest state includes, and when it was taken.
+    state_upto: Seq,
+    state_at: MonoTime,
     stats: SessionStats,
 }
 
@@ -378,20 +440,22 @@ impl<P: Policies> Session<P> {
             .acquire(spec.id)
             .await
             .map_err(StartError::Journal)?;
-        if recovered.snapshot.is_some() {
-            return Err(StartError::Snapshot);
-        }
         let mut next = Vec::new();
-        let (kernel, offset) = if recovered.tail.is_empty() {
-            let kernel = Kernel::new(spec.kernel.clone(), policies).map_err(StartError::Config)?;
-            (kernel, Duration::ZERO)
-        } else {
+        let state_upto = recovered
+            .snapshot
+            .as_ref()
+            .map_or(Seq(0), |state| state.upto);
+        let (kernel, heard_until) = rebuild(&spec.kernel, policies, &recovered)?;
+        if heard_until.is_some() {
             // The first step of a session that was rebuilt deals with
             // what its earlier life left unfinished. This makes sure
             // there is one.
             next.push(Event::Durable(Seq(recovered.next.get().saturating_sub(1))));
-            rebuild(&spec.kernel, policies, &recovered.tail)?
-        };
+        }
+        // A session that is rebuilt goes on a little after the end of
+        // what its earlier life heard.
+        let offset = heard_until.map_or(Duration::ZERO, |heard| since_start(heard) + RESUME_GAP);
+        let began = MonoTime::from_nanos(u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX));
         let store = Store::new(parts.journal, spec.id, recovered.lease, recovered.next);
         let recent = last_of(recovered.tail, recovered.next);
         Ok(Self {
@@ -433,6 +497,10 @@ impl<P: Policies> Session<P> {
             parting: Vec::new(),
             leaving: None,
             far_end_told: false,
+            rule: spec.states,
+            heard_until: heard_until.unwrap_or(MediaTime::from_ticks(0)),
+            state_upto,
+            state_at: began,
             stats: SessionStats::default(),
         })
     }
@@ -468,6 +536,7 @@ impl<P: Policies> Session<P> {
     pub fn stats(&self) -> SessionStats {
         let mut stats = self.stats;
         stats.speaking = self.voice.stats();
+        stats.states = self.store.states();
         for ear in &self.ears {
             let hearing = ear.stats();
             stats.hearing.recogniser_failures += hearing.recogniser_failures;
@@ -898,13 +967,15 @@ impl<P: Policies> Session<P> {
                     let seq = stamped.seq;
                     self.tell(&SessionEvent::Fact { seq, record });
                 }
-                if let Fact::TurnCommitted { turn, .. } = stamped.fact {
+                if let Fact::TurnCommitted { turn, span, .. } = stamped.fact {
                     mark(self.sink.as_ref(), self.id, now, Stage::TurnEnded(turn));
+                    self.heard_until = self.heard_until.max(span.end);
                 }
             }
             if let Some(sink) = &self.sink {
                 sink.facts(self.id, now, &out.facts, &out.text);
             }
+            self.keep_state(now, &out.facts);
         }
         for command in &out.cmds {
             self.carry_out(now, command, &out.text);
@@ -1009,9 +1080,38 @@ impl<P: Policies> Session<P> {
                 }
             }
             Command::Emit(event) => self.tell(&SessionEvent::Told(event)),
-            // The store tells the kernel of every fact that is safe, so
-            // there is nothing to do for the one it waits for.
-            Command::AwaitDurable(_) => {}
+            // The store tells the kernel of every fact that is safe. For
+            // the one it waits for, the journal is asked not to wait for
+            // more to store with it.
+            Command::AwaitDurable(seq) => self.store.hurry(seq),
+        }
+    }
+
+    /// Has the journal store the session's state, if the facts a step
+    /// has just left make this the time for it.
+    fn keep_state(&mut self, now: MonoTime, facts: &[Stamped]) {
+        let Some(last) = facts.last().map(|stamped| stamped.seq) else {
+            return;
+        };
+        let waiting = last.get().saturating_sub(self.state_upto.get());
+        let since = Duration::from_nanos(now.as_nanos().saturating_sub(self.state_at.as_nanos()));
+        let due = waiting >= self.rule.records || since >= self.rule.after;
+        let overdue = waiting >= self.rule.records.saturating_mul(2);
+        let settled = facts.iter().any(|stamped| {
+            matches!(
+                stamped.fact,
+                Fact::TurnCommitted { .. } | Fact::UtteranceCommitted { .. }
+            )
+        });
+        if !(overdue || due && settled) {
+            return;
+        }
+        // The kernel has taken every fact it emitted, so what it holds is
+        // the state as of the last of them.
+        self.state_upto = last;
+        self.state_at = now;
+        if let Ok(state) = codec::encode_state(&self.kernel.snapshot(), self.heard_until) {
+            self.store.keep(last, state);
         }
     }
 
@@ -1112,25 +1212,46 @@ fn mark(sink: Option<&Arc<dyn EventSink>>, session: SessionId, at: MonoTime, sta
     }
 }
 
-/// The kernel that the records of a journal add up to, and the time on
-/// the session's clock at which its next life starts.
+/// The kernel of a session as its journal has it. For a session the
+/// journal holds nothing of, a new one. Otherwise the one that the
+/// journal's state of the session and the records after it add up to,
+/// and where the last audio ends that a turn of the session was spoken
+/// in.
 fn rebuild<P: Policies>(
     config: &KernelConfig,
     policies: P,
-    records: &[Bytes],
-) -> Result<(Kernel<P>, Duration), StartError> {
+    recovered: &Recovered,
+) -> Result<(Kernel<P>, Option<MediaTime>), StartError> {
+    if recovered.is_new() {
+        let kernel = Kernel::new(config.clone(), policies).map_err(StartError::Config)?;
+        return Ok((kernel, None));
+    }
     let mut text = TextArena::default();
-    let mut facts: Vec<Stamped> = Vec::with_capacity(records.len());
-    for record in records {
+    let mut facts: Vec<Stamped> = Vec::with_capacity(recovered.tail.len());
+    for record in &recovered.tail {
         facts.push(codec::decode(record, &mut text).map_err(StartError::Record)?);
     }
-    // What a new session would be is what the first record was added to.
-    let blank = Kernel::new(config.clone(), DefaultPolicies::default())
-        .map_err(StartError::Config)?
-        .snapshot();
-    let kernel = Kernel::restore(config.clone(), policies, &blank, &facts, &text)
+    let (from, heard) = if let Some(stored) = &recovered.snapshot {
+        let (snapshot, heard) = codec::decode_state(&stored.state).map_err(StartError::State)?;
+        let says = Seq(snapshot.next_seq().get().saturating_sub(1));
+        if says != stored.upto {
+            return Err(StartError::StateMoved {
+                journal: stored.upto,
+                state: says,
+            });
+        }
+        (snapshot, heard)
+    } else {
+        // What a new session would be is what the first record was
+        // added to.
+        let blank = Kernel::new(config.clone(), DefaultPolicies::default())
+            .map_err(StartError::Config)?
+            .snapshot();
+        (blank, MediaTime::from_ticks(0))
+    };
+    let kernel = Kernel::restore(config.clone(), policies, &from, &facts, &text)
         .map_err(StartError::Restore)?;
-    Ok((kernel, heard_until(&facts) + RESUME_GAP))
+    Ok((kernel, Some(heard.max(heard_until(&facts)))))
 }
 
 /// The last of the records of a journal whose next record has the number
@@ -1148,16 +1269,20 @@ fn last_of(records: Vec<Bytes>, next: Seq) -> VecDeque<(Seq, Bytes)> {
         .collect()
 }
 
-/// The session's time at the end of the last audio the facts speak of.
-fn heard_until(facts: &[Stamped]) -> Duration {
-    let ticks = facts
+/// Where the last audio ends that a turn among the facts was spoken in.
+fn heard_until(facts: &[Stamped]) -> MediaTime {
+    facts
         .iter()
         .filter_map(|stamped| match stamped.fact {
-            Fact::TurnCommitted { span, .. } => Some(span.end.ticks()),
+            Fact::TurnCommitted { span, .. } => Some(span.end),
             _ => None,
         })
         .max()
-        .unwrap_or(0);
+        .unwrap_or(MediaTime::from_ticks(0))
+}
+
+/// How long after a session began the audio at `at` was heard.
+fn since_start(at: MediaTime) -> Duration {
     // 48,000 ticks in a second.
-    Duration::from_nanos(ticks.saturating_mul(62_500) / 3)
+    Duration::from_nanos(at.ticks().saturating_mul(62_500) / 3)
 }
