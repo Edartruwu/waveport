@@ -30,6 +30,8 @@ serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
+waveport-kernel-sim = { workspace = true }
+waveport-sim = { workspace = true }
 waveport-testkit = { workspace = true }
 
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }

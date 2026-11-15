@@ -40,7 +40,7 @@ use waveport_domain::config::{ConfigError, KernelConfig};
 use waveport_domain::event::{CloseReason, ControlInput, Event, TimerId, ToolEvent};
 use waveport_domain::fact::{Fact, Lifecycle, Stamped};
 use waveport_domain::ids::{ParticipantId, Seq, ToolCallId, ToolId, TurnId};
-use waveport_domain::kernel::{Kernel, RestoreError, View};
+use waveport_domain::kernel::{Kernel, RestoreError, Snapshot, View};
 use waveport_domain::out::Out;
 use waveport_domain::policy::{DefaultPolicies, Policies};
 use waveport_domain::text::TextArena;
@@ -436,6 +436,13 @@ impl<P: Policies> Session<P> {
     #[must_use]
     pub fn view(&self) -> View<'_> {
         self.kernel.view()
+    }
+
+    /// What the session's facts add up to: what a session rebuilt from
+    /// its journal holds, once the journal has every fact.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        self.kernel.snapshot()
     }
 
     /// What went wrong so far that the session could carry on from.
