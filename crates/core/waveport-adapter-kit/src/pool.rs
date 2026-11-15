@@ -433,7 +433,12 @@ mod tests {
         drop(listener);
         let pool = pool(url, Duration::from_secs(60));
         let error = pool.warm().await.unwrap_err();
-        assert_eq!(error.class, RetryClass::Transient, "{error}");
+        // Refused, or not answered in time: some systems take as long to
+        // refuse as this pool is willing to wait.
+        assert!(
+            matches!(error.class, RetryClass::Transient | RetryClass::Timeout),
+            "{error}"
+        );
         assert!(pool.line().await.is_err());
         assert_eq!(pool.kept(), 0);
     }

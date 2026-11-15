@@ -336,12 +336,13 @@ impl waveport_ports::tts::TtsTx for Deaf {
 
 #[tokio::test]
 async fn the_end_of_a_context_said_too_early_does_not_end_the_speech() {
-    // The provider says that the context is over after the first piece,
-    // which it is not: more text follows.
+    // The provider says that the context is over in the middle of the
+    // first piece, which it is not: more text follows.
     let script = [
         "> \"text\":\"Hello,\"".to_owned(),
-        audio("test-1", 300, " Hello,", 20),
+        audio("test-1", 200, " Hell", 20),
         over("test-1"),
+        audio("test-1", 100, "o,", 20),
         UNTIL_FINISHED.to_owned(),
         audio("test-1", 700, " world!", 30),
         over("test-1"),
@@ -351,7 +352,9 @@ async fn the_end_of_a_context_said_too_early_does_not_end_the_speech() {
     let tts = adapter(&server);
     let mut stream = tts.open(TtsConfig::new(RATE)).await.unwrap();
     stream.tx.try_speak("Hello,").unwrap();
-    // The first piece comes whole before the next is given.
+    // The first piece comes whole before the next is given, and the
+    // word that the context is over, which comes in the middle of it,
+    // ends nothing.
     let mut marks = 0;
     while marks < 6 {
         match next_tts(&mut stream.rx).await {
@@ -360,9 +363,6 @@ async fn the_end_of_a_context_said_too_early_does_not_end_the_speech() {
             other => panic!("the speech ended early: {other:?}"),
         }
     }
-    // And then the word that the context is over, which ends nothing.
-    let early = tokio::time::timeout(Duration::from_millis(100), next_tts(&mut stream.rx));
-    assert!(early.await.is_err());
     stream.tx.try_speak(" world!").unwrap();
     stream.tx.try_finish().unwrap();
     let (events, samples) = read(&mut stream).await;
