@@ -48,6 +48,8 @@ pub struct AllocStats {
     pub deallocations: u64,
     /// Bytes requested by allocations, plus the growth of reallocations.
     pub bytes_allocated: u64,
+    /// Bytes returned by deallocations, plus the shrinkage of reallocations.
+    pub bytes_freed: u64,
 }
 
 impl AllocStats {
@@ -57,6 +59,7 @@ impl AllocStats {
         reallocations: 0,
         deallocations: 0,
         bytes_allocated: 0,
+        bytes_freed: 0,
     };
 
     /// Total number of calls to the allocator.
@@ -75,7 +78,18 @@ impl AllocStats {
             reallocations: self.reallocations.saturating_sub(earlier.reallocations),
             deallocations: self.deallocations.saturating_sub(earlier.deallocations),
             bytes_allocated: self.bytes_allocated.saturating_sub(earlier.bytes_allocated),
+            bytes_freed: self.bytes_freed.saturating_sub(earlier.bytes_freed),
         }
+    }
+
+    /// Bytes allocated and not freed again, when the two are compared over
+    /// the same span: what the measured code still holds on the heap.
+    ///
+    /// Zero when more was freed than allocated, which happens when the span
+    /// frees memory that was allocated before it started.
+    #[must_use]
+    pub const fn live_bytes(self) -> u64 {
+        self.bytes_allocated.saturating_sub(self.bytes_freed)
     }
 }
 
@@ -144,7 +158,10 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        record(|stats| stats.deallocations = stats.deallocations.saturating_add(1));
+        record(|stats| {
+            stats.deallocations = stats.deallocations.saturating_add(1);
+            stats.bytes_freed = stats.bytes_freed.saturating_add(bytes(layout.size()));
+        });
         // SAFETY: the caller guarantees that `ptr` came from this allocator
         // with `layout`. Every allocation here was made by `inner`, so the
         // same holds for `inner`.
@@ -155,7 +172,9 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
         record(|stats| {
             stats.reallocations = stats.reallocations.saturating_add(1);
             let growth = bytes(new_size.saturating_sub(layout.size()));
+            let shrinkage = bytes(layout.size().saturating_sub(new_size));
             stats.bytes_allocated = stats.bytes_allocated.saturating_add(growth);
+            stats.bytes_freed = stats.bytes_freed.saturating_add(shrinkage);
         });
         // SAFETY: the caller guarantees that `ptr` came from this allocator
         // with `layout` and that `new_size` is valid for it. Every allocation
@@ -226,12 +245,14 @@ mod tests {
             reallocations: 2,
             deallocations: 3,
             bytes_allocated: 40,
+            bytes_freed: 10,
         };
         let later = AllocStats {
             allocations: 4,
             reallocations: 2,
             deallocations: 5,
             bytes_allocated: 100,
+            bytes_freed: 30,
         };
         let delta = later.since(earlier);
         assert_eq!(
@@ -241,8 +262,10 @@ mod tests {
                 reallocations: 0,
                 deallocations: 2,
                 bytes_allocated: 60,
+                bytes_freed: 20,
             }
         );
+        assert_eq!(delta.live_bytes(), 40);
         assert_eq!(delta.calls(), 5);
         assert_eq!(AllocStats::default(), AllocStats::ZERO);
     }
