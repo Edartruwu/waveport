@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core/*", "crates/testing/*", "xtask"]
+members = ["benches", "crates/core/*", "crates/testing/*", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -72,10 +72,15 @@ allowed = ["waveport-alloc-counter"]
 # each member opt in, which also works on the minimum supported Cargo.
 [workspace.dependencies]
 waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", version = "0.1.0" }
+waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
 
 serde = { version = "1.0.229", default-features = false }
 serde_json = { version = "1.0.154", default-features = false }
 toml = "1.2.1"
+
+# Benchmark harnesses, used only by the `benches` package.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+gungraun = "0.20.0"
 
 [profile.release]
 opt-level = 3

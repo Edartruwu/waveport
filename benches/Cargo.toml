@@ -1,0 +1,40 @@
+[package]
+name = "waveport-benches"
+description = "Waveport benchmarks: wall-clock and instruction-count."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.waveport]
+layer = "tooling"
+stability = "internal"
+
+[lib]
+bench = false
+
+[dependencies]
+waveport-sim = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# Instruction counts come from Valgrind, which this project uses on Linux only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gungraun = { workspace = true }
+
+[[bench]]
+name = "wall_smoke"
+path = "wall/smoke.rs"
+harness = false
+
+[[bench]]
+name = "ir_smoke"
+path = "ir/smoke.rs"
+harness = false
+
+[lints]
+workspace = true

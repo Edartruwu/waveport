@@ -69,7 +69,11 @@ pub(crate) fn compare(workspace: &Workspace, base: Option<&str>) -> Result<bool>
         None => false,
     };
     let mut command = meta::cargo();
-    command.current_dir(&workspace.root).args(BENCH);
+    command
+        .current_dir(&workspace.root)
+        // The same directory the baseline was saved under.
+        .env("CARGO_TARGET_DIR", &workspace.target_dir)
+        .args(BENCH);
     if with_baseline {
         command.args(["--baseline=base", LIMIT]);
     }
