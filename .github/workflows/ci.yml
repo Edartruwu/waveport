@@ -66,6 +66,12 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2.9.3
+      # The headers of the sound system, for the transport that runs on
+      # this machine's microphone and loudspeaker. macOS and Windows have
+      # theirs already.
+      - name: Install the ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev
       - run: cargo clippy --workspace --all-targets --all-features --locked
 
   test:
@@ -84,6 +90,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
+      # The headers of the sound system: see the `clippy` job.
+      - name: Install the ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev
       # The models that listen, and the library that runs them, are not in
       # the repository. They are fetched, each checked against the digest
       # that `assets/assets.lock.toml` pins, and kept from one run to the
@@ -109,6 +119,9 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2.9.3
+      # The headers of the sound system: see the `clippy` job.
+      - name: Install the ALSA headers
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev
       - run: cargo doc --workspace --no-deps --all-features --locked
 
   features:
@@ -123,6 +136,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack@0.6.46
+      # The headers of the sound system: see the `clippy` job.
+      - name: Install the ALSA headers
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev
       - run: cargo hack check --feature-powerset --workspace --locked
       # The domain builds for a target that has no operating system, which
       # proves it uses no sockets, clocks, threads or files.
@@ -145,6 +161,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack@0.6.46
+      # The headers of the sound system: see the `clippy` job.
+      - name: Install the ALSA headers
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev
       - run: cargo hack check --rust-version --workspace --all-targets --locked
 
   deny:
