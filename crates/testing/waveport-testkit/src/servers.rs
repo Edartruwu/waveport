@@ -315,6 +315,38 @@ async fn answer_with(stream: &mut TcpStream, answer: HttpAnswer) -> std::io::Res
     }
 }
 
+/// `text`, with each `{{name}}` in it replaced by the text that `heard`,
+/// a JSON object, has under `"name"`. A provider repeats the names its
+/// client chose, for a request or for a stream, and a script cannot know
+/// them beforehand. A name that `heard` does not have is left as it is.
+fn repeating(text: &str, heard: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((before, after)) = rest.split_once("{{") {
+        out.push_str(before);
+        let Some((name, after)) = after.split_once("}}") else {
+            out.push_str("{{");
+            rest = after;
+            continue;
+        };
+        let key = format!("\"{name}\":\"");
+        let value = heard
+            .split_once(&key)
+            .and_then(|(_, value)| value.split_once('"'))
+            .map(|(value, _)| value);
+        if let Some(value) = value {
+            out.push_str(value);
+        } else {
+            out.push_str("{{");
+            out.push_str(name);
+            out.push_str("}}");
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// How long a server that has closed a connection waits for the other
 /// side to answer before it drops the connection.
 const CLOSE_WAIT: Duration = Duration::from_millis(500);
@@ -326,7 +358,9 @@ pub enum WsStep {
     /// Refuses the connection with this status and body, as a provider
     /// refuses a key it does not know. Only as the first step.
     Refuse(u16, String),
-    /// Sends a message of text.
+    /// Sends a message of text. Each `{{name}}` in it is replaced by the
+    /// text that the last message a [`Hear`](Self::Hear) waited for has
+    /// under `"name"`: a provider repeats the names its client chose.
     Say(String),
     /// Sends a message of bytes.
     SayBytes(Vec<u8>),
@@ -594,10 +628,14 @@ impl Connection {
             return;
         };
 
+        // The last message a step waited for: what is said next may
+        // repeat names out of it.
+        let mut waited_for = String::new();
         for step in script {
             match step {
                 WsStep::Refuse(..) => {}
                 WsStep::Say(text) => {
+                    let text = repeating(&text, &waited_for);
                     if socket.send(Message::text(text)).await.is_err() {
                         return;
                     }
@@ -609,7 +647,10 @@ impl Connection {
                 }
                 WsStep::Hear(wanted) => loop {
                     match self.heard(&mut socket).await {
-                        Some(WsHeard::Text(text)) if text.contains(&wanted) => break,
+                        Some(WsHeard::Text(text)) if text.contains(&wanted) => {
+                            waited_for = text;
+                            break;
+                        }
                         Some(_) => {}
                         None => return,
                     }
@@ -715,6 +756,30 @@ mod tests {
         assert_eq!(
             WsStep::script("? 401 {\"error\":\"no\"}"),
             [WsStep::Refuse(401, "{\"error\":\"no\"}".to_owned())]
+        );
+    }
+
+    #[test]
+    fn what_is_said_can_repeat_names_out_of_what_was_heard() {
+        let heard = r#"{"context_id":"call-7","transcript":"Hi","n":3,"voice":{"id":"v1"}}"#;
+        assert_eq!(
+            super::repeating(r#"{"done":true,"context_id":"{{context_id}}"}"#, heard),
+            r#"{"done":true,"context_id":"call-7"}"#
+        );
+        assert_eq!(
+            super::repeating("{{id}} said {{transcript}}, {{id}}", heard),
+            "v1 said Hi, v1"
+        );
+        // What was not heard, or is not text, stays as it was written,
+        // and so does what only looks like a name.
+        assert_eq!(
+            super::repeating("{{missing}} {{n}}", heard),
+            "{{missing}} {{n}}"
+        );
+        assert_eq!(super::repeating("a {{b", heard), "a {{b");
+        assert_eq!(
+            super::repeating("{\"a\":{\"b\":1}}", heard),
+            "{\"a\":{\"b\":1}}"
         );
     }
 
