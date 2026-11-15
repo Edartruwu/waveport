@@ -47,6 +47,25 @@ jobs:
           echo "seeds ${WAVEPORT_SIM_SEEDS}"
           cargo test --release --locked -p waveport-domain --test simulation
 
+  # Whole sessions made up from seeds and run by the real session actor,
+  # with a fake in every port: a thousand for each of the six stories and
+  # each of the four profiles, and other ones every night. A failure prints
+  # its seed, and `WAVEPORT_SIM_SEED=<seed>` runs that session alone.
+  sessions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: cargo test --release -p waveport-runtime --test simulation
+        run: |
+          first=$(( GITHUB_RUN_NUMBER * 1000 ))
+          export WAVEPORT_SIM_SEEDS="${first}..$(( first + 1000 ))"
+          echo "seeds ${WAVEPORT_SIM_SEEDS}"
+          cargo test --release --locked -p waveport-runtime --test simulation
+
   # Every path through sessions small enough to try them all, the larger
   # ones included: millions of states, each step checked.
   model-check:

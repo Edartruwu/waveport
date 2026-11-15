@@ -166,6 +166,22 @@ jobs:
       # The gate itself runs in pr-meta.yml, where the title is known.
       - run: cargo xtask semver --self-test
 
+  # Every way the threads of the compute plane can take turns over what
+  # they hand each other: a frame that arrives in pieces, or a wake-up that
+  # is missed, in any of them fails here.
+  loom:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: --cfg waveport_loom
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: cargo test --release --locked -p waveport-runtime --lib --target-dir target/loom
+
   miri:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -218,6 +234,7 @@ jobs:
       - msrv
       - deny
       - semver-self-test
+      - loom
       - miri
       - bench
     runs-on: ubuntu-24.04
