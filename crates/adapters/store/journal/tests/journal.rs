@@ -270,6 +270,26 @@ async fn a_new_token_takes_the_place_of_the_one_before() {
     assert_eq!(soon(journal.admit(&stranger)).await, Ok(false));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_the_journal_makes_is_its_owners_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let path = scratch("private");
+    let journal = open(&path);
+    soon(journal.acquire(SessionId(1))).await.unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    drop(journal);
+
+    // A file that was there is left as whoever made it wanted it.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let journal = open(&path);
+    soon(journal.acquire(SessionId(1))).await.unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o640, "{mode:o}");
+}
+
 #[tokio::test]
 async fn one_process_has_the_file_at_a_time() {
     let path = scratch("in-use");

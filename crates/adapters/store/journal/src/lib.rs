@@ -331,6 +331,23 @@ impl fmt::Debug for LocalJournal {
     }
 }
 
+/// Makes the file at `path`, empty and its owner's alone, if there is no
+/// file there. The store underneath takes an empty file for a new one.
+#[cfg(unix)]
+fn make_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path);
+    match made {
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => Err(error),
+        _ => Ok(()),
+    }
+}
+
 /// How the store underneath is set up for a journal.
 fn builder(cache_bytes: usize, check_on_open: bool) -> Builder {
     let mut builder = Database::builder();
@@ -344,6 +361,11 @@ impl LocalJournal {
     /// Opens the journal in the file at `path`, and makes the file if it
     /// is not there. The directory it is in has to be.
     ///
+    /// The file holds what was said in every session. Where the system
+    /// lets a file be its owner's alone, a file that is made here is: on
+    /// Unix nobody else can read or write it. A file that was there
+    /// already is left as it is.
+    ///
     /// A file that was left by a process that died is brought back to
     /// what it last committed, which reads all of it once.
     ///
@@ -353,6 +375,10 @@ impl LocalJournal {
     /// cannot be read or written.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, OpenError> {
         let path = path.as_ref().to_path_buf();
+        // Elsewhere a file is its owner's by where it is, not by what
+        // it is told: the store underneath makes it.
+        #[cfg(unix)]
+        make_private(&path).map_err(OpenError::Io)?;
         let (cache_bytes, check_on_open) = (config.cache_bytes, config.check_on_open);
         let file = path.clone();
         let open = move || -> Result<Database, OpenError> {
