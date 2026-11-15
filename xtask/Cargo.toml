@@ -1,0 +1,22 @@
+[package]
+name = "xtask"
+description = "Waveport repository gates: architecture, stability, lint and release checks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "tooling"
+stability = "internal"
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+toml = { workspace = true }
+
+[lints]
+workspace = true

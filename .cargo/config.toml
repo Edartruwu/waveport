@@ -1,3 +1,6 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
 [registry]
 # Dependency cooldown: never resolve to a version published less than a week
 # ago. Versions already in Cargo.lock are exempt. One-off override:
