@@ -26,6 +26,8 @@ Fifty calls on one shard in real time (`benches/tests/load.rs`), with a stand-in
 | The same, left to the system | 0.57 to 0.63% | 3 in 100 |
 | GitHub's runners (Xeon 6975P-C, EPYC 9V74 and EPYC 7763), left to the system, twelve runs | 0.20 to 0.27%, by the processor | 3 in 10,000 on the first two, 6 on the third |
 
+The laptop's figures were measured with its balanced power profile. With the profile for performance its one core gives 0.19% and 3 in 10,000, which the performance gates found later (section 12 of the architecture); left to the system it has not been measured that way.
+
 Three things have to be said about it.
 
 - **No thread was pinned.** `cargo xtask perf --cpu` runs the whole measuring process under `taskset`, on one processor. In that test it comes close to pinning the shard, because the thread that drives the test sleeps and the models are stand-ins that run on the shard's own thread. It says nothing about a process whose other threads work: the two of the compute plane, and the journal's.

@@ -3,21 +3,26 @@
 machine = "core-ultra-7-155h"
 # The processor the measurement was kept on, and a check is kept on.
 cpu = 6
+# How the machine was powered: on `mains`, or on its `battery`.
+power = "mains"
+# How the speed of that processor was governed: its governor, and its
+# preference between energy and speed. A check is made with the same.
+scaling = "powersave/performance"
 
 [measured]
-"density.ratio" = 0.9226
-"density.reference_drift" = 1.076
-"density.reference_ms" = 2.49
+"density.ratio" = 0.7492
+"density.reference_drift" = 1.013
+"density.reference_ms" = 2.488
 "density.sessions" = 50
-"density.sessions_per_thread" = 435
-"density.share_percent" = 0.2297
-"poll.longest_ms" = 0.771
-"poll.over_budget_share" = 0.00035
-"start.p50_ms" = 0.092
-"start.p99_ms" = 0.19
-"turn.answering.max_ms" = 0.034
-"turn.answering.p50_ms" = 0.01
-"turn.answering.p99_ms" = 0.034
+"density.sessions_per_thread" = 536
+"density.share_percent" = 0.1864
+"poll.longest_ms" = 0.381
+"poll.over_budget_share" = 0.00027
+"start.p50_ms" = 0.069
+"start.p99_ms" = 0.103
+"turn.answering.max_ms" = 0.028
+"turn.answering.p50_ms" = 0.009
+"turn.answering.p99_ms" = 0.024
 "turn.phrasing.max_ms" = 0
 "turn.phrasing.p50_ms" = 0
 "turn.phrasing.p99_ms" = 0
