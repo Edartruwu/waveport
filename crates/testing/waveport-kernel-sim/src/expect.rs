@@ -1,6 +1,7 @@
 //! What a scenario expects of a session.
 
 use waveport_domain::command::{Command, LlmCause, LlmCmd, PlayoutCmd, ToolCmd, TtsCmd};
+use waveport_domain::event::CloseReason;
 use waveport_domain::fact::{Dismissal, Fact, Lifecycle, ToolOutcome};
 use waveport_domain::ids::{BatchId, GenId, ParticipantId, ToolCallId, ToolId};
 use waveport_domain::kernel::ItemView;
@@ -38,6 +39,12 @@ enum Said {
         text: String,
         truncated: bool,
     },
+    /// Keys of a telephone. No item of a conversation is read as this yet:
+    /// the kernel has no turn of keys.
+    Keys {
+        who: ParticipantId,
+        keys: String,
+    },
     /// Anything a scenario has no way to write: tool calls, results,
     /// notices.
     Other(String),
@@ -49,6 +56,15 @@ pub fn user(who: Person, text: &str) -> Line {
     Line(Said::User {
         who: who.0,
         text: text.to_owned(),
+    })
+}
+
+/// `who` pressed `keys`.
+#[must_use]
+pub fn pressed(who: Person, keys: &str) -> Line {
+    Line(Said::Keys {
+        who: who.0,
+        keys: keys.to_owned(),
     })
 }
 
@@ -207,6 +223,79 @@ impl Sim {
                 None => Probe::NotYet,
             }
         });
+        self.settle(expected, outcome)
+    }
+
+    /// A turn by `who` is committed before its words are known, as it is
+    /// in a session whose [words follow](crate::Setup::words_follow).
+    ///
+    /// # Errors
+    ///
+    /// No turn by `who` is committed, or the next one has words already.
+    #[track_caller]
+    pub fn expect_turn_without_words(&mut self, who: Person) -> Result<Turn, Box<Failure>> {
+        let name = self.world.names.person(who.0).to_owned();
+        let expected = format!("a turn by {name} to be committed before its words are known");
+        let outcome = self.wait_for(|sim| {
+            let found = sim.unclaimed(
+                |what| matches!(what, What::Fact(Fact::TurnCommitted { who: by, .. }) if *by == who.0),
+            );
+            match found.and_then(|index| sim.claim(index)) {
+                Some(Seen {
+                    what: What::Fact(Fact::TurnCommitted { turn, .. }),
+                    text: heard,
+                    ..
+                }) if heard.is_empty() => Probe::Found(Turn(turn)),
+                Some(seen) => Probe::Wrong(format!(
+                    "the turn that was committed for {name} says \"{}\"",
+                    seen.text
+                )),
+                None => Probe::NotYet,
+            }
+        });
+        self.settle(expected, outcome)
+    }
+
+    /// The conversation holds `turn` with exactly these words: they have
+    /// arrived, and they are where the turn is.
+    ///
+    /// # Errors
+    ///
+    /// It does not, or it holds the turn with other words.
+    #[track_caller]
+    pub fn expect_words(&mut self, turn: Turn, text: &str) -> Verdict {
+        let expected = format!("turn {} to hold the words \"{text}\"", turn.0);
+        let outcome = self.wait_for(|sim| {
+            let held = sim.kernel().view().items().find_map(|item| match item {
+                ItemView::UserTurn {
+                    turn: of,
+                    text: held,
+                    ..
+                } if of == turn.0 => Some(held.to_owned()),
+                _ => None,
+            });
+            match held {
+                Some(held) if held == text => Probe::Found(()),
+                Some(held) if !held.is_empty() => {
+                    Probe::Wrong(format!("the conversation holds it as \"{held}\""))
+                }
+                _ => Probe::NotYet,
+            }
+        });
+        self.settle(expected, outcome)
+    }
+
+    /// A turn of keys by `who` is committed, with exactly these keys.
+    ///
+    /// # Errors
+    ///
+    /// No turn of keys by `who` is committed. The kernel has no turn of
+    /// keys yet, so for now this is every time.
+    #[track_caller]
+    pub fn expect_keys(&mut self, who: Person, keys: &str) -> Result<Turn, Box<Failure>> {
+        let name = self.world.names.person(who.0).to_owned();
+        let expected = format!("a committed turn in which {name} presses {keys}");
+        let outcome = self.wait_for(|_| Probe::NotYet);
         self.settle(expected, outcome)
     }
 
@@ -675,6 +764,52 @@ impl Sim {
         self.settle(format!("the session to become {stage:?}"), outcome)
     }
 
+    /// The session is running: nothing has begun to close it.
+    ///
+    /// # Errors
+    ///
+    /// It is closing or closed.
+    #[track_caller]
+    pub fn expect_open(&mut self) -> Verdict {
+        let outcome = self.look(|sim| match sim.kernel().view().lifecycle() {
+            Lifecycle::Running => Probe::Found(()),
+            stage => Probe::Wrong(format!("it is {stage:?}")),
+        });
+        self.settle("the session still to be running", outcome)
+    }
+
+    /// The session begins to close because its caller is gone for good.
+    ///
+    /// # Errors
+    ///
+    /// It does not begin to close, or for another reason.
+    #[track_caller]
+    pub fn expect_abandoned(&mut self) -> Verdict {
+        let outcome = self.wait_for(|sim| {
+            let found = sim.unclaimed(|what| {
+                matches!(
+                    what,
+                    What::Fact(Fact::LifecycleChanged {
+                        to: Lifecycle::Draining,
+                        ..
+                    })
+                )
+            });
+            match found
+                .and_then(|index| sim.claim(index))
+                .map(|seen| seen.what)
+            {
+                Some(What::Fact(Fact::LifecycleChanged {
+                    reason: Some(CloseReason::Abandoned),
+                    ..
+                })) => Probe::Found(()),
+                Some(what) => Probe::Wrong(format!("the kernel emitted {what:?}")),
+                None => Probe::NotYet,
+            }
+        });
+        self.settle("the session to begin to close as abandoned", outcome)
+    }
+
     /// The session is `Closed` no later than `millis` after it was asked
     /// to close.
     ///
@@ -706,8 +841,8 @@ impl Sim {
     /// session is checked:
     ///
     /// - every scripted response was given, and no other;
-    /// - everything a person said ended in one turn, committed or
-    ///   dismissed;
+    /// - everything a person said or typed ended in one turn, committed or
+    ///   dismissed, and every run of keys in one turn of keys;
     /// - no response entered the conversation twice;
     /// - no tool call was dispatched twice, ended twice or has its result
     ///   in the conversation twice;
@@ -724,6 +859,7 @@ impl Sim {
             problems.push(fault.to_owned());
         }
         self.check_turns(&mut problems);
+        self.check_keys(&mut problems);
         self.check_utterances(&mut problems);
         self.check_calls(&mut problems);
         let outcome = if problems.is_empty() {
@@ -770,6 +906,17 @@ impl Sim {
                     self.world.names.person(who)
                 ));
             }
+        }
+    }
+
+    /// The kernel has no turn of keys yet, so every run of keys is one
+    /// that came to nothing.
+    fn check_keys(&self, problems: &mut Vec<String>) {
+        for (who, runs) in self.world.pressings() {
+            problems.push(format!(
+                "{} pressed keys {runs} times, and no turn of keys was committed",
+                self.world.names.person(who)
+            ));
         }
     }
 
@@ -853,6 +1000,7 @@ mod tests {
 
     use waveport_domain::command::{Command, LlmCause, LlmCmd, PlayoutCmd, ToolCmd, TtsCmd};
     use waveport_domain::config::Effect;
+    use waveport_domain::event::CloseReason;
     use waveport_domain::fact::{Dismissal, Fact, Lifecycle, ToolOutcome};
     use waveport_domain::ids::{
         AgentId, BatchId, ContextVersion, Epoch, GenId, OpTag, ParticipantId, ToolCallId, ToolId,
@@ -861,7 +1009,7 @@ mod tests {
     use waveport_domain::text::{TextArena, TextRef};
     use waveport_domain::time::MediaSpan;
 
-    use super::{Ending, cut_off, spoke, user};
+    use super::{Ending, cut_off, pressed, spoke, user};
     use crate::explore::{Explored, explore};
     use crate::script::say;
     use crate::setup::Setup;
@@ -990,6 +1138,140 @@ mod tests {
         let failure = sim.expect_turn(caller, "where is my order").unwrap_err();
         assert!(failure.found.contains("where is my border"), "{failure}");
         assert_eq!(failure.file, file!());
+    }
+
+    #[test]
+    fn a_turn_without_words_is_one_committed_with_none() {
+        let mut sim = session(Setup::new().words_follow());
+        let caller = sim.caller();
+        committed(&mut sim, 1, CALLER, "");
+        committed(&mut sim, 2, CALLER, "where is my order");
+        assert_eq!(sim.expect_turn_without_words(caller), Ok(Turn(TurnId(1))));
+        let failure = sim.expect_turn_without_words(caller).unwrap_err();
+        assert!(failure.found.contains("where is my order"), "{failure}");
+        assert!(failure.expected.contains("before its words"), "{failure}");
+        let failure = sim.expect_turn_without_words(caller).unwrap_err();
+        assert!(failure.found.contains("never happened"), "{failure}");
+    }
+
+    #[test]
+    fn the_words_of_a_turn_are_read_from_the_conversation() {
+        let mut sim = live(Setup::new());
+        let caller = sim.caller();
+        sim.agent_will(say("It shipped on Monday."));
+        sim.says(caller, "where is my order");
+        let turn = sim.expect_turn(caller, "where is my order").unwrap();
+        assert_eq!(sim.expect_words(turn, "where is my order"), Ok(()));
+        let failure = sim.expect_words(turn, "where is my border").unwrap_err();
+        assert!(failure.found.contains("where is my order"), "{failure}");
+        // A turn the conversation does not hold never gets its words.
+        let failure = sim.expect_words(Turn(TurnId(9)), "hello").unwrap_err();
+        assert!(failure.expected.contains("turn 9"), "{failure}");
+    }
+
+    #[test]
+    fn words_arrive_by_hand_only_when_they_were_said_to_wait() {
+        let mut sim = live(Setup::new().words_follow());
+        let caller = sim.caller();
+        sim.says(caller, "where is my order");
+        sim.words_arrive(caller);
+        let failure = sim.finish().unwrap_err();
+        assert!(failure.found.contains("without having said"), "{failure}");
+
+        let mut sim = live(Setup::new().words_follow());
+        let caller = sim.caller();
+        sim.words_wait();
+        sim.words_arrive(caller);
+        let failure = sim.finish().unwrap_err();
+        assert!(failure.found.contains("none are waiting"), "{failure}");
+    }
+
+    #[test]
+    fn keys_have_no_turn_yet() {
+        let mut sim = live(Setup::new());
+        let caller = sim.caller();
+        sim.presses(caller, "4071#");
+        let failure = sim.expect_keys(caller, "4071").unwrap_err();
+        assert!(failure.expected.contains("presses 4071"), "{failure}");
+        assert!(failure.found.contains("never happened"), "{failure}");
+        assert!(
+            failure
+                .log
+                .iter()
+                .any(|line| line.contains("the caller presses 4071#")),
+            "{failure}"
+        );
+        // And keys that came to nothing are held against the session.
+        let failure = sim.finish().unwrap_err();
+        assert!(
+            failure.found.contains("the caller pressed keys 1 times"),
+            "{failure}"
+        );
+        // A line of keys is like no item a conversation has.
+        assert_ne!(pressed(caller, "4071"), user(caller, "4071"));
+    }
+
+    #[test]
+    fn typed_text_takes_the_floor() {
+        let mut sim = live(Setup::new().text());
+        let caller = sim.caller();
+        sim.agent_will(say("One two three four five six seven eight."));
+        sim.types(caller, "count for me");
+        let turn = sim.expect_turn(caller, "count for me").unwrap();
+        let reply = sim.expect_reply(turn).unwrap();
+        assert_eq!(sim.hears_words(reply, 3), Ok(()));
+
+        sim.agent_will(say("Stopped."));
+        sim.types(caller, "stop");
+        assert_eq!(sim.expect_interrupted(reply), Ok(()));
+        assert_eq!(
+            sim.expect_spoken(reply, "One two three", Ending::Truncated),
+            Ok(())
+        );
+        let turn = sim.expect_turn(caller, "stop").unwrap();
+        let reply = sim.expect_reply(turn).unwrap();
+        assert_eq!(
+            sim.expect_spoken(reply, "Stopped.", Ending::Complete),
+            Ok(())
+        );
+        assert_eq!(sim.finish(), Ok(()));
+    }
+
+    #[test]
+    fn a_line_that_drops_is_told_to_the_session_and_silences_the_world() {
+        let mut sim = live(Setup::new().detach_wait_ms(5_000));
+        let caller = sim.caller();
+        assert!(sim.kernel().view().is_attached());
+        sim.agent_will(say("One two three four five six seven eight."));
+        sim.says(caller, "count for me");
+        let turn = sim.expect_turn(caller, "count for me").unwrap();
+        let reply = sim.expect_reply(turn).unwrap();
+        assert_eq!(sim.hears_words(reply, 2), Ok(()));
+
+        sim.line_drops();
+        assert!(!sim.kernel().view().is_attached());
+        // Nothing more is heard, whatever the kernel does.
+        sim.wait_ms(3_000);
+        let voice = sim.world.voice_of(reply.0.generation).unwrap();
+        assert_eq!(voice.heard_text(), "One two");
+
+        sim.line_returns();
+        assert!(sim.kernel().view().is_attached());
+        let failure = sim.expect_never_spoke(reply).unwrap_err();
+        assert!(
+            failure
+                .log
+                .iter()
+                .any(|line| line.contains("is to wait 5000 ms")),
+            "{failure}"
+        );
+        assert!(
+            failure
+                .log
+                .iter()
+                .any(|line| line.contains("the line is back")),
+            "{failure}"
+        );
     }
 
     #[test]
@@ -1234,6 +1516,34 @@ mod tests {
                 .map_err(|failure| failure.ordinal),
             Err(5)
         );
+    }
+
+    #[test]
+    fn a_session_is_abandoned_by_that_reason_and_no_other() {
+        let mut sim = session(Setup::new());
+        let abandoned = Fact::LifecycleChanged {
+            to: Lifecycle::Draining,
+            reason: Some(CloseReason::Abandoned),
+        };
+        fact(&mut sim, abandoned, "");
+        assert_eq!(sim.expect_abandoned(), Ok(()));
+
+        let asked = Fact::LifecycleChanged {
+            to: Lifecycle::Draining,
+            reason: Some(CloseReason::Requested),
+        };
+        fact(&mut sim, asked, "");
+        let failure = sim.expect_abandoned().unwrap_err();
+        assert!(failure.found.contains("Requested"), "{failure}");
+        let failure = sim.expect_abandoned().unwrap_err();
+        assert!(failure.found.contains("never happened"), "{failure}");
+
+        // A session with nothing under way closes in one step.
+        let mut sim = live(Setup::new());
+        assert_eq!(sim.expect_open(), Ok(()));
+        sim.close();
+        let failure = sim.expect_open().unwrap_err();
+        assert!(failure.found.contains("Closed"), "{failure}");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use waveport_domain::text::TextArena;
 use waveport_domain::time::{MediaDur, MediaSpan, MediaTime, MonoTime};
 
 use crate::script::Script;
-use crate::setup::Names;
+use crate::setup::{Names, Ways};
 
 /// Virtual time, in milliseconds since the session began.
 pub(crate) type Ms = u64;
@@ -259,11 +259,16 @@ pub(crate) struct Voice {
     as_of: Ms,
     /// The position and the "all played" flag last reported to the kernel.
     reported: Option<(Ms, bool)>,
+    /// Whether this is text that is delivered and not speech that is
+    /// played: it has no audio, and a word is with the reader as soon as
+    /// it is handed over. Its position then counts words, not time.
+    written: bool,
 }
 
 impl Voice {
-    fn new(tag: OpTag, now: Ms) -> Self {
+    fn new(tag: OpTag, now: Ms, written: bool) -> Self {
         Self {
+            written,
             tag,
             text: String::new(),
             words: Vec::new(),
@@ -304,7 +309,7 @@ impl Voice {
     }
 
     fn end_word(&mut self, text_end: usize, ready: Ms) {
-        let audio_end = self.total() + WORD_MS;
+        let audio_end = self.total() + if self.written { 1 } else { WORD_MS };
         self.words.push(Word {
             text_end,
             audio_end,
@@ -312,11 +317,12 @@ impl Voice {
         });
     }
 
-    /// What synthesis tells the kernel when audio arrives.
+    /// What synthesis tells the kernel when audio arrives. Text has none.
     fn segment(&self, last: bool) -> OpEvent {
+        let length = if self.written { 0 } else { self.total() };
         OpEvent::TtsSegment {
             text_end: u32::try_from(self.text.len()).unwrap_or(u32::MAX),
-            audio_end: audio(self.total()),
+            audio_end: audio(length),
             last,
         }
     }
@@ -324,7 +330,9 @@ impl Voice {
     /// Plays audio up to `now`: in real time from the start of playback,
     /// waiting whenever the next word's audio has not arrived.
     pub(crate) fn advance(&mut self, now: Ms) {
-        if let Some(started) = self.started {
+        if self.written {
+            self.deliver(now);
+        } else if let Some(started) = self.started {
             let limit = self.stopped.map_or(now, |stop| stop.min(now));
             let mut at = self.as_of.max(started);
             for word in &self.words {
@@ -346,6 +354,26 @@ impl Voice {
         self.as_of = self.as_of.max(now);
     }
 
+    /// Hands text to the reader up to `now`: every word that had been
+    /// written by the time delivery was allowed, and each later one as it
+    /// is written, until delivery is stopped.
+    fn deliver(&mut self, now: Ms) {
+        let Some(started) = self.started else {
+            return;
+        };
+        let limit = self.stopped.map_or(now, |stop| stop.min(now));
+        if limit < started {
+            return;
+        }
+        let delivered = self
+            .words
+            .iter()
+            .take_while(|word| word.ready <= limit)
+            .last()
+            .map_or(0, |word| word.audio_end);
+        self.played = self.played.max(delivered);
+    }
+
     /// When playback reaches `position`, if nothing stops it and the audio
     /// up to there is already on its way. Call [`advance`](Self::advance)
     /// first.
@@ -356,6 +384,10 @@ impl Voice {
         }
         if self.played >= position {
             return Some(now);
+        }
+        if self.written {
+            let word = self.words.iter().find(|word| word.audio_end >= position)?;
+            return Some(now.max(started).max(word.ready));
         }
         let mut at = now.max(started);
         let mut played = self.played;
@@ -398,8 +430,16 @@ impl Voice {
     }
 
     /// Whether every word synthesis will deliver has been played.
+    ///
+    /// Speech is played out after its last audio arrived. Text is delivered
+    /// in the same instant as its last piece is handed over, and the report
+    /// that all of it is delivered follows that piece: it is never ahead of
+    /// it.
     fn is_drained(&self, now: Ms) -> bool {
-        self.finished.is_some_and(|at| at <= now) && self.played >= self.total()
+        let finished = self
+            .finished
+            .is_some_and(|at| if self.written { at < now } else { at <= now });
+        finished && self.played >= self.total()
     }
 
     /// Whether the listener will hear no more of this response.
@@ -426,7 +466,7 @@ impl Voice {
             return None;
         }
         self.reported = Some(state);
-        let position = audio(self.played);
+        let position = audio(if self.written { 0 } else { self.played });
         Some(OpEvent::Played {
             handed: position,
             acked: position,
@@ -438,6 +478,12 @@ impl Voice {
     /// When playback next has something to report by itself: at the usual
     /// interval, or sooner if the response's audio ends before that.
     fn next_report(&self, now: Ms) -> Ms {
+        if self.written {
+            return self
+                .finished
+                .filter(|finished| *finished >= now)
+                .map_or(now + TICK_MS, |finished| finished + 1);
+        }
         let end = self
             .finished
             .and_then(|finished| Some(self.eta(now, self.total())?.max(finished)))
@@ -457,6 +503,10 @@ struct Paused {
 
 /// Every adapter of one session.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four things that are each so or not, and none of them rules out another"
+)]
 pub(crate) struct World {
     pub(crate) names: Names,
     queue: Queue,
@@ -476,10 +526,21 @@ pub(crate) struct World {
     wake_at: Option<Ms>,
     /// Things that must never happen in any scenario, and did.
     faults: Vec<String>,
+    /// What kind of session this is.
+    ways: Ways,
+    /// The line to the caller has dropped and has not come back.
+    line_gone: bool,
+    /// Words arrive only when the scenario says so.
+    words_wait: bool,
+    /// What was said and has not been told to the session as words: the
+    /// words of turns that are known only after them.
+    unsaid: VecDeque<(ParticipantId, String)>,
+    /// Who pressed keys, once for each run of keys.
+    pressed: Vec<ParticipantId>,
 }
 
 impl World {
-    pub(crate) fn new(names: Names) -> Self {
+    pub(crate) fn new(names: Names, ways: Ways) -> Self {
         let scripts = (0..names.agent_count()).map(|_| VecDeque::new()).collect();
         Self {
             names,
@@ -494,6 +555,11 @@ impl World {
             tick_at: None,
             wake_at: None,
             faults: Vec::new(),
+            ways,
+            line_gone: false,
+            words_wait: false,
+            unsaid: VecDeque::new(),
+            pressed: Vec::new(),
         }
     }
 
@@ -655,6 +721,16 @@ impl World {
             at: end_at,
         };
         self.send(end, Stream::Voice(who), stopped);
+        if self.ways.words_follow {
+            // Nobody transcribes while the caller speaks. The words are
+            // known once the turn is over.
+            self.unsaid.push_back((who, words.join(" ")));
+            return Some(Event::Speech {
+                who,
+                edge: VadEdge::Start,
+                at: start_at,
+            });
+        }
         let half = words.len() / 2;
         if half > 0 {
             let heard = now + WORD_MS * count(half);
@@ -678,6 +754,76 @@ impl World {
             edge: VadEdge::Start,
             at: start_at,
         })
+    }
+
+    /// `who` types `text`. Returns the event that hands it to the session.
+    pub(crate) fn types(&mut self, now: Ms, who: ParticipantId, text: &str) -> Option<Event> {
+        if text.trim().is_empty() {
+            self.blame(format!(
+                "the scenario has {} type nothing",
+                self.names.person(who)
+            ));
+            return None;
+        }
+        // What is typed is said in no time at all.
+        self.utterances.push(Utterance {
+            who,
+            manner: Manner::Speech,
+            end: now,
+        });
+        if self.silent {
+            return None;
+        }
+        Some(Event::TextIn {
+            who,
+            text: text.into(),
+        })
+    }
+
+    /// `who` presses a run of keys.
+    pub(crate) fn presses(&mut self, who: ParticipantId) {
+        self.pressed.push(who);
+    }
+
+    /// Everyone who pressed keys, with how many runs of them.
+    pub(crate) fn pressings(&self) -> Vec<(ParticipantId, usize)> {
+        let mut people = self.pressed.clone();
+        people.sort_unstable();
+        people.dedup();
+        people
+            .into_iter()
+            .map(|who| (who, self.pressed.iter().filter(|by| **by == who).count()))
+            .collect()
+    }
+
+    /// From now on the words of a turn arrive only when the scenario says.
+    pub(crate) fn hold_words(&mut self) {
+        self.words_wait = true;
+    }
+
+    /// Whether the words of turns wait for the scenario.
+    pub(crate) fn holds_words(&self) -> bool {
+        self.words_wait
+    }
+
+    /// The oldest words of `who` that the session has not been told.
+    pub(crate) fn next_words(&mut self, who: ParticipantId) -> Option<String> {
+        let index = self.unsaid.iter().position(|(by, _)| *by == who)?;
+        self.unsaid.remove(index).map(|(_, words)| words)
+    }
+
+    /// The line to the caller drops: from now on nobody hears the agent.
+    pub(crate) fn line_drops(&mut self, now: Ms) {
+        self.line_gone = true;
+        for voice in &mut self.voices {
+            voice.advance(now);
+            voice.stopped.get_or_insert(now);
+        }
+    }
+
+    /// The line to the caller is back.
+    pub(crate) fn line_returns(&mut self) {
+        self.line_gone = false;
     }
 
     /// Has the adapter a command is for react to it.
@@ -786,13 +932,15 @@ impl World {
         };
         match command {
             TtsCmd::Speak { text: chunk } => {
-                let ready = (now + TTS_MS).max(voice.last_ready);
+                let takes = if voice.written { 0 } else { TTS_MS };
+                let ready = (now + takes).max(voice.last_ready);
                 voice.add(text.get(chunk), ready);
                 let segment = voice.segment(false);
                 self.send(ready, stream, Event::Op(tag, segment));
             }
             TtsCmd::Finish => {
-                let at = (now + TTS_LAST_MS).max(voice.last_ready);
+                let takes = if voice.written { 0 } else { TTS_LAST_MS };
+                let at = (now + takes).max(voice.last_ready);
                 voice.last_ready = at;
                 voice.finished = Some(at);
                 let segment = voice.segment(true);
@@ -807,6 +955,13 @@ impl World {
     }
 
     fn playout(&mut self, now: Ms, tag: OpTag, command: PlayoutCmd) {
+        if self.line_gone && command == PlayoutCmd::Start {
+            self.blame(format!(
+                "response {} began to be played on a line that is gone",
+                tag.generation
+            ));
+            return;
+        }
         let Some(voice) = self.voice_mut(tag, now) else {
             return;
         };
@@ -865,7 +1020,7 @@ impl World {
     /// The speech carrying `tag`, begun now if there is none yet.
     fn voice_mut(&mut self, tag: OpTag, now: Ms) -> Option<&mut Voice> {
         if self.voices.iter().all(|voice| voice.tag != tag) {
-            self.voices.push(Voice::new(tag, now));
+            self.voices.push(Voice::new(tag, now, self.ways.text));
         }
         self.voices.iter_mut().find(|voice| voice.tag == tag)
     }
@@ -952,7 +1107,8 @@ mod tests {
 
     fn world() -> World {
         let setup = Setup::new().tool("lookup", Effect::Pure);
-        World::new(setup.build().unwrap().2)
+        let ways = setup.ways();
+        World::new(setup.build().unwrap().2, ways)
     }
 
     /// Everything due up to `until`, as `(time, event)`.
@@ -1009,6 +1165,194 @@ mod tests {
                 if text.as_str() == "where is my order" && span.len() == MediaDur::from_millis(1_200)
         ));
         assert_eq!(world.utterances_by(CALLER), 1);
+        assert_eq!(world.fault(), None);
+    }
+
+    #[test]
+    fn typed_text_is_said_in_no_time() {
+        let mut world = world();
+        let typed = world.types(1_000, CALLER, "where is my order");
+        assert!(matches!(
+            &typed,
+            Some(Event::TextIn { who: CALLER, text }) if text.as_str() == "where is my order"
+        ));
+        // Nothing follows on a timetable, and the next thing can be said at
+        // once.
+        assert_eq!(events(&mut world, 10_000), []);
+        assert!(world.types(1_000, CALLER, "order 1234").is_some());
+        assert_eq!(world.utterances_by(CALLER), 2);
+        assert_eq!(world.fault(), None);
+
+        assert!(world.types(2_000, CALLER, "  ").is_none());
+        assert!(world.fault().unwrap().contains("type nothing"));
+    }
+
+    #[test]
+    fn words_that_follow_their_turn_are_not_transcribed() {
+        let setup = Setup::new().words_follow();
+        let ways = setup.ways();
+        let mut world = World::new(setup.build().unwrap().2, ways);
+        let started = world.utter(1_000, CALLER, "where is my order", Manner::Speech);
+        assert!(matches!(
+            started,
+            Some(Event::Speech {
+                edge: VadEdge::Start,
+                ..
+            })
+        ));
+        // The end of the speech is reported, and no transcript.
+        let events = events(&mut world, 10_000);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            (
+                2_200,
+                Event::Speech {
+                    edge: VadEdge::End,
+                    ..
+                }
+            )
+        ));
+        // The words wait to be told.
+        assert!(!world.holds_words());
+        world.hold_words();
+        assert!(world.holds_words());
+        assert_eq!(world.next_words(ParticipantId(2)), None);
+        assert_eq!(
+            world.next_words(CALLER).as_deref(),
+            Some("where is my order")
+        );
+        assert_eq!(world.next_words(CALLER), None);
+    }
+
+    #[test]
+    fn runs_of_keys_are_counted_by_who_pressed_them() {
+        let mut world = world();
+        assert_eq!(world.pressings(), []);
+        world.presses(ParticipantId(2));
+        world.presses(CALLER);
+        world.presses(ParticipantId(2));
+        assert_eq!(world.pressings(), [(CALLER, 1), (ParticipantId(2), 2)]);
+    }
+
+    #[test]
+    fn text_has_no_audio_and_is_delivered_as_it_is_handed_over() {
+        let setup = Setup::new().text();
+        let ways = setup.ways();
+        let mut world = World::new(setup.build().unwrap().2, ways);
+
+        // Synthesis takes no time and gives no audio.
+        speak(&mut world, 1_000, "Hello there. ");
+        let segments = events(&mut world, 1_000);
+        assert!(matches!(
+            segments[..],
+            [(
+                1_000,
+                Event::Op(
+                    TAG,
+                    OpEvent::TtsSegment {
+                        text_end: 13,
+                        audio_end: MediaDur::ZERO,
+                        last: false
+                    }
+                )
+            )]
+        ));
+        // Nothing is delivered until delivery is allowed, and then all that
+        // was written is, at once.
+        assert_eq!(world.reports(1_000), []);
+        command(&mut world, 1_005, Command::Playout(TAG, PlayoutCmd::Start));
+        let delivered = world.reports(1_005);
+        assert!(matches!(
+            delivered[..],
+            [(
+                TAG,
+                OpEvent::Played {
+                    handed: MediaDur::ZERO,
+                    acked: MediaDur::ZERO,
+                    heard_text: 12,
+                    drained: false
+                }
+            )]
+        ));
+        // What is written later is delivered when it is handed over.
+        speak(&mut world, 1_020, "How are you?");
+        let voice = world.voice_of(TAG.generation).unwrap();
+        voice.advance(1_020);
+        assert_eq!(voice.heard_words(), 5);
+        assert_eq!(voice.heard_text(), "Hello there. How are you?");
+        assert_eq!(voice.word_eta(1_020, 5), Some(1_020));
+
+        // The report that all of it is delivered comes after the last
+        // piece, never with it.
+        command(&mut world, 1_040, Command::Tts(TAG, TtsCmd::Finish));
+        let reports = world.reports(1_040);
+        assert!(matches!(
+            reports[..],
+            [(TAG, OpEvent::Played { drained: false, .. })]
+        ));
+        let reports = world.reports(1_041);
+        assert!(matches!(
+            reports[..],
+            [(
+                TAG,
+                OpEvent::Played {
+                    heard_text: 25,
+                    drained: true,
+                    ..
+                }
+            )]
+        ));
+    }
+
+    #[test]
+    fn text_that_is_stopped_is_delivered_no_further() {
+        let setup = Setup::new().text();
+        let ways = setup.ways();
+        let mut world = World::new(setup.build().unwrap().2, ways);
+        speak(&mut world, 0, "One two ");
+        command(&mut world, 0, Command::Playout(TAG, PlayoutCmd::Start));
+        let stop = PlayoutCmd::Stop { fade_ms: 0 };
+        command(&mut world, 10, Command::Playout(TAG, stop));
+        speak(&mut world, 20, "three");
+        let voice = world.voice_of(TAG.generation).unwrap();
+        voice.advance(1_000);
+        assert_eq!(voice.heard_text(), "One two");
+        assert!(voice.is_over(1_000));
+        assert_eq!(voice.word_eta(1_000, 3), None);
+    }
+
+    #[test]
+    fn nobody_hears_a_line_that_is_gone() {
+        let mut world = world();
+        // Audio arrives 100 ms after the text, and a word takes 300 ms.
+        speak(&mut world, 0, "One two three four five.");
+        command(&mut world, 0, Command::Playout(TAG, PlayoutCmd::Start));
+        world.line_drops(700);
+        let voice = world.voice_of(TAG.generation).unwrap();
+        voice.advance(5_000);
+        assert_eq!(voice.heard_words(), 2);
+        assert!(voice.is_over(700));
+
+        // A response that begins to play into the gap is a fault.
+        let other = OpTag {
+            generation: GenId(2),
+            epoch: Epoch(1),
+        };
+        command(&mut world, 800, Command::Playout(other, PlayoutCmd::Start));
+        assert!(world.fault().unwrap().contains("a line that is gone"));
+    }
+
+    #[test]
+    fn a_line_that_is_back_is_played_on_again() {
+        let mut world = world();
+        world.line_drops(0);
+        world.line_returns();
+        speak(&mut world, 100, "One two.");
+        command(&mut world, 100, Command::Playout(TAG, PlayoutCmd::Start));
+        let voice = world.voice_of(TAG.generation).unwrap();
+        voice.advance(5_000);
+        assert_eq!(voice.heard_words(), 2);
         assert_eq!(world.fault(), None);
     }
 

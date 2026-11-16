@@ -4,17 +4,19 @@ use core::time::Duration;
 
 use waveport_domain::config::{AgentSpec, Effect, Executor, KernelConfig, ToolSpec};
 use waveport_domain::ids::{AgentId, ParticipantId, ToolId};
-use waveport_domain::policy::{AddressedByName, BoxedPolicies};
+use waveport_domain::policy::{AddressedByName, BoxedPolicies, TextChunker};
 
 /// The name the first human in a session goes by.
 const CALLER: &str = "the caller";
 /// The name the agent that holds the floor goes by.
 const FRONT: &str = "the agent";
 
-/// The session a scenario runs in: its tools, its agents and its timing.
+/// The session a scenario runs in: its tools, its agents, its timing and
+/// what kind of session it is.
 ///
 /// Without anything added it is one caller talking to one agent that has no
-/// tools and treats everything said as meant for it.
+/// tools and treats everything said as meant for it, in a session where
+/// speech is recognised and the agent's words are synthesised.
 #[derive(Clone, Debug, Default)]
 #[must_use]
 pub struct Setup {
@@ -23,6 +25,31 @@ pub struct Setup {
     answers_to: Vec<String>,
     drain: Option<Duration>,
     grace: Option<Duration>,
+    ways: Ways,
+}
+
+/// What kind of session a scenario runs in, as far as the world around the
+/// kernel has to behave differently for it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Ways {
+    /// Nobody speaks and nothing is played: text comes in and text goes
+    /// out.
+    pub(crate) text: bool,
+    /// The words of a turn are known only after the turn is over.
+    pub(crate) words_follow: bool,
+    /// How long the session is to wait for a line that dropped.
+    pub(crate) detach_wait: Option<Duration>,
+}
+
+/// Releases a response's text as the model writes it. A session of text
+/// has no synthesiser to wait for whole sentences for.
+#[derive(Clone, Copy, Debug)]
+struct AsWritten;
+
+impl TextChunker for AsWritten {
+    fn ready(&self, pending: &str, _done: bool) -> usize {
+        pending.len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +98,28 @@ impl Setup {
         self
     }
 
+    /// A session of text: the caller types, and what the agent writes is
+    /// delivered as it is written. Nothing is recognised, synthesised or
+    /// played.
+    pub fn text(mut self) -> Self {
+        self.ways.text = true;
+        self
+    }
+
+    /// The words of a turn come after it: the session runs on a model that
+    /// answers the caller's audio and says afterwards what it heard.
+    pub fn words_follow(mut self) -> Self {
+        self.ways.words_follow = true;
+        self
+    }
+
+    /// The session waits this long for a line that dropped, instead of the
+    /// usual time.
+    pub fn detach_wait_ms(mut self, millis: u64) -> Self {
+        self.ways.detach_wait = Some(Duration::from_millis(millis));
+        self
+    }
+
     /// How long a closing session may spend finishing what is under way.
     pub fn drain_ms(mut self, millis: u64) -> Self {
         self.drain = Some(Duration::from_millis(millis));
@@ -81,6 +130,11 @@ impl Setup {
     pub fn grace_ms(mut self, millis: u64) -> Self {
         self.grace = Some(Duration::from_millis(millis));
         self
+    }
+
+    /// What kind of session this is.
+    pub(crate) const fn ways(&self) -> Ways {
+        self.ways
     }
 
     /// The kernel configuration, the policies and the names this setup
@@ -138,6 +192,9 @@ impl Setup {
                 .map(String::as_str)
                 .collect::<Vec<_>>();
             policies.addressee = Box::new(AddressedByName::new(&answers_to));
+        }
+        if self.ways.text {
+            policies.chunker = Box::new(AsWritten);
         }
         Ok((config, policies, names))
     }
@@ -228,6 +285,26 @@ mod tests {
             humans: 1,
         };
         assert!(policies.addressee().addressed(&anything));
+    }
+
+    #[test]
+    fn the_kind_of_session_is_told_to_the_world_and_to_the_policies() {
+        let plain = Setup::new();
+        assert!(!plain.ways().text);
+        assert!(!plain.ways().words_follow);
+        assert_eq!(plain.ways().detach_wait, None);
+        let (_, policies, _) = plain.build().unwrap();
+        // Speech is released a sentence at a time.
+        assert_eq!(policies.chunker.ready("One. Two", false), 5);
+
+        let setup = Setup::new().text().words_follow().detach_wait_ms(5_000);
+        let ways = setup.ways();
+        assert!(ways.text);
+        assert!(ways.words_follow);
+        assert_eq!(ways.detach_wait, Some(Duration::from_secs(5)));
+        let (_, policies, _) = setup.build().unwrap();
+        // Text is released as it is written.
+        assert_eq!(policies.chunker.ready("One. Two", false), 8);
     }
 
     #[test]
