@@ -39,6 +39,7 @@ fn counts_a_deallocation() {
         stats,
         AllocStats {
             deallocations: 1,
+            bytes_freed: 64,
             ..AllocStats::ZERO
         }
     );
@@ -51,6 +52,30 @@ fn counts_a_reallocation_and_its_growth() {
     assert_eq!(stats.reallocations, 1);
     assert_eq!(stats.allocations, 0);
     assert_eq!(stats.bytes_allocated, 56);
+    assert_eq!(stats.bytes_freed, 0);
+}
+
+#[test]
+fn counts_the_shrinkage_of_a_reallocation() {
+    let mut buffer = black_box(Vec::<u8>::with_capacity(64));
+    buffer.push(1);
+    let ((), stats) = measure(|| buffer.shrink_to(8));
+    assert_eq!(stats.reallocations, 1);
+    assert_eq!(stats.bytes_allocated, 0);
+    assert_eq!(stats.bytes_freed, 56);
+}
+
+#[test]
+fn live_bytes_is_what_the_measured_code_still_holds() {
+    let (kept, stats) = measure(|| {
+        let scratch = black_box(vec![0_u8; 1024]);
+        drop(scratch);
+        black_box(vec![0_u8; 256])
+    });
+    assert_eq!(stats.bytes_allocated, 1280);
+    assert_eq!(stats.bytes_freed, 1024);
+    assert_eq!(stats.live_bytes(), 256);
+    drop(kept);
 }
 
 #[test]

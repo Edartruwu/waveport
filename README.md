@@ -4,7 +4,9 @@ Waveport is an open-source platform for real-time voice and multimodal AI agents
 
 ## Status
 
-**Foundations only.** The repository holds the workspace, the quality gates and the test and benchmark harnesses. There is no product code yet: nothing here runs a voice session. The session kernel and the first voice loop are the next phase of the [roadmap](ROADMAP.md).
+**Foundations, and the first measurements.** The repository holds the workspace, the quality gates and the test and benchmark harnesses. There is no product code yet: nothing here runs a voice session.
+
+Phase 1 of the [roadmap](ROADMAP.md) has started. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The session kernel and the first voice loop come next.
 
 ## Documents
 
@@ -14,6 +16,7 @@ Waveport is an open-source platform for real-time voice and multimodal AI agents
 | [docs/architecture.md](docs/architecture.md) | The design: layers, session kernel, ports, performance targets, tech stack |
 | [docs/ecosystem.md](docs/ecosystem.md) | Everything the repository will contain, traced to the gap it closes |
 | [docs/stability.md](docs/stability.md) | What each crate promises about its API |
+| [docs/decisions/](docs/decisions/) | Decisions that rest on a measurement, with the numbers |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The gates and the rules they enforce |
 
 ## Layout
@@ -33,6 +36,9 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/testing/waveport-testkit` | Shared test helpers |
 | `benches/` | Wall-clock and instruction-count benchmarks |
 | `xtask/` | The repository's gates, run as `cargo xtask <command>` |
+| `assets/` | The lock file that pins model files; `cargo xtask fetch-assets` downloads them |
+| `perf/` | Recorded measurements |
+| `spikes/` | Throwaway experiments, outside the workspace and its gates |
 
 The core crates are documented skeletons today. Adapters (`crates/adapters/`), applications (`apps/`) and SDKs are added in the phases that need them.
 

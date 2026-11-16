@@ -1,0 +1,46 @@
+# Throwaway density spike (roadmap phase 1, item 1).
+#
+# It has its own workspace and lockfile so that it can put `ort`, `tract`,
+# mimalloc and jemalloc side by side, which the product workspace's
+# dependency rules would reject. None of the repository's gates see it.
+# Its results are kept in docs/decisions/0001-density-spike.md.
+
+[workspace]
+
+[package]
+name = "density-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["backend-ort", "backend-tract"]
+backend-ort = ["dep:ort"]
+backend-tract = ["dep:tract-onnx"]
+alloc-mimalloc = ["dep:mimalloc"]
+alloc-jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+core_affinity = "0.8.3"
+opus = "0.4.0"
+rtrb = "0.4.1"
+tokio = { version = "~1.53", features = ["rt", "time", "sync"] }
+
+mimalloc = { version = "0.1.52", optional = true }
+tikv-jemallocator = { version = "0.7.0", optional = true }
+# Default features are off because `tls-native` needs OpenSSL headers.
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "copy-dylibs",
+    "tls-rustls",
+    "api-31",
+] }
+tract-onnx = { version = "0.23.10", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"

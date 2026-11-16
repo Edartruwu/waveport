@@ -340,6 +340,40 @@ fn adapter_transitive_adapter() {
 }
 
 #[test]
+fn adapters_share_the_kit() {
+    Fixture::new("adapters-share-the-kit")
+        .member("ports", "crates/core/ports", "ports", &[])
+        .member(
+            "kit",
+            "crates/core/kit",
+            "kit",
+            &[("ports", Normal), ("tokio", Normal)],
+        )
+        .member(
+            "stt",
+            "crates/adapters/stt/stt",
+            "adapter",
+            &[("kit", Normal)],
+        )
+        .member(
+            "tts",
+            "crates/adapters/tts/tts",
+            "adapter",
+            &[("kit", Normal)],
+        )
+        .vendored("tokio", &[])
+        .expect(&[]);
+}
+
+#[test]
+fn application_depends_on_kit() {
+    Fixture::new("application-depends-on-kit")
+        .member("kit", "crates/core/kit", "kit", &[])
+        .member("app", "crates/core/app", "application", &[("kit", Normal)])
+        .expect(&["ARCH001"]);
+}
+
+#[test]
 fn external_not_allowlisted() {
     Fixture::new("external-not-allowlisted")
         .member("dom", "crates/core/dom", "domain", &[("helper", Normal)])
