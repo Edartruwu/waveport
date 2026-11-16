@@ -3,8 +3,6 @@
 //! Nothing here touches a connection: messages come in as text and
 //! transcripts go out, so that every rule can be tried without one.
 
-use core::time::Duration;
-
 use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
 use tokio::time::Instant;
@@ -83,23 +81,10 @@ struct Turn {
     /// Whether the provider takes the turn to be over.
     #[serde(rename = "end_of_turn")]
     over: bool,
+    /// The words of the turn so far. The provider gives a time for each
+    /// word besides, which is not read: see [`Hearing`].
     #[serde(default)]
     transcript: String,
-    #[serde(default)]
-    words: Vec<Word>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Word {
-    /// Where the word begins, in milliseconds of the audio that was sent.
-    start: f64,
-    end: f64,
-}
-
-/// A time the provider gives, in milliseconds. One that is no time at all
-/// is taken as the beginning.
-fn millis(time: f64) -> Duration {
-    Duration::try_from_secs_f64(time / 1_000.0).unwrap_or_default()
 }
 
 /// Reads a message, or says why it cannot be read. `None` is a message of
@@ -216,17 +201,25 @@ impl Outbox {
 #[derive(Clone, Copy, Debug)]
 struct Owed {
     since: Instant,
-    /// How much audio had been sent when it was asked for.
-    upto: Duration,
+    /// The audio it was asked about: what had been sent since the final
+    /// transcript before it.
+    window: MediaSpan,
 }
 
 /// What one stream has sent and heard.
+///
+/// A transcript is placed in the audio that was sent since the final
+/// transcript before it, and not by the times the provider gives its
+/// words. Held against audio whose words are at known places, those
+/// times are not where the words were spoken: one model spreads the
+/// words of a turn over the turn by the number of their letters, from
+/// where it takes the turn to begin, and another gives every word the
+/// same 80 ms at a place up to two thirds of a second after the word
+/// began.
 #[derive(Debug)]
 pub(crate) struct Hearing {
     timeline: Timeline,
     owed: Option<Owed>,
-    /// Where the last final transcript began: none begins before it.
-    last: MediaTime,
     /// The last turn that was given as final. Nothing more is taken
     /// about it or about one before it.
     settled: Option<u64>,
@@ -240,7 +233,6 @@ impl Hearing {
         Self {
             timeline: Timeline::new(),
             owed: None,
-            last: MediaTime::ZERO,
             settled: None,
             formats,
         }
@@ -251,19 +243,39 @@ impl Hearing {
         self.timeline.sent(at, length);
     }
 
+    /// The audio sent since the final transcript before, which the next
+    /// one is about. When none was sent, the place where the audio ends.
+    fn taken(&mut self) -> MediaSpan {
+        self.timeline.take_window().unwrap_or_else(|| {
+            let end = self.timeline.end();
+            MediaSpan::new(end, end)
+        })
+    }
+
     /// Takes a request for a final transcript of everything so far.
     /// Returns whether the provider has to be asked: of no audio at all
     /// there is nothing to write down, and that is said at once.
     pub(crate) fn finalize(&mut self, now: Instant, out: &mut Vec<SttEvent>) -> bool {
-        let upto = self.timeline.total();
-        if upto.is_zero() {
-            self.nothing_more(upto, out);
+        let nothing_sent = self.timeline.total().is_zero();
+        let window = self.taken();
+        if nothing_sent {
+            out.push(SttEvent::Transcript(Transcript {
+                span: window,
+                text: String::new(),
+                is_final: true,
+            }));
             return false;
         }
         // A request that is still owed keeps its place in time: the
-        // provider has had since then to answer.
-        let since = self.owed.map_or(now, |owed| owed.since);
-        self.owed = Some(Owed { since, upto });
+        // provider has had since then to answer. What was sent since is
+        // asked about as well.
+        self.owed = Some(match self.owed {
+            Some(owed) => Owed {
+                since: owed.since,
+                window: MediaSpan::new(owed.window.start, window.end.max(owed.window.start)),
+            },
+            None => Owed { since: now, window },
+        });
         true
     }
 
@@ -274,29 +286,16 @@ impl Hearing {
 
     /// Answers the request that is owed an answer with nothing. The
     /// provider ends a turn it is writing down when it is asked to; of
-    /// silence it is writing none, and says nothing.
+    /// silence it is writing none, and one of its models says nothing
+    /// then.
     pub(crate) fn give_up(&mut self, out: &mut Vec<SttEvent>) {
         if let Some(owed) = self.owed.take() {
-            self.nothing_more(owed.upto, out);
+            out.push(SttEvent::Transcript(Transcript {
+                span: owed.window,
+                text: String::new(),
+                is_final: true,
+            }));
         }
-    }
-
-    /// A final transcript with no words, at the place `upto` into the
-    /// audio: everything before it has been heard.
-    fn nothing_more(&mut self, upto: Duration, out: &mut Vec<SttEvent>) {
-        let at = self.place(upto).max(self.last);
-        self.last = at;
-        out.push(SttEvent::Transcript(Transcript {
-            span: MediaSpan::new(at, at),
-            text: String::new(),
-            is_final: true,
-        }));
-    }
-
-    /// The place on the media clock of the provider's time `offset`. The
-    /// provider cannot have heard what it was not sent.
-    fn place(&self, offset: Duration) -> MediaTime {
-        self.timeline.at(offset).min(self.timeline.end())
     }
 
     /// Takes a message of the provider. Returns whether it was the last
@@ -319,20 +318,19 @@ impl Hearing {
             return Ok(false);
         }
         let text = turn.transcript.trim().to_owned();
-        // Where the words are, when the provider says; otherwise the end
-        // of what it was sent.
-        let (first, last) = match (turn.words.first(), turn.words.last()) {
-            (Some(first), Some(last)) => (millis(first.start), millis(last.end)),
-            _ => (self.timeline.total(), self.timeline.total()),
-        };
-        let start = self.place(first).max(self.last);
-        let span = MediaSpan::new(start, self.place(last).max(start));
 
         // A model that writes a turn out properly at its end says twice
         // that the turn is over. The second time is the one that counts.
         let over = turn.over && (turn.formatted || !self.formats);
         if !over {
             if !text.is_empty() {
+                // Words that may still change, of the audio that the
+                // final transcript after them will be about.
+                let span = self.owed.map(|owed| owed.window);
+                let span = span.or_else(|| self.timeline.window()).unwrap_or_else(|| {
+                    let end = self.timeline.end();
+                    MediaSpan::new(end, end)
+                });
                 out.push(SttEvent::Transcript(Transcript {
                     span,
                     text,
@@ -342,24 +340,21 @@ impl Hearing {
             return Ok(false);
         }
         self.settled = Some(turn.order);
-        if !text.is_empty() {
-            self.last = span.start;
-            out.push(SttEvent::Transcript(Transcript {
-                span,
-                text,
-                is_final: true,
-            }));
-        }
-        if let Some(owed) = self.owed.take() {
-            // Words that end where the speaker stopped say by themselves
-            // that all of it was heard. Silence has to be said.
-            if out.last().is_none_or(|event| {
-                let SttEvent::Transcript(last) = event;
-                !last.is_final || last.span.end < self.place(owed.upto)
-            }) {
-                self.nothing_more(owed.upto, out);
-            }
-        }
+        // The turn that ends answers the request that is owed an answer,
+        // with words or with none. A turn that ends by the provider's
+        // own judgement is about the audio sent until now. One that ends
+        // with nothing said, and that nobody asked for, is not passed
+        // on.
+        let span = match self.owed.take() {
+            Some(owed) => owed.window,
+            None if text.is_empty() => return Ok(false),
+            None => self.taken(),
+        };
+        out.push(SttEvent::Transcript(Transcript {
+            span,
+            text,
+            is_final: true,
+        }));
         Ok(false)
     }
 }
@@ -376,21 +371,27 @@ mod tests {
 
     use super::{Hearing, Outbox, begun};
 
-    /// A stream that has been sent `ms` of audio, which began a second
-    /// into the session.
-    fn sent(ms: u32) -> Hearing {
-        let mut hearing = Hearing::new(false);
-        let mut at = MediaTime::from_millis(1_000);
+    /// Sends a stream `ms` of audio that begins at `from` on the
+    /// session's clock.
+    fn send(hearing: &mut Hearing, from: u64, ms: u32) {
+        let mut at = MediaTime::from_millis(from);
         for _ in 0..ms / 20 {
             let length = MediaDur::from_millis(20);
             hearing.sent(at, length);
             at = at.after(length);
         }
+    }
+
+    /// A stream that has been sent `ms` of audio, which began a second
+    /// into the session.
+    fn sent(ms: u32) -> Hearing {
+        let mut hearing = Hearing::new(false);
+        send(&mut hearing, 1_000, ms);
         hearing
     }
 
-    /// What the provider says about a turn. `words` are where the first
-    /// word begins and the last one ends, in milliseconds.
+    /// What the provider says about a turn. `words` are where it says
+    /// the first word begins and the last one ends, in milliseconds.
     fn turn(order: u64, flags: &str, transcript: &str, words: Option<(u32, u32)>) -> String {
         let words = words.map_or_else(String::new, |(start, end)| {
             let middle = start.midpoint(end);
@@ -423,27 +424,41 @@ mod tests {
     }
 
     #[test]
-    fn words_are_placed_where_they_were_spoken_on_the_sessions_clock() {
-        let mut hearing = sent(3_000);
+    fn words_are_placed_in_the_audio_sent_since_the_transcript_before() {
+        // A second of audio, which began a second into the session.
+        let mut hearing = sent(1_000);
         let mut out = Vec::new();
-        let said = [
-            "{\"type\":\"SpeechStarted\",\"timestamp\":400,\"confidence\":0.98}".to_owned(),
-            // Each of these is the whole turn so far, and replaces the
-            // one before it.
-            turn(0, PARTIAL, "what", Some((400, 600))),
-            turn(0, PARTIAL, "what time is", Some((400, 1_050))),
-            turn(0, OVER, "What time is it?", Some((400, 1_300))),
-        ];
-        for text in said {
+        let started = "{\"type\":\"SpeechStarted\",\"timestamp\":0,\"confidence\":0.92}";
+        assert!(!hearing.heard(started, &mut out).unwrap());
+        // Each of these is the whole turn so far, and replaces the one
+        // before it. The times the provider gives are not where the
+        // words were spoken, and place nothing.
+        hearing
+            .heard(&turn(0, PARTIAL, "what", Some((0, 390))), &mut out)
+            .unwrap();
+        send(&mut hearing, 2_000, 1_000);
+        for text in [
+            turn(0, PARTIAL, "what time is", Some((0, 1_134))),
+            turn(0, OVER, "What time is it?", Some((0, 2_168))),
+        ] {
             assert!(!hearing.heard(&text, &mut out).unwrap());
         }
-        // The audio began a second into the session.
+        // The next turn is in the audio that follows.
+        send(&mut hearing, 3_000, 500);
+        for text in [
+            turn(1, PARTIAL, "and", Some((2_720, 3_094))),
+            turn(1, OVER, "And now?", Some((2_720, 4_888))),
+        ] {
+            assert!(!hearing.heard(&text, &mut out).unwrap());
+        }
         assert_eq!(
             out,
             [
-                transcript(1_400, 1_600, "what", false),
-                transcript(1_400, 2_050, "what time is", false),
-                transcript(1_400, 2_300, "What time is it?", true),
+                transcript(1_000, 2_000, "what", false),
+                transcript(1_000, 3_000, "what time is", false),
+                transcript(1_000, 3_000, "What time is it?", true),
+                transcript(3_000, 3_500, "and", false),
+                transcript(3_000, 3_500, "And now?", true),
             ]
         );
     }
@@ -459,6 +474,7 @@ mod tests {
             // Whatever follows about that turn is not taken.
             turn(0, OVER, "My name is Sonny.", Some((200, 900))),
             turn(0, PARTIAL, "my name", Some((200, 500))),
+            // The next turn is in audio that has not been sent yet.
             turn(1, PARTIAL, "and", Some((1_500, 1_700))),
         ] {
             hearing.heard(&text, &mut out).unwrap();
@@ -466,8 +482,8 @@ mod tests {
         assert_eq!(
             out,
             [
-                transcript(1_200, 1_900, "my name is sonny", true),
-                transcript(2_500, 2_700, "and", false),
+                transcript(1_000, 4_000, "my name is sonny", true),
+                transcript(4_000, 4_000, "and", false),
             ]
         );
 
@@ -485,8 +501,8 @@ mod tests {
         assert_eq!(
             out,
             [
-                transcript(1_200, 1_900, "my name is sonny", false),
-                transcript(1_200, 1_900, "My name is Sonny.", true),
+                transcript(1_000, 4_000, "my name is sonny", false),
+                transcript(1_000, 4_000, "My name is Sonny.", true),
             ]
         );
     }
@@ -503,6 +519,8 @@ mod tests {
             .heard(&turn(0, PARTIAL, "tell me", Some((500, 900))), &mut out)
             .unwrap();
         assert!(hearing.waiting_since().is_some());
+        // What is sent after the request is not what was asked about.
+        send(&mut hearing, 3_000, 400);
         hearing
             .heard(
                 &turn(0, OVER, "Tell me a story.", Some((500, 1_800))),
@@ -510,25 +528,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hearing.waiting_since(), None);
+        // It is what the turn after it is in, which the provider ends by
+        // itself.
+        hearing
+            .heard(&turn(1, OVER, "Please.", Some((2_000, 2_400))), &mut out)
+            .unwrap();
         assert_eq!(
             out,
             [
-                transcript(1_500, 1_900, "tell me", false),
-                transcript(1_500, 2_800, "Tell me a story.", true),
-                // The words stop before the audio does: that all of it
-                // was heard is said apart.
-                transcript(3_000, 3_000, "", true),
+                transcript(1_000, 3_000, "tell me", false),
+                transcript(1_000, 3_000, "Tell me a story.", true),
+                transcript(3_000, 3_400, "Please.", true),
             ]
         );
-
-        // Words that reach the end of the audio say it themselves.
-        let mut hearing = sent(2_000);
-        let mut out = Vec::new();
-        assert!(hearing.finalize(now, &mut out));
-        hearing
-            .heard(&turn(0, OVER, "Go on.", Some((1_500, 2_000))), &mut out)
-            .unwrap();
-        assert_eq!(out, [transcript(2_500, 3_000, "Go on.", true)]);
     }
 
     #[test]
@@ -544,7 +556,8 @@ mod tests {
         hearing
             .heard(&turn(1, UNFORMATTED, "", None), &mut out)
             .unwrap();
-        assert_eq!(out, [transcript(3_000, 3_000, "", true)]);
+        // Nothing was said in all of the audio.
+        assert_eq!(out, [transcript(1_000, 3_000, "", true)]);
         assert_eq!(hearing.waiting_since(), None);
     }
 
@@ -561,32 +574,57 @@ mod tests {
         let asked = Instant::now();
         assert!(hearing.finalize(asked, &mut out));
         // Asked again while the first is owed: the provider has had since
-        // the first to answer.
-        hearing.sent(MediaTime::from_millis(3_000), MediaDur::from_millis(500));
+        // the first to answer, and is asked about what was sent since as
+        // well.
+        send(&mut hearing, 3_000, 500);
         assert!(hearing.finalize(asked + Duration::from_millis(300), &mut out));
         assert_eq!(hearing.waiting_since(), Some(asked));
         hearing.give_up(&mut out);
-        assert_eq!(out, [transcript(3_500, 3_500, "", true)]);
+        assert_eq!(out, [transcript(1_000, 3_500, "", true)]);
         assert_eq!(hearing.waiting_since(), None);
         // Giving up twice gives up once.
         hearing.give_up(&mut out);
         assert_eq!(out.len(), 1);
+
+        // The provider had ended the turn by itself before it was asked:
+        // the request is about what was sent since, in which it heard
+        // nothing.
+        let mut hearing = sent(2_000);
+        let mut out = Vec::new();
+        hearing
+            .heard(&turn(0, OVER, "Go on.", Some((0, 540))), &mut out)
+            .unwrap();
+        send(&mut hearing, 3_000, 200);
+        assert!(hearing.finalize(asked, &mut out));
+        hearing.give_up(&mut out);
+        assert_eq!(
+            out,
+            [
+                transcript(1_000, 3_000, "Go on.", true),
+                transcript(3_000, 3_200, "", true),
+            ]
+        );
     }
 
     #[test]
-    fn nothing_is_placed_outside_the_audio_or_before_what_came_before() {
+    fn the_times_the_provider_gives_its_words_place_nothing() {
         let mut hearing = sent(1_000);
         let mut out = Vec::new();
         for text in [
             // Words the provider puts after the end of what it was sent.
             turn(0, OVER, "well", Some((900, 1_400))),
-            // And then words it puts before those.
+            // And then words it puts before those. No audio was sent
+            // since the turn before: they are where the audio ends.
             turn(1, OVER, "oh", Some((100, 300))),
             // Times that are no times.
             "{\"type\":\"Turn\",\"turn_order\":2,\"end_of_turn\":false,\"transcript\":\"hm\",\
              \"words\":[{\"start\":-3000,\"end\":-2000.5,\"text\":\"hm\"}]}"
                 .to_owned(),
-            // Words without their times are at the end of the audio.
+            // Words that are not what the provider says words are.
+            "{\"type\":\"Turn\",\"turn_order\":2,\"end_of_turn\":true,\"transcript\":\"hm.\",\
+             \"words\":[\"hm\",null]}"
+                .to_owned(),
+            // And none at all.
             turn(3, OVER, "so", None),
         ] {
             hearing.heard(&text, &mut out).unwrap();
@@ -594,9 +632,10 @@ mod tests {
         assert_eq!(
             out,
             [
-                transcript(1_900, 2_000, "well", true),
-                transcript(1_900, 1_900, "oh", true),
-                transcript(1_900, 1_900, "hm", false),
+                transcript(1_000, 2_000, "well", true),
+                transcript(2_000, 2_000, "oh", true),
+                transcript(2_000, 2_000, "hm", false),
+                transcript(2_000, 2_000, "hm.", true),
                 transcript(2_000, 2_000, "so", true),
             ]
         );

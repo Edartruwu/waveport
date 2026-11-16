@@ -1,15 +1,19 @@
 //! The adapter against a server on this machine that speaks as the
-//! provider's documentation says the provider does, and, when asked,
-//! against the provider.
+//! provider does, and, when asked, against the provider.
 //!
-//! Nothing here was recorded. The messages are made up in the shapes the
-//! documentation of 15 November 2026 gives, with a tone for audio. They
-//! hold the adapter to its own reading of that documentation, and to the
-//! rules of the port, which are the same ones the fakes keep. Whether
-//! the reading is right is for the tests named `live_*` to say. Those
-//! talk to the provider, are ignored unless asked for, and need
-//! `ELEVENLABS_API_KEY`, and a voice in `ELEVENLABS_VOICE` to use another
-//! than the one named here:
+//! `tests/fixtures/two_sentences.jsonl` is what the provider sent for
+//! two sentences on 16 November 2026, but for the audio itself. The
+//! other messages here are made up in the shape of those, with a tone
+//! for audio: the provider times the characters on a clock that runs on
+//! through the speech, a little ahead of the audio it sends, and puts
+//! the space between two pieces of text at the end of the first. They
+//! hold the adapter to the rules of the port, which are the same ones
+//! the fakes keep. What the provider does when it fails has not been
+//! seen, and is as the adapter takes it to be.
+//!
+//! The tests named `live_*` talk to the provider, are ignored unless
+//! asked for, and need `ELEVENLABS_API_KEY`, and a voice in
+//! `ELEVENLABS_VOICE` to use another than the one named here:
 //!
 //! ```sh
 //! cargo test -p waveport-tts-elevenlabs -- --ignored live_
@@ -43,9 +47,9 @@ const PIECES: [&str; 2] = ["Hello,", " world!"];
 const UNTIL_FINISHED: &str = "> \"close_context\":true";
 
 /// A message that carries `millis` of a tone for `context`, in which
-/// `text` is spoken, every character taking `each` ms from where the
-/// tone begins.
-fn audio(context: &str, millis: u32, text: &str, each: u32) -> String {
+/// `text` is spoken, every character taking `each` ms from `from` on
+/// the provider's clock, which begins with the speech.
+fn audio(context: &str, millis: u32, text: &str, each: u32, from: u32) -> String {
     let samples: Vec<i16> = (0..RATE.samples_in_millis(millis))
         .map(|n| if n % 16 < 8 { 2_000 } else { -2_000 })
         .collect();
@@ -53,7 +57,7 @@ fn audio(context: &str, millis: u32, text: &str, each: u32) -> String {
     write_base64(&samples, &mut data);
     let chars: Vec<String> = text.chars().map(|c| format!("\"{c}\"")).collect();
     let starts: Vec<String> = (0..chars.len())
-        .map(|n| (u32::try_from(n).unwrap() * each).to_string())
+        .map(|n| (u32::try_from(n).unwrap() * each + from).to_string())
         .collect();
     let lengths = vec![each.to_string(); chars.len()];
     let alignment = if text.is_empty() {
@@ -82,13 +86,39 @@ fn over(context: &str) -> String {
 fn hello(context: &str) -> String {
     [
         UNTIL_FINISHED.to_owned(),
-        // The space a context is begun with is among the characters.
-        audio(context, 300, " Hello,", 20),
-        audio(context, 400, " world!", 30),
-        audio(context, 300, "", 0),
+        // The space between the two pieces of text is at the end of the
+        // first, and the provider adds one of its own at the very end.
+        audio(context, 300, "Hello, ", 20, 0),
+        // Its clock is at 306 ms where the second piece of audio begins,
+        // which is 300 ms into the speech.
+        audio(context, 400, "world! ", 30, 306),
+        audio(context, 300, "", 0, 0),
         over(context),
     ]
     .join("\n")
+}
+
+/// What the provider sent for [`SENTENCES`] when it was recorded, as a
+/// script: every message as it came, but for its audio, which is silence
+/// of the recorded length here. The context was called `ctx-1`.
+fn recorded() -> String {
+    let lines = include_str!("fixtures/two_sentences.jsonl").lines();
+    let said = lines
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| {
+            let mut message: serde_json::Value = serde_json::from_str(line).unwrap();
+            let fields = message.as_object_mut().unwrap();
+            let bytes = fields.remove("audio_bytes").unwrap().as_u64().unwrap();
+            let silence = vec![0_i16; usize::try_from(bytes).unwrap() / 2];
+            let mut data = String::new();
+            write_base64(&silence, &mut data);
+            fields.insert("audio".to_owned(), serde_json::Value::String(data));
+            format!("< {message}")
+        });
+    core::iter::once(UNTIL_FINISHED.to_owned())
+        .chain(said)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A server whose connections follow these scripts, one after the other.
@@ -161,23 +191,24 @@ async fn speech_in_the_documented_shapes_is_read_as_the_port_says() {
     assert_eq!(seen.length, MediaDur::from_millis(1_000));
     assert_eq!(seen.samples.len(), 16_000);
     // A mark where each character ends. Those of the second piece of
-    // audio are timed from where it begins, 300 ms into the speech.
+    // audio are as far into it as the provider's clock says they are
+    // from its first, and that piece begins 300 ms into the speech.
     assert_eq!(
         seen.marks,
         [
-            mark(1, 40),
-            mark(2, 60),
-            mark(3, 80),
-            mark(4, 100),
-            mark(5, 120),
-            mark(6, 140),
-            mark(7, 330),
-            mark(8, 360),
-            mark(9, 390),
-            mark(10, 420),
-            mark(11, 450),
-            mark(12, 480),
-            mark(13, 510),
+            mark(1, 20),
+            mark(2, 40),
+            mark(3, 60),
+            mark(4, 80),
+            mark(5, 100),
+            mark(6, 120),
+            mark(7, 140),
+            mark(8, 330),
+            mark(9, 360),
+            mark(10, 390),
+            mark(11, 420),
+            mark(12, 450),
+            mark(13, 480),
         ]
     );
 
@@ -200,6 +231,54 @@ async fn speech_in_the_documented_shapes_is_read_as_the_port_says() {
             "{\"text\":\" world!\",\"context_id\":\"test-1\",\"flush\":true}",
             "{\"context_id\":\"test-1\",\"close_context\":true}",
         ]
+    );
+}
+
+#[tokio::test]
+async fn two_sentences_are_marked_in_the_audio_as_the_provider_sent_them() {
+    let server = server(&[&recorded()]).await;
+    let tts = ElevenLabsTts::new(Config {
+        rate: Rate::Hz24000,
+        context_prefix: "ctx".to_owned(),
+        ..config(&server)
+    })
+    .unwrap();
+    // The check fails on a mark that points past the audio there is,
+    // which is what the provider's own times do: they end at 3,065 ms,
+    // and it sent 70,312 and 76,296 bytes of audio, which are 73,304
+    // samples and 3,054 ms.
+    let seen = tts_utterance(&tts, Rate::Hz24000, &SENTENCES)
+        .await
+        .unwrap();
+    assert_eq!(seen.samples.len(), 73_304);
+
+    // Every character of the text is marked, in its order.
+    let all: usize = SENTENCES.iter().map(|sentence| sentence.len()).sum();
+    let ends: Vec<usize> = seen
+        .marks
+        .iter()
+        .map(|mark| usize::try_from(mark.text_end).unwrap())
+        .collect();
+    assert_eq!(ends, (1..=all).collect::<Vec<_>>());
+    // The first sentence ends in the first piece of audio, which is
+    // 1,465 ms long, near its end; and the second begins in the second.
+    let first = SENTENCES[0].len();
+    let piece = Rate::Hz24000.length_of(70_312 / 2);
+    let first_ends = seen.marks[first - 1].audio_end;
+    assert!(
+        first_ends >= MediaDur::from_millis(1_300) && first_ends <= piece,
+        "{first_ends:?}"
+    );
+    // The space between the two is the last thing in the first piece.
+    assert_eq!(seen.marks[first].audio_end, piece);
+    let second_begins = seen.marks[first + 1].audio_end;
+    assert!(second_begins > piece, "{second_begins:?}");
+    // The last character ends before the audio does: what follows it is
+    // the space the provider adds, which is not of the text.
+    let last_ends = seen.marks[all - 1].audio_end;
+    assert!(
+        last_ends >= MediaDur::from_millis(2_700) && last_ends < seen.length,
+        "{last_ends:?}"
     );
 }
 
@@ -231,13 +310,13 @@ async fn a_response_that_is_abandoned_takes_its_connection_with_it() {
     // side. The second speaks the next response whole.
     let begun = format!(
         "> \"text\":\" world!\"\n{}",
-        audio("test-1", 200, " Hel", 20)
+        audio("test-1", 200, "Hel", 20, 0)
     );
     let server = server(&[&begun, &hello("test-2")]).await;
     let tts = adapter(&server);
     let seen = tts_abandoned(&tts, RATE, &PIECES).await.unwrap();
     assert_eq!(seen.samples.len(), 16_000);
-    assert_eq!(seen.marks.last(), Some(&mark(13, 510)));
+    assert_eq!(seen.marks.last(), Some(&mark(13, 480)));
 
     let connections = server.over(1).await;
     assert_eq!(connections.len(), 2);
@@ -340,11 +419,12 @@ async fn the_end_of_a_context_said_too_early_does_not_end_the_speech() {
     // first piece, which it is not: more text follows.
     let script = [
         "> \"text\":\"Hello,\"".to_owned(),
-        audio("test-1", 200, " Hell", 20),
+        audio("test-1", 200, "Hell", 20, 0),
         over("test-1"),
-        audio("test-1", 100, "o,", 20),
+        // The space after it is of text that has not been given yet.
+        audio("test-1", 100, "o, ", 20, 203),
         UNTIL_FINISHED.to_owned(),
-        audio("test-1", 700, " world!", 30),
+        audio("test-1", 700, "world! ", 30, 304),
         over("test-1"),
     ]
     .join("\n");
@@ -367,7 +447,8 @@ async fn the_end_of_a_context_said_too_early_does_not_end_the_speech() {
     stream.tx.try_finish().unwrap();
     let (events, samples) = read(&mut stream).await;
     assert_eq!(samples, 11_200, "{events:?}");
-    assert_eq!(events.len(), 8, "{events:?}");
+    // The six characters of the word, and the end.
+    assert_eq!(events.len(), 7, "{events:?}");
     assert_eq!(events.last(), Some(&Ok(TtsEvent::Done)));
 }
 
@@ -378,7 +459,7 @@ async fn what_is_said_about_an_earlier_response_is_not_taken_for_this_one() {
     let script = [
         hello("test-1"),
         "> \"text\":\"Hello,\"".to_owned(),
-        audio("test-1", 500, "late", 10),
+        audio("test-1", 500, "late", 10, 0),
         over("test-1"),
         hello("test-2"),
     ]
@@ -394,8 +475,8 @@ async fn what_is_said_about_an_earlier_response_is_not_taken_for_this_one() {
 
 #[tokio::test]
 async fn what_the_provider_will_not_speak_fails_the_stream() {
-    // The documentation does not show a failure. This is the shape the
-    // adapter takes one to have: a name for it, and words.
+    // A failure in the shape the provider's refusal of a key has: a name
+    // for it, and words. This one is made up.
     let refusal = "< {\"message\":\"A voice with that voice_id does not exist.\",\
                    \"error\":\"voice_id_does_not_exist\",\"code\":1008}";
     let server = server(&[&format!("> \"text\":\"Hello,\"\n{refusal}")]).await;
@@ -404,6 +485,20 @@ async fn what_the_provider_will_not_speak_fails_the_stream() {
     let (events, samples) = read(&mut stream).await;
     assert_eq!((events, samples), (vec![Err(RetryClass::Permanent)], 0));
     // A connection that failed is not kept.
+    assert_eq!(tts.kept(), 0);
+}
+
+#[tokio::test]
+async fn a_key_the_provider_does_not_know_fails_the_first_speech() {
+    // As it was recorded: the provider takes the connection, and says
+    // no once it is asked for something.
+    let server = server(&[include_str!("fixtures/wrong_key.ws")]).await;
+    let tts = adapter(&server);
+    let mut stream = tts.open(TtsConfig::new(RATE)).await.unwrap();
+    stream.tx.try_speak("Hello.").unwrap();
+    stream.tx.try_finish().unwrap();
+    let (events, samples) = read(&mut stream).await;
+    assert_eq!((events, samples), (vec![Err(RetryClass::Auth)], 0));
     assert_eq!(tts.kept(), 0);
 }
 
@@ -428,7 +523,7 @@ async fn a_provider_that_refuses_the_connection_answers_by_its_status() {
 
 #[tokio::test]
 async fn a_provider_that_goes_quiet_with_the_speech_not_over_is_not_waited_for() {
-    let quiet = format!("{UNTIL_FINISHED}\n{}", audio("test-1", 200, "", 0));
+    let quiet = format!("{UNTIL_FINISHED}\n{}", audio("test-1", 200, "", 0, 0));
     let server = server(&[&quiet]).await;
     let tts = ElevenLabsTts::new(Config {
         stall_timeout: Duration::from_millis(150),
@@ -473,7 +568,10 @@ async fn a_connection_that_drops_in_the_middle_fails_the_stream() {
         // The provider closes with a complaint.
         ("! 1008 not allowed", RetryClass::Permanent),
     ] {
-        let dropped = format!("{UNTIL_FINISHED}\n{}\n{gone}", audio("test-1", 200, "", 0));
+        let dropped = format!(
+            "{UNTIL_FINISHED}\n{}\n{gone}",
+            audio("test-1", 200, "", 0, 0)
+        );
         let server = server(&[&dropped]).await;
         let tts = adapter(&server);
         let mut stream = say_hello(&tts).await;

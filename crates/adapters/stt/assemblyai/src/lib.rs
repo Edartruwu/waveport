@@ -3,20 +3,19 @@
 //! Stability: experimental
 //!
 //! One WebSocket for one participant. Audio goes up as plain samples, and
-//! the provider writes down what it hears turn by turn, with the time of
-//! every word: while a turn goes on it says again and again what the
-//! turn holds so far, and when it takes the turn to be over it says so
-//! once more, for good. It can also be asked to end the turn now, which
-//! is what a session does when it has decided for itself that a turn is
-//! over.
+//! the provider writes down what it hears turn by turn: while a turn
+//! goes on it says again and again what the turn holds so far, and when
+//! it takes the turn to be over it says so once more, for good. It can
+//! also be asked to end the turn now, which is what a session does when
+//! it has decided for itself that a turn is over.
 //!
-//! **This adapter was written from the provider's documentation as it
-//! stood on 15 November 2026, and has not yet been held against the
-//! provider.** The tests replay messages in the documented shapes, made
-//! up here; none of them was recorded. The tests named `live_*` are the
-//! ones that will tell, once there is a key to run them with.
+//! **This adapter was written from the provider's documentation, and
+//! was held against the provider on 16 November 2026**, with the models
+//! `universal-3-6-pro` and `universal-streaming-english`. What the
+//! provider said then is in `tests/fixtures`, and tests replay it. The
+//! tests named `live_*` ask the provider again.
 //!
-//! What the documentation says, and the adapter is built around:
+//! What the adapter is built around:
 //!
 //! - What the session asks for is in the address: the model, the rate of
 //!   the audio, the language. The provider passes over what it does not
@@ -30,15 +29,25 @@
 //! - A message of audio has to hold between 20 ms and a second, and is
 //!   best 50 ms or more. Smaller pieces are put together here, which
 //!   holds back at most a few hundredths of a second.
-//! - Times are milliseconds of the audio that was sent. They are brought
-//!   to the session's clock here.
+//! - The provider gives a time for every word, in milliseconds of the
+//!   audio that was sent, and the times are not where the words were
+//!   spoken. Held against audio whose words are at known places, one
+//!   model spread the words of a turn by the number of their letters
+//!   over a stretch that began where the turn before had ended, a third
+//!   of a second before the first word; the other gave every word 80 ms,
+//!   at a place up to two thirds of a second after the word began. So
+//!   the times are not read. A transcript is placed in the audio that
+//!   was sent since the final transcript before it, which is wider than
+//!   its words, and the adapter says so ([`SttTiming::Window`]). The
+//!   adapter was first written to trust the times.
 //! - Everything the provider says about a turn replaces what it said
 //!   before, until the turn is over.
 //! - Asked to end the turn, the provider ends the one it is writing
-//!   down. The documentation does not say what it does when it is
-//!   writing none, as in silence. So a request is answered here by the
-//!   turn that ends next, and by an empty transcript when none has ended
-//!   in a short while.
+//!   down. When it is writing none, as in silence or when it has just
+//!   ended a turn by itself, one model says nothing and the other ends a
+//!   turn that holds nothing. So a request is answered here by the turn
+//!   that ends next, and by an empty transcript when none has ended in a
+//!   short while.
 //! - The provider charges for as long as a session is open, and a
 //!   session it is not told to end stays open. It is told when no more
 //!   audio follows, and what it still writes down is passed on until it
@@ -250,7 +259,7 @@ impl Stt for AssemblyAiStt {
         SttCaps {
             rates: RateSet::of(&[Rate::Hz8000, Rate::Hz16000, Rate::Hz24000, Rate::Hz48000]),
             interim: true,
-            timing: SttTiming::Words,
+            timing: SttTiming::Window,
             finalize: SttFinalize::Both,
         }
     }
