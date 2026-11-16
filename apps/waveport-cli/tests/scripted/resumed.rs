@@ -295,6 +295,27 @@ impl Set {
             .collect()
     }
 
+    /// What the model was shown so far, once its server has recorded
+    /// nothing more for a while.
+    ///
+    /// A process that is killed may have sent the model a request that
+    /// its server has not got round to yet. Read too early, that
+    /// request is missing from what the killed process asked, and is
+    /// taken for the first thing the next process asked.
+    async fn asked_once_quiet(&self) -> Vec<Vec<Shown>> {
+        let mut asked = self.asked();
+        let mut quiet_since = Instant::now();
+        while quiet_since.elapsed() < Duration::from_millis(300) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let now = self.asked();
+            if now.len() != asked.len() {
+                asked = now;
+                quiet_since = Instant::now();
+            }
+        }
+        asked
+    }
+
     /// Runs a call until its process is at `place`, and kills the
     /// process there. Returns what it told, and its errors.
     async fn killed_at(&self, place: &str) -> (Vec<String>, String) {
@@ -352,7 +373,7 @@ async fn goes_on(killed: Killed) -> WentOn {
     // The process that is killed.
     let (before, errors_before) = set.killed_at(place).await;
     let notes_before = lines(&set.notes);
-    let asked_before = set.asked();
+    let asked_before = set.asked_once_quiet().await;
 
     // The process that goes on.
     let record = [
