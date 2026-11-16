@@ -12,9 +12,11 @@
 //!
 //! This library holds the workloads, so that both kinds measure the same code.
 
+pub mod calls;
 pub mod journal;
 pub mod kernel;
 pub mod media;
+pub mod targets;
 
 use waveport_sim::{Seed, SimRng};
 

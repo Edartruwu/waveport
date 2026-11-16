@@ -2610,12 +2610,16 @@ dependencies = [
  "criterion",
  "gungraun",
  "tokio",
+ "toml",
+ "waveport-adapter-kit",
+ "waveport-alloc-counter",
  "waveport-domain",
  "waveport-media",
  "waveport-ports",
  "waveport-runtime",
  "waveport-sim",
  "waveport-store-journal",
+ "waveport-testkit",
 ]
 
 [[package]]
