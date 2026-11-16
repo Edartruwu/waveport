@@ -98,3 +98,37 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - run: cargo test --release --locked -p waveport-domain --test model -- --include-ignored
+
+  # A thousand calls of a minute each, at once, by the real session actor
+  # with a stand-in in every port, on a clock the test controls: every
+  # question answered, no answer later for the other sessions, no session
+  # holding more than `perf/targets.toml` allows, and every byte given
+  # back at the end.
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo test --release --locked -p waveport-benches --test memory -- --ignored
+
+  # How much of a thread a session takes: fifty calls on one shard of the
+  # runtime, in real time. A share of a thread says as much about the
+  # runner as about the code, so it is divided by what a piece of
+  # reference work takes in the same run, and that ratio is what is held
+  # to `perf/targets.toml`. The numbers themselves are checked on a
+  # machine that is left alone, with `cargo xtask perf check`.
+  density:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: cargo test --release -p waveport-benches --test load
+        env:
+          WAVEPORT_PERF_GATE: "1"
+        run: cargo test --release --locked -p waveport-benches --test load -- --ignored --nocapture

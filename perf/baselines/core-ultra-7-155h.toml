@@ -1,0 +1,15 @@
+# The numbers of one machine, recorded by `cargo xtask perf record`.
+# `cargo xtask perf check` holds the same machine to them.
+machine = "core-ultra-7-155h"
+
+[measured]
+"density.ratio" = 1.271
+"density.reference_drift" = 1.001
+"density.reference_ms" = 4.471
+"density.sessions" = 50
+"density.sessions_per_thread" = 176
+"density.share_percent" = 0.5682
+"poll.longest_ms" = 1.861
+"poll.over_budget_share" = 0.02524
+"start.p50_ms" = 0.124
+"start.p99_ms" = 0.425
