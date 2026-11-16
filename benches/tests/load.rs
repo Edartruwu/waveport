@@ -9,8 +9,9 @@
 //!
 //! A share of a thread is a number about this machine. So the same run
 //! also times a piece of reference work, encoding and decoding a second
-//! of Opus, and the share is divided by that: the ratio moves little
-//! from one machine to another, and it is what the nightly gate holds.
+//! of Opus, and the share is divided by that. The ratio has the speed of
+//! the processor taken out of it, though not everything else about a
+//! machine, and it is what the nightly gate holds on its runner.
 //! `cargo xtask perf` reads the lines this test prints, and records and
 //! checks the numbers themselves on the machine it is run on.
 //!

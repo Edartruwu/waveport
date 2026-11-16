@@ -45,11 +45,13 @@ active = { target_p50_kb = 1500, target_p99_kb = 4000, held_pcm_kb = 612, held_o
 # docs/decisions/0001-density-spike.md.
 [density]
 # The session's share of its shard's thread, divided by what encoding and
-# decoding a second of Opus takes on the same machine in the same run. A
-# share is a number about one machine; the ratio moves little from one to
-# another, so it is what the nightly run holds, on a runner nobody else
-# is using at that hour.
-held_ratio = 1.39
+# decoding a second of Opus takes on the same machine in the same run.
+# That takes the speed of the processor out of the number, and not
+# everything else about a machine: it was 0.73 on a runner of GitHub's
+# and 0.92 on one core of a laptop, where work that comes in short bursts
+# is slower than work that runs on. So the number held here is the
+# runner's own, and it holds the runner. It is from one run so far.
+held_ratio = 0.73
 # How much over what is held a run may be, as a share of it: runners
 # differ, and the same runner differs from night to night.
 tolerance = 0.25
@@ -59,9 +61,13 @@ tolerance = 0.25
 [local]
 # How much worse than its record a number may be, as a share of it. On
 # one processor of the machine this was written on (`perf record --cpu`)
-# the share of a thread moves by about 2% from run to run; on whatever
-# processor the system picks, by about 10%, which is why a check that
-# fails measures again and keeps the better measurement.
+# the share of a thread moves by about 1% from run to run.
+#
+# It is also how much longer or shorter the reference work may take than
+# it took when the record was made. Past that the machine is not in the
+# state it was recorded in, and a check refuses to compare: the same
+# laptop took 1.8 times as long over everything earlier on the day of
+# its record.
 tolerance = 0.10
 # The numbers that are held to their record. Less is better for each.
 # How long a session takes to start is not among them: it is a fraction

@@ -46,6 +46,10 @@ const MEASURE: &[&str] = &[
 /// worse than its record.
 const TRIES: u32 = 3;
 
+/// The number that says what state a machine is in: how long the
+/// reference work takes it.
+const REFERENCE: &str = "density.reference_ms";
+
 /// The number that says which of two measurements is the better one:
 /// the share of a thread that a session takes.
 const SHARE: &str = "density.share_percent";
@@ -110,6 +114,7 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
             let rules = rules(&workspace.root)?;
             let mut measured = measure(&workspace.root, pinned)?;
             steady(&measured, &rules)?;
+            as_recorded(&recorded, &measured, &rules)?;
             let mut tries = 1;
             loop {
                 let (table, held) = compare(&recorded, &measured, &rules);
@@ -131,6 +136,7 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
                 println!("perf: worse than the record allows, so once more");
                 let again = measure(&workspace.root, pinned)?;
                 steady(&again, &rules)?;
+                as_recorded(&recorded, &again, &rules)?;
                 measured = better(measured, again);
                 tries += 1;
             }
@@ -264,6 +270,35 @@ fn steady(measured: &BTreeMap<String, f64>, rules: &Rules) -> Result<()> {
         ))),
         _ => Ok(()),
     }
+}
+
+/// Refuses to hold a machine to a record that was made in another state
+/// of it: the reference work takes it longer or shorter now than then,
+/// by more than the tolerance.
+///
+/// The same machine is not always the same machine. A laptop on its
+/// battery, or one that is warm, or one that is doing something else,
+/// takes nearly twice as long over the same work, and so over a session.
+/// Held to a record made when it was fast, it would fail for no change
+/// in the code; held to one made when it was slow, it would pass
+/// whatever the change.
+fn as_recorded(
+    recorded: &BTreeMap<String, f64>,
+    measured: &BTreeMap<String, f64>,
+    rules: &Rules,
+) -> Result<()> {
+    let (Some(then), Some(now)) = (recorded.get(REFERENCE), measured.get(REFERENCE)) else {
+        return Ok(());
+    };
+    if *then > 0.0 && ((now - then) / then).abs() > rules.tolerance {
+        return Err(Error::new(format!(
+            "the reference work takes this machine {now} ms now and took it {then} ms when its \
+             record was made: it is not in the state it was recorded in (its power, its heat, \
+             or what else it is doing). Bring it back to that state, or make a new record with \
+             `cargo xtask perf record`"
+        )));
+    }
+    Ok(())
 }
 
 /// The better of two measurements, whole: the one in which a session
@@ -415,7 +450,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Rules, better, command, compare, parse, recorded, rules_from, slug, steady, written,
+        Rules, as_recorded, better, command, compare, parse, recorded, rules_from, slug, steady,
+        written,
     };
 
     fn numbers(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
@@ -553,6 +589,25 @@ mod tests {
             workflow.contains(&command),
             "scheduled.yml does not run `{command}`"
         );
+    }
+
+    #[test]
+    fn a_machine_in_another_state_than_its_record_is_not_held_to_it() {
+        let recorded = numbers(&[("density.reference_ms", 4.47)]);
+        // A little faster or slower: the same machine.
+        for now in [4.2, 4.47, 4.8] {
+            let measured = numbers(&[("density.reference_ms", now)]);
+            assert!(as_recorded(&recorded, &measured, &rules()).is_ok(), "{now}");
+        }
+        // Nearly twice as fast, as when its charger is put in; and slower.
+        for now in [2.49, 5.5] {
+            let measured = numbers(&[("density.reference_ms", now)]);
+            let error = as_recorded(&recorded, &measured, &rules()).unwrap_err();
+            assert!(error.to_string().contains("perf record"), "{error}");
+        }
+        // A record without the number holds to no state.
+        let measured = numbers(&[("density.reference_ms", 2.49)]);
+        assert!(as_recorded(&BTreeMap::new(), &measured, &rules()).is_ok());
     }
 
     #[test]

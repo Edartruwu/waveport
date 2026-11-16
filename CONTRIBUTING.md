@@ -291,7 +291,9 @@ cargo xtask perf record --cpu 6    # writes perf/baselines/<processor>.toml
 cargo xtask perf check             # measures the same way, and holds the machine to its record
 ```
 
-`--cpu` keeps the measurement on one processor, with `taskset`, and is worth using: on a machine whose cores are not alike, the numbers move by a tenth without it and by a fiftieth with it. A check that fails measures again, up to three times, because whatever else a machine does can only make a measurement worse. The record is named after the machine's processor and says nothing else of the machine. Make a new record in the pull request that changes what a session costs, and say why it changed.
+`--cpu` keeps the measurement on one processor, with `taskset`, and is worth using on a machine whose cores are not alike: the numbers then repeat to about 1%. A check that fails measures again, up to three times, because whatever else a machine does can only make a measurement worse.
+
+The same machine is not always the same machine. A laptop takes nearly twice as long over the same work when it is on its battery, warm, or busy, and then over a session too. So a record says how long the reference work took, and a check refuses a machine that takes a tenth longer or shorter over it now: bring the machine back to that state, or make a new record. Record with the machine as it is when it is left alone. The record is named after the machine's processor and says nothing else of the machine. Make a new record in the pull request that changes what a session costs, and say why it changed.
 
 ## Spikes
 
