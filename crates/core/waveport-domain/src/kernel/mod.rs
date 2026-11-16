@@ -23,17 +23,29 @@
 //! }
 //! ```
 
+mod conversation;
+mod coordinator;
 mod fingerprint;
+mod floor;
+mod lifecycle;
+mod response;
 mod view;
 
 use core::fmt;
 
 pub use view::{CallState, CallView, GenerationRole, GenerationView, ItemView, TurnView, View};
 
+use self::conversation::Conversation;
+use self::coordinator::Step;
+use self::floor::OpenTurn;
+use self::lifecycle::Closing;
+use self::response::Generation;
+use crate::bounded::Bounded;
+use crate::command::LlmCause;
 use crate::config::{AgentSpec, ConfigError, KernelConfig, ToolSpec};
-use crate::event::Event;
-use crate::fact::{Lifecycle, Stamped};
-use crate::ids::{AgentId, ContextVersion, Epoch, Seq, ToolId};
+use crate::event::{ControlInput, Event};
+use crate::fact::{Fact, Lifecycle, Stamped};
+use crate::ids::{AgentId, ContextVersion, Epoch, GenId, ParticipantId, Seq, ToolId, TurnId};
 use crate::out::Out;
 use crate::policy::{DefaultPolicies, Policies};
 use crate::text::TextArena;
@@ -41,26 +53,114 @@ use crate::time::MonoTime;
 
 /// Everything about a session that a step may change. It is plain data:
 /// two kernels with equal state behave the same from then on.
+///
+/// Part of it outlives a crash: the conversation, the participants, the
+/// epoch and the stage of the session's life. That part changes only in
+/// [`State::apply`], by a fact that is journaled, so the journal can
+/// rebuild it. The rest, the turns and responses under way, is lost with
+/// the process, and the session carries on without it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct State {
     epoch: Epoch,
     lifecycle: Lifecycle,
+    closing: Option<Closing>,
     attached: bool,
+    /// Whether this kernel still owns the session.
+    leased: bool,
     front: AgentId,
     /// The sequence number the next fact gets.
     next_seq: Seq,
-    context: ContextVersion,
+    next_turn: TurnId,
+    next_gen: GenId,
+    participants: Bounded<ParticipantId>,
+    turns: Bounded<OpenTurn>,
+    generations: Bounded<Generation>,
+    conversation: Conversation,
+    /// The newest item of the conversation that is owed a response, as the
+    /// version of the conversation that holds it, and what the response is
+    /// for.
+    owed: Option<(ContextVersion, LlmCause)>,
+    /// The conversation the latest response was started on. A response is
+    /// owed while `owed` is newer than this.
+    answered: ContextVersion,
 }
 
 impl State {
     fn new(config: &KernelConfig) -> Self {
+        let limits = &config.limits;
         Self {
             epoch: Epoch(0),
             lifecycle: Lifecycle::Running,
+            closing: None,
             attached: true,
+            leased: true,
             front: config.front,
             next_seq: Seq(1),
-            context: ContextVersion(0),
+            next_turn: TurnId(1),
+            next_gen: GenId(1),
+            participants: Bounded::new(limits.participants),
+            turns: Bounded::new(limits.open_turns),
+            generations: Bounded::new(limits.generations),
+            conversation: Conversation::default(),
+            owed: None,
+            answered: ContextVersion(0),
+        }
+    }
+
+    /// Makes a fact true. `text` is the arena the fact's text refers to.
+    ///
+    /// This only sets values. Every decision was taken before the fact was
+    /// emitted, so applying the same facts in the same order gives the
+    /// same state, in this build or a later one.
+    fn apply(&mut self, fact: &Fact, text: &TextArena) {
+        match *fact {
+            Fact::ParticipantJoined { who } => {
+                if !self.participants.contains(&who) {
+                    // A full table refuses the participant, as it did when
+                    // the fact was emitted.
+                    let _ = self.participants.push(who);
+                }
+            }
+            Fact::ParticipantLeft { who } => self.participants.retain(|known| *known != who),
+            Fact::LifecycleChanged { to, .. } => self.lifecycle = to,
+            Fact::EpochAdvanced { to, .. } => self.epoch = to,
+            Fact::TurnCommitted {
+                turn,
+                who,
+                text: words,
+                addressed,
+                ..
+            } => {
+                self.conversation
+                    .push_user_turn(turn, who, text.get(words), addressed);
+                if addressed {
+                    self.owed = Some((self.conversation.version(), LlmCause::Reply { turn }));
+                }
+                self.next_turn = self.next_turn.max(turn.next());
+            }
+            Fact::TurnDismissed { turn, .. } => {
+                self.next_turn = self.next_turn.max(turn.next());
+            }
+            Fact::UtteranceCommitted {
+                generation,
+                agent,
+                text: words,
+                truncated,
+            } => {
+                self.conversation
+                    .push_utterance(generation, agent, text.get(words), truncated);
+                self.next_gen = self.next_gen.max(generation.next());
+            }
+            // Recorded for recovery, which arrives with the tools.
+            Fact::UtteranceProgress { .. }
+            | Fact::NoticeAppended { .. }
+            | Fact::ToolProposed { .. }
+            | Fact::ToolAuthorized { .. }
+            | Fact::ToolDispatched { .. }
+            | Fact::ToolFinished { .. }
+            | Fact::BatchResolved { .. }
+            | Fact::HandoffRequested { .. }
+            | Fact::AgentActivated { .. } => {}
         }
     }
 }
@@ -114,7 +214,22 @@ impl<P: Policies> Kernel<P> {
     /// output.
     pub fn step(&mut self, now: MonoTime, event: &Event, out: &mut Out) {
         out.clear();
-        let _ = (now, event);
+        if matches!(event, Event::Control(ControlInput::LeaseLost)) {
+            // Another owner has the session. From here on this kernel
+            // neither says nor records anything.
+            self.state.leased = false;
+        }
+        if !self.state.leased || self.state.lifecycle == Lifecycle::Closed {
+            return;
+        }
+        let mut step = Step {
+            now,
+            config: &self.config,
+            policies: &self.policies,
+            state: &mut self.state,
+            out,
+        };
+        step.run(event);
     }
 
     /// A read-only look at the session.
@@ -168,8 +283,8 @@ impl<P: Policies> Kernel<P> {
                 });
             }
             state.next_seq = state.next_seq.next();
+            state.apply(&stamped.fact, text);
         }
-        let _ = text;
         Ok(Self {
             config,
             policies,
@@ -179,27 +294,50 @@ impl<P: Policies> Kernel<P> {
 
     /// Gives back memory the session is not using. For a session that is
     /// going idle; the next step reserves again.
-    pub fn park(&mut self) {}
+    pub fn park(&mut self) {
+        let state = &mut self.state;
+        state.participants.park();
+        state.turns.park();
+        state.generations.park();
+        state.conversation.park();
+    }
 
     /// Bytes of heap the kernel holds: its state and its configuration.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         let config = &self.config;
-        let lists = config
-            .agents
-            .capacity()
-            .saturating_mul(size_of::<AgentSpec>())
-            .saturating_add(
-                config
-                    .tools
-                    .capacity()
-                    .saturating_mul(size_of::<ToolSpec>()),
-            );
-        config
-            .agents
+        let state = &self.state;
+        let texts = state
+            .turns
             .iter()
-            .map(|agent| agent.tools.capacity().saturating_mul(size_of::<ToolId>()))
-            .fold(lists, usize::saturating_add)
+            .map(|open| open.text.capacity())
+            .chain(
+                state
+                    .generations
+                    .iter()
+                    .map(|running| running.planned.capacity()),
+            )
+            .chain(
+                config
+                    .agents
+                    .iter()
+                    .map(|agent| agent.tools.capacity().saturating_mul(size_of::<ToolId>())),
+            );
+        let tables = [
+            state.participants.heap_bytes(),
+            state.turns.heap_bytes(),
+            state.generations.heap_bytes(),
+            state.conversation.heap_bytes(),
+            config
+                .agents
+                .capacity()
+                .saturating_mul(size_of::<AgentSpec>()),
+            config
+                .tools
+                .capacity()
+                .saturating_mul(size_of::<ToolSpec>()),
+        ];
+        texts.chain(tables).fold(0, usize::saturating_add)
     }
 
     /// A hash of the session's state. Equal states have equal fingerprints

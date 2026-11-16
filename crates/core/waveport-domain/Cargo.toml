@@ -17,6 +17,7 @@ stability = "experimental"
 bench = false
 
 [dev-dependencies]
+waveport-alloc-counter = { workspace = true }
 waveport-kernel-sim = { workspace = true }
 
 [lints]

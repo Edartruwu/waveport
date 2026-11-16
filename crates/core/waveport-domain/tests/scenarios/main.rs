@@ -19,34 +19,34 @@ mod shutdown;
 mod spoken_text;
 mod three_party;
 
-use waveport_kernel_sim::check::{Report, unstarted};
+use waveport_kernel_sim::check::{Report, passes, pending};
 
 #[test]
 fn lost_input() -> Result<(), Report> {
-    unstarted(lost_input::lost_input)
+    passes(lost_input::lost_input)
 }
 
 #[test]
 fn backchannel_tool() -> Result<(), Report> {
-    unstarted(backchannel_tool::backchannel_tool)
+    pending(backchannel_tool::backchannel_tool)
 }
 
 #[test]
 fn spoken_text() -> Result<(), Report> {
-    unstarted(spoken_text::spoken_text)
+    passes(spoken_text::spoken_text)
 }
 
 #[test]
 fn shutdown() -> Result<(), Report> {
-    unstarted(shutdown::shutdown)
+    passes(shutdown::shutdown)
 }
 
 #[test]
 fn hybrid_front_back() -> Result<(), Report> {
-    unstarted(hybrid_front_back::hybrid_front_back)
+    pending(hybrid_front_back::hybrid_front_back)
 }
 
 #[test]
 fn three_party() -> Result<(), Report> {
-    unstarted(three_party::three_party)
+    passes(three_party::three_party)
 }

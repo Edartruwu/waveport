@@ -674,6 +674,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "gungraun",
+ "waveport-domain",
  "waveport-sim",
 ]
 
@@ -685,6 +686,7 @@ version = "0.1.0"
 name = "waveport-domain"
 version = "0.1.0"
 dependencies = [
+ "waveport-alloc-counter",
  "waveport-kernel-sim",
 ]
 
@@ -693,6 +695,7 @@ name = "waveport-kernel-sim"
 version = "0.1.0"
 dependencies = [
  "waveport-domain",
+ "waveport-sim",
 ]
 
 [[package]]

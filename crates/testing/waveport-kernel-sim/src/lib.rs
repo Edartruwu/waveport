@@ -39,12 +39,22 @@
 //! The simulated world keeps fixed time: a word takes 300 ms to say, a
 //! final transcript follows speech by 200 ms, and so on. The figures are in
 //! the `world` module and are part of what scenarios rely on.
+//!
+//! Two more modules look at the kernel from other sides:
+//!
+//! - [`invariants`] holds a monitor that checks the kernel's invariants
+//!   after every step, from the outside. Every scenario runs under it.
+//! - [`seeded`] makes up sessions from a seed, with adapters that are late,
+//!   repeat themselves, fall silent or send nonsense, and runs them under
+//!   the same monitor.
 
 pub mod check;
 mod expect;
 mod explore;
 mod failure;
+pub mod invariants;
 mod script;
+pub mod seeded;
 mod setup;
 mod sim;
 mod world;

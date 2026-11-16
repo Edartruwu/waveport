@@ -191,6 +191,11 @@ pub enum EpochCause {
     Interrupted,
     /// Another agent took the floor.
     Handoff,
+    /// A newer turn made the response out of date before any of it was
+    /// heard.
+    Superseded,
+    /// A part that was producing the output failed or stalled.
+    Failure,
     /// The session was rebuilt after a crash.
     Recovery,
     /// The session is closing.

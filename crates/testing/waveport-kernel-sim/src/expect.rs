@@ -876,7 +876,16 @@ mod tests {
         }
     }
 
+    /// A session whose kernel emits nothing, so that each test decides
+    /// what was emitted and the expectations are tested on their own.
     fn session(setup: Setup) -> Sim {
+        let mut sim = live(setup);
+        sim.silence_kernel();
+        sim
+    }
+
+    /// A session with a working kernel.
+    fn live(setup: Setup) -> Sim {
         Sim::new(setup, Rc::default())
     }
 
@@ -1294,17 +1303,47 @@ mod tests {
     }
 
     #[test]
+    fn a_working_kernel_closes_in_stages() {
+        let mut sim = live(Setup::new());
+        let caller = sim.caller();
+        // Thirty words: nine seconds of speech.
+        let long = "one two three four five six seven eight nine ten ".repeat(3);
+        sim.agent_will(say(long.trim_end()));
+        sim.says(caller, "hello");
+        let turn = sim.expect_turn(caller, "hello").unwrap();
+        let reply = sim.expect_reply(turn).unwrap();
+        sim.hears_words(reply, 2).unwrap();
+
+        // Asked to close in the middle of the answer, the session lets the
+        // agent go on for the five seconds it has to finish.
+        sim.close();
+        let asked = sim.now;
+        assert_eq!(sim.expect_lifecycle(Lifecycle::Draining), Ok(()));
+        let failure = sim.expect_closed_within(3_000).unwrap_err();
+        assert!(failure.found.contains("still Draining"), "{failure}");
+        assert_eq!((failure.ordinal, failure.at_ms), (5, asked + 3_000));
+        assert_eq!(sim.expect_closed_within(5_000), Ok(()));
+        assert_eq!(sim.now, asked + 5_000);
+        assert_eq!(sim.expect_lifecycle(Lifecycle::Closed), Ok(()));
+        assert_eq!(sim.expect_interrupted(reply), Ok(()));
+        assert_eq!(sim.finish(), Ok(()));
+    }
+
+    #[test]
     fn a_race_runs_the_scenario_once_for_every_order() {
         let explored = explore(|lab| {
             let mut sim = lab.sim(Setup::new());
             let caller = sim.caller();
-            // The end of the speech can arrive before, between or after the
-            // two transcripts, which keep their own order.
+            sim.agent_will(say("Hello."));
+            // Four reports are on their way: an interim and a final
+            // transcript, in that order, and the end of the speech followed
+            // by the estimate that it asks for.
             sim.says(caller, "hello there");
             sim.race()?;
-            if sim.now == 0 { Ok(()) } else { sim.finish() }
+            sim.expect_turn(caller, "hello there")?;
+            sim.finish()
         });
-        assert_eq!(explored, Ok(Explored { paths: 3 }));
+        assert_eq!(explored, Ok(Explored { paths: 6 }));
     }
 
     #[test]

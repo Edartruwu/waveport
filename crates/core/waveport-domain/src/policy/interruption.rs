@@ -34,9 +34,12 @@ pub trait InterruptionPolicy {
     fn decide(&self, input: &OverlapInput) -> OverlapDecision;
 }
 
-/// Follows the classifier's verdict when there is one, and otherwise judges
-/// by voice activity alone: speech that lasts is a barge-in, speech that
-/// stops early was a backchannel.
+/// Follows the classifier's verdict when there is one. Without one it waits
+/// for `min_speech` and then judges by voice activity alone: speech that is
+/// still going on is a barge-in, speech that has stopped was a backchannel.
+///
+/// The wait also applies when the speech stops early, so that a verdict
+/// that is on its way is not pre-empted by a guess.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VoiceActivityInterruption {
     /// How long overlapping speech must last, without a verdict, to count
@@ -57,10 +60,10 @@ impl InterruptionPolicy for VoiceActivityInterruption {
         match input.verdict {
             Some(OverlapVerdict::BargeIn) => OverlapDecision::Interrupt,
             Some(OverlapVerdict::Backchannel | OverlapVerdict::Noise) => OverlapDecision::Resume,
-            None if !input.speaking => OverlapDecision::Resume,
             None => match self.min_speech.checked_sub(input.elapsed) {
                 Some(left) if !left.is_zero() => OverlapDecision::Wait(left),
-                _ => OverlapDecision::Interrupt,
+                _ if input.speaking => OverlapDecision::Interrupt,
+                _ => OverlapDecision::Resume,
             },
         }
     }
@@ -97,6 +100,16 @@ mod tests {
             OverlapDecision::Wait(Duration::from_millis(300))
         );
         assert_eq!(decide(None, true, 500), OverlapDecision::Interrupt);
-        assert_eq!(decide(None, false, 200), OverlapDecision::Resume);
+    }
+
+    #[test]
+    fn without_a_verdict_speech_that_stopped_was_a_backchannel() {
+        // Not before the verdict has had its time to arrive.
+        assert_eq!(
+            decide(None, false, 200),
+            OverlapDecision::Wait(Duration::from_millis(300))
+        );
+        assert_eq!(decide(None, false, 500), OverlapDecision::Resume);
+        assert_eq!(decide(None, false, 900), OverlapDecision::Resume);
     }
 }

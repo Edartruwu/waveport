@@ -12,13 +12,15 @@
 //!
 //! This library holds the workloads, so that both kinds measure the same code.
 
+pub mod kernel;
+
 use waveport_sim::{Seed, SimRng};
 
 /// The smoke workload: draws 1024 numbers from the simulation's generator
 /// and folds them together.
 ///
-/// It exists to prove both harnesses work before there is product code to
-/// measure. Benchmarks of the session kernel replace it.
+/// It exists to prove that both harnesses work, whatever the product code
+/// does.
 #[must_use]
 pub fn smoke(seed: u64) -> u64 {
     let mut rng = SimRng::new(Seed(seed));
