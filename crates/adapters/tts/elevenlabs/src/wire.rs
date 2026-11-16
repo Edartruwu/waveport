@@ -70,7 +70,9 @@ struct Incoming {
 }
 
 /// The characters spoken in a piece of audio, and when each begins and
-/// how long it lasts, in milliseconds from where that piece begins.
+/// how long it lasts, in milliseconds on a clock of the provider's that
+/// begins with the speech of the response and runs on from one piece to
+/// the next.
 #[derive(Debug, Default, Deserialize)]
 struct Alignment {
     #[serde(default)]
@@ -283,7 +285,7 @@ impl Speaking {
         }
         self.heard = true;
         // Where this piece of audio begins in all the audio of the
-        // speech: its characters are timed from there.
+        // speech, and where it ends.
         let begins = self.rate.length_of(self.bytes / 2);
         if !audio.is_empty() {
             let piece = read_base64(&audio)?;
@@ -293,15 +295,25 @@ impl Speaking {
                 out.push(TtsEvent::Audio(pcm));
             }
         }
+        let ends = self.rate.length_of(self.bytes / 2);
         if let Some(Alignment {
             chars,
             starts,
             lengths,
         }) = incoming.alignment
         {
+            // The provider times the characters on a clock of its own,
+            // which begins with the speech and runs a little ahead of
+            // the audio it sends: the characters of a piece begin where
+            // those of the piece before ended on that clock, some
+            // milliseconds past the end of that piece's audio. So a
+            // character is placed by how far into its piece the provider
+            // says it is, from where the audio of the piece begins, and
+            // never past the audio there is.
+            let origin = starts.first().copied().unwrap_or_default();
             for ((spoken, start), long) in chars.iter().zip(starts).zip(lengths) {
-                let ends = begins.saturating_add(length(start + long));
-                self.spoken(spoken, ends, out);
+                let into = length((start - origin).max(0.0) + long);
+                self.spoken(spoken, begins.saturating_add(into).min(ends), out);
             }
         }
         // The provider says that a context is over when it has been told
@@ -375,7 +387,8 @@ mod tests {
     }
 
     /// A message that carries `millis` of audio for `context`, in which
-    /// `text` is spoken, a character every 10 ms from `from` on.
+    /// `text` is spoken, a character every 10 ms from `from` on the
+    /// provider's clock, which begins with the speech.
     fn audio(context: &str, millis: u32, text: &str, from: u32) -> String {
         let samples = vec![100_i16; Rate::Hz16000.samples_in_millis(millis)];
         let mut data = String::new();
@@ -455,13 +468,15 @@ mod tests {
         speaking.speak("you.").unwrap();
         speaking.finish().unwrap();
         let mut out = Vec::new();
-        // The first piece of audio: 100 ms, with the space the speech was
-        // begun with and then "Hi," in it.
-        let first = audio("ctx-1", 100, " Hi,", 20);
+        // The first piece of audio: 100 ms, in which "Hi, " is spoken
+        // from the beginning.
+        let first = audio("ctx-1", 100, "Hi, ", 0);
         assert_eq!(speaking.heard(&first, &mut out).unwrap(), Heard::More);
-        // The second: 200 ms, whose characters are timed from where it
-        // begins, which is 100 ms into the speech.
-        let second = audio("ctx-1", 200, " you.", 5);
+        // The second: 200 ms, which begin 100 ms into the speech. The
+        // provider's clock goes on from the first piece and is a little
+        // ahead of the audio by now, at 106 ms. It adds a space of its
+        // own at the end of what it was given, which is not of the text.
+        let second = audio("ctx-1", 200, "you. ", 106);
         assert_eq!(speaking.heard(&second, &mut out).unwrap(), Heard::More);
         assert_eq!(
             speaking.heard(&over("ctx-1"), &mut out).unwrap(),
@@ -472,18 +487,31 @@ mod tests {
         assert_eq!(
             rest,
             [
-                // The space at the beginning is not of the text.
-                mark(1, 40),
-                mark(2, 50),
-                mark(3, 60),
-                mark(4, 115),
-                mark(5, 125),
-                mark(6, 135),
-                mark(7, 145),
-                mark(8, 155),
+                mark(1, 10),
+                mark(2, 20),
+                mark(3, 30),
+                mark(4, 40),
+                mark(5, 110),
+                mark(6, 120),
+                mark(7, 130),
+                mark(8, 140),
                 TtsEvent::Done,
             ]
         );
+    }
+
+    #[test]
+    fn a_character_is_never_placed_past_the_audio_there_is() {
+        let mut speaking = speaking();
+        speaking.speak("abcd").unwrap();
+        let mut out = Vec::new();
+        // The provider's clock runs past the end of the audio it sends:
+        // 25 ms of audio, and four characters of 10 ms each.
+        speaking
+            .heard(&audio("ctx-1", 25, "abcd", 0), &mut out)
+            .unwrap();
+        let (rest, _) = told(&out);
+        assert_eq!(rest, [mark(1, 10), mark(2, 20), mark(3, 25), mark(4, 25)]);
     }
 
     #[test]
@@ -539,10 +567,16 @@ mod tests {
         speaking.speak("abc").unwrap();
         let mut out = Vec::new();
         // The provider's times go back within a piece.
-        let odd = "{\"audio\":\"\",\"contextId\":\"ctx-1\",\"alignment\":{\"chars\":[\"a\",\"b\",\
-                   \"c\"],\"charStartTimesMs\":[50,10,-70],\"charDurationsMs\":[10,10,10]}}";
-        speaking.heard(odd, &mut out).unwrap();
-        assert_eq!(out, [mark(1, 60), mark(2, 60), mark(3, 60)]);
+        let samples = vec![100_i16; Rate::Hz16000.samples_in_millis(100)];
+        let mut data = String::new();
+        write_base64(&samples, &mut data);
+        let odd = format!(
+            "{{\"audio\":\"{data}\",\"contextId\":\"ctx-1\",\"alignment\":{{\"chars\":[\"a\",\
+             \"b\",\"c\"],\"charStartTimesMs\":[50,10,-70],\"charDurationsMs\":[60,10,10]}}}}"
+        );
+        speaking.heard(&odd, &mut out).unwrap();
+        let (rest, _) = told(&out);
+        assert_eq!(rest, [mark(1, 60), mark(2, 60), mark(3, 60)]);
     }
 
     #[test]

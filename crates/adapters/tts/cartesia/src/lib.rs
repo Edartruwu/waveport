@@ -8,13 +8,14 @@
 //! with the time each word ends at, which is what lets a response that is
 //! interrupted be cut at the word the listener heard.
 //!
-//! **This adapter was written from the provider's documentation as it
-//! stood on 15 November 2026, and has not yet been held against the
-//! provider.** The tests replay messages in the documented shapes, made
-//! up here; none of them was recorded. The tests named `live_*` are the
-//! ones that will tell, once there is a key to run them with.
+//! **This adapter was written from the provider's documentation, and
+//! was held against the provider on 16 November 2026**, with the model
+//! `sonic-3.6`. It needed no change. What the provider sent then for two
+//! sentences is in `tests/fixtures`, and a test replays it. The tests
+//! named `live_*` ask the provider again.
 //!
-//! What the documentation says, and the adapter is built around:
+//! What the adapter is built around, as the documentation has it and as
+//! the provider did:
 //!
 //! - The provider calls the speech of one response a context. Text is
 //!   added to a context by its name, and joined exactly as it is given:
@@ -25,6 +26,9 @@
 //!   ([`Config::max_buffer_delay_ms`]).
 //! - A context ends when it is told that no more text follows, and the
 //!   provider says `done` when all its audio has been sent.
+//! - The words come in messages of their own, one or a few at a time,
+//!   apart from the audio they are in. Their times count through the
+//!   speech, and none was past the audio there was.
 //! - A context that is cancelled goes on with the piece it is speaking.
 //!   So a response that is abandoned takes its connection with it:
 //!   closing the connection is the one way to be sure that nothing more
