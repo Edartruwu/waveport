@@ -3,13 +3,22 @@
 machine = "core-ultra-7-155h"
 
 [measured]
-"density.ratio" = 1.271
-"density.reference_drift" = 1.001
+"density.ratio" = 1.3171
+"density.reference_drift" = 1.004
 "density.reference_ms" = 4.471
 "density.sessions" = 50
-"density.sessions_per_thread" = 176
-"density.share_percent" = 0.5682
-"poll.longest_ms" = 1.861
-"poll.over_budget_share" = 0.02524
-"start.p50_ms" = 0.124
-"start.p99_ms" = 0.425
+"density.sessions_per_thread" = 170
+"density.share_percent" = 0.5889
+"poll.longest_ms" = 1.471
+"poll.over_budget_share" = 0.02927
+"start.p50_ms" = 0.155
+"start.p99_ms" = 0.482
+"turn.answering.max_ms" = 0.108
+"turn.answering.p50_ms" = 0.026
+"turn.answering.p99_ms" = 0.103
+"turn.phrasing.max_ms" = 0
+"turn.phrasing.p50_ms" = 0
+"turn.phrasing.p99_ms" = 0
+"turn.sending.max_ms" = 0
+"turn.sending.p50_ms" = 0
+"turn.sending.p99_ms" = 0

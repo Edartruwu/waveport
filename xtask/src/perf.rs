@@ -31,6 +31,9 @@ const MEASURE: &[&str] = &[
     "--",
     "--ignored",
     "--nocapture",
+    // One measurement at a time: two would measure each other.
+    "--test-threads",
+    "1",
 ];
 
 /// How many times a check measures before it says that a machine does

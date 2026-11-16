@@ -10,8 +10,8 @@
 # Who reads this file:
 #   benches/tests/latency.rs   [latency], on every pull request
 #   benches/tests/memory.rs    [memory] and [soak], on every pull request
-#   benches/tests/load.rs      [density], every night and by hand
-#   cargo xtask perf           [density] and [local], by hand
+#   benches/tests/load.rs      [density], every night
+#   cargo xtask perf           [local], by hand, on one machine
 
 # How long the parts of a turn take in the session's own time, in
 # milliseconds, when every provider answers at once: what is left is this
@@ -65,8 +65,19 @@ tolerance = 0.15
 # held to its target below, which is ten times what is measured.
 held = ["density.share_percent", "density.ratio"]
 
-# The numbers that are held to a target of the design as well, whatever
-# the record says: a session starts in 2 ms, and 99 in a hundred in 10 ms.
+# The numbers that are held to a target of the design, whatever the
+# record says. A session starts in 2 ms, and 99 in a hundred in 10 ms.
+# And the parts of a turn, in real time and by the marks the sessions
+# make, while fifty sessions share a shard and the providers answer at
+# once: the same three parts that [latency] holds on a clock the test
+# controls. There they are a wait that is not there; here they are the
+# time a session takes to be run.
 [local.targets]
 "start.p50_ms" = 2.0
 "start.p99_ms" = 10.0
+"turn.answering.p50_ms" = 5.0
+"turn.answering.p99_ms" = 15.0
+"turn.phrasing.p50_ms" = 0.2
+"turn.phrasing.p99_ms" = 1.0
+"turn.sending.p50_ms" = 2.0
+"turn.sending.p99_ms" = 10.0

@@ -118,8 +118,9 @@ jobs:
   # runtime, in real time. A share of a thread says as much about the
   # runner as about the code, so it is divided by what a piece of
   # reference work takes in the same run, and that ratio is what is held
-  # to `perf/targets.toml`. The numbers themselves are checked on a
-  # machine that is left alone, with `cargo xtask perf check`.
+  # to `perf/targets.toml`. How long the parts of a turn take in real
+  # time is measured and printed as well. The numbers themselves are
+  # checked on a machine that is left alone, with `cargo xtask perf check`.
   density:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -131,4 +132,4 @@ jobs:
       - name: cargo test --release -p waveport-benches --test load
         env:
           WAVEPORT_PERF_GATE: "1"
-        run: cargo test --release --locked -p waveport-benches --test load -- --ignored --nocapture
+        run: cargo test --release --locked -p waveport-benches --test load -- --ignored --nocapture --test-threads 1

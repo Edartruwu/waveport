@@ -21,10 +21,15 @@
 //! (`docs/decisions/0001-density-spike.md`), and everything a real
 //! provider's adapter does with a real connection.
 //!
-//! The test is left out of an ordinary test run:
+//! A second measurement, `turns`, runs the same fifty calls with
+//! providers that answer at once, and says how long the parts of a turn
+//! take in real time by the marks the sessions make.
+//!
+//! Both are left out of an ordinary test run, and run one after the
+//! other so that neither measures the other:
 //!
 //! ```text
-//! cargo test --release -p waveport-benches --test load -- --ignored --nocapture
+//! cargo test --release -p waveport-benches --test load -- --ignored --nocapture --test-threads 1
 //! ```
 
 #![expect(
@@ -34,6 +39,7 @@
 )]
 
 use core::time::Duration;
+use std::sync::Arc;
 use std::time::Instant;
 
 use waveport_adapter_kit::turns::{Spread, What};
@@ -46,10 +52,12 @@ use waveport_media::codec::{Decoder, Encoder};
 use waveport_ports::audio::{Codec, Rate};
 use waveport_ports::journal::SessionId;
 use waveport_runtime::session::Ended;
-use waveport_runtime::shard::{Exit, Runtime, RuntimeConfig};
+use waveport_runtime::shard::{Exit, Runtime, RuntimeConfig, ShardStats};
 use waveport_testkit::fakes::tts::tone;
 
 const ANSWERING: What = What::Answering(TurnId(0), GenId(0));
+const PHRASING: What = What::Phrasing(GenId(0));
+const SENDING: What = What::Sending(GenId(0));
 
 /// A whole number from the environment, or `usual`.
 fn from_env(name: &str, usual: u32) -> u32 {
@@ -90,26 +98,34 @@ fn ms(length: Duration) -> f64 {
     length.as_secs_f64() * 1_000.0
 }
 
-#[test]
-#[ignore = "a measurement in real time, made every night and by `cargo xtask perf`"]
-fn density() {
-    let sessions = from_env("WAVEPORT_PERF_SESSIONS", 50);
-    let questions = from_env("WAVEPORT_PERF_QUESTIONS", 2);
-    let script = Script {
-        answer: STORY,
-        every: Duration::from_secs(14),
-        ..Script::asking(questions, Codec::Opus, Delays::USUAL)
-    };
-    let before = reference();
+/// What a run of calls on one shard of the runtime came to.
+struct Run {
+    /// The share of the shard's thread that one session took, from two
+    /// seconds into the run to two seconds before its end.
+    share: f64,
+    /// The share of the runs of a session that went over the budget.
+    over: f64,
+    /// The longest run of a session.
+    longest: Duration,
+    /// How long each session took to start.
+    starts: Vec<Duration>,
+}
 
-    let watch = Watch::counting();
-    let shared = Shared::new(script, &watch);
+/// What the one shard of `runtime` has run so far.
+fn the_shard(runtime: &Runtime) -> ShardStats {
+    *runtime.stats().first().unwrap()
+}
+
+/// Runs `sessions` calls at once, each as `script` says, on one shard
+/// of the runtime and in real time, to their ends.
+fn run(script: Script, sessions: u32, watch: &Arc<Watch>) -> Run {
+    let shared = Shared::new(script, watch);
     let runtime = Runtime::new(RuntimeConfig::default()).unwrap();
     let clock = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap();
-    let (share, over, longest, mut starts) = clock.block_on(async {
+    clock.block_on(async {
         let mut started = Vec::new();
         let mut starts = Vec::new();
         for n in 0..sessions {
@@ -123,20 +139,44 @@ fn density() {
         }
         // The first two seconds are left out: the sessions settle in.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let (from, at) = (runtime.stats()[0], Instant::now());
+        let (from, at) = (the_shard(&runtime), Instant::now());
         tokio::time::sleep(script.length().saturating_sub(Duration::from_secs(4))).await;
-        let (to, passed) = (runtime.stats()[0], at.elapsed());
+        let (to, passed) = (the_shard(&runtime), at.elapsed());
         assert_eq!(to.sessions, usize::try_from(sessions).unwrap());
         for call in started {
             assert_eq!(call.exit().await, Exit::Ended(Ended::Closed));
         }
         let busy = to.busy.saturating_sub(from.busy);
-        let share = busy.as_secs_f64() / passed.as_secs_f64() / f64::from(sessions);
         let runs = to.polls - from.polls;
         #[expect(clippy::cast_precision_loss, reason = "counts of runs that fit easily")]
         let over = (to.over_budget - from.over_budget) as f64 / runs.max(1) as f64;
-        (share, over, to.longest, starts)
-    });
+        Run {
+            share: busy.as_secs_f64() / passed.as_secs_f64() / f64::from(sessions),
+            over,
+            longest: to.longest,
+            starts,
+        }
+    })
+}
+
+#[test]
+#[ignore = "a measurement in real time, made every night and by `cargo xtask perf`"]
+fn density() {
+    let sessions = from_env("WAVEPORT_PERF_SESSIONS", 50);
+    let questions = from_env("WAVEPORT_PERF_QUESTIONS", 2);
+    let script = Script {
+        answer: STORY,
+        every: Duration::from_secs(14),
+        ..Script::asking(questions, Codec::Opus, Delays::USUAL)
+    };
+    let before = reference();
+    let watch = Watch::counting();
+    let Run {
+        share,
+        over,
+        longest,
+        mut starts,
+    } = run(script, sessions, &watch);
     let after = reference();
 
     // Every call ended as it should, and every question was answered.
@@ -178,5 +218,34 @@ fn density() {
             "a session takes {ratio:.3} times the reference work, and perf/targets.toml holds \
              it to {held} with {tolerance} to spare"
         );
+    }
+}
+
+/// How long the parts of a turn take in real time, by the marks the
+/// sessions themselves make, while fifty of them share a shard. The
+/// providers answer at once, so that what is left is this project's own
+/// share: the time a session waits for its shard to run it, and for the
+/// tick that paces what it sends.
+#[test]
+#[ignore = "a measurement in real time, made every night and by `cargo xtask perf`"]
+fn turns() {
+    let sessions = from_env("WAVEPORT_PERF_SESSIONS", 50);
+    let questions = from_env("WAVEPORT_PERF_QUESTIONS", 2);
+    let script = Script::asking(questions, Codec::Opus, Delays::NONE);
+    let watch = Watch::keeping();
+    let _ = run(script, sessions, &watch);
+
+    assert_eq!(watch.closed(), u64::from(sessions));
+    let answers = u64::from(sessions) * u64::from(questions);
+    for (name, what) in [
+        ("answering", ANSWERING),
+        ("phrasing", PHRASING),
+        ("sending", SENDING),
+    ] {
+        assert_eq!(watch.counted(&what), answers, "{name}");
+        let spread = watch.spread(&what).unwrap();
+        println!("PERF turn.{name}.p50_ms={:.3}", ms(spread.p50));
+        println!("PERF turn.{name}.p99_ms={:.3}", ms(spread.p99));
+        println!("PERF turn.{name}.max_ms={:.3}", ms(spread.max));
     }
 }
