@@ -57,6 +57,12 @@ const SHARE: &str = "density.share_percent";
 /// Where the gates' numbers are, from the root of the repository.
 const TARGETS: &str = "perf/targets.toml";
 
+/// Where the system says how the machine is powered.
+const POWER: &str = "/sys/class/power_supply";
+
+/// Where the system says how the speed of each processor is governed.
+const PROCESSORS: &str = "/sys/devices/system/cpu";
+
 /// Runs `record` or `check`.
 pub(crate) fn run(args: &[String]) -> Result<bool> {
     let mut args = Args::new(args);
@@ -81,13 +87,20 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
         .join(format!("{machine}.toml"));
     match rest.as_slice() {
         [what] if what == "record" => {
+            let rules = rules(&workspace.root)?;
             let measured = measure(&workspace.root, cpu)?;
-            steady(&measured, &rules(&workspace.root)?)?;
+            // Later measurements are held to a record, so it is made on
+            // a steadier machine than a check asks for.
+            steady(&measured, rules.record_drift)?;
             if let Some(folder) = file.parent() {
                 std::fs::create_dir_all(folder)
                     .context(format!("could not make {}", folder.display()))?;
             }
-            std::fs::write(&file, written(&machine, cpu, &measured))
+            let state = State {
+                power: power(Path::new(POWER)).map(str::to_owned),
+                scaling: scaling(Path::new(PROCESSORS), cpu),
+            };
+            std::fs::write(&file, written(&machine, cpu, &state, &measured))
                 .context(format!("could not write {}", file.display()))?;
             println!(
                 "perf: recorded {} numbers in {}",
@@ -97,7 +110,11 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
             Ok(true)
         }
         [what] if what == "check" => {
-            let (pinned, recorded) = recorded(&file)?;
+            let Record {
+                cpu: pinned,
+                state: then,
+                measured: recorded,
+            } = recorded(&file)?;
             if cpu.is_some() && cpu != pinned {
                 // A check on another processor than the record's, or on
                 // one when the record was made on any, compares two
@@ -112,9 +129,13 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
                 )));
             }
             let rules = rules(&workspace.root)?;
+            // Before a minute is spent measuring what cannot be compared.
+            let now = scaling(Path::new(PROCESSORS), pinned);
+            governed_alike(then.scaling.as_deref(), now.as_deref())?;
+            let powers = (then.power.as_deref(), power(Path::new(POWER)));
             let mut measured = measure(&workspace.root, pinned)?;
-            steady(&measured, &rules)?;
-            as_recorded(&recorded, &measured, &rules)?;
+            steady(&measured, rules.tolerance)?;
+            as_recorded(&recorded, &measured, powers, &rules)?;
             let mut tries = 1;
             loop {
                 let (table, held) = compare(&recorded, &measured, &rules);
@@ -135,8 +156,8 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
                 // something costs it every time.
                 println!("perf: worse than the record allows, so once more");
                 let again = measure(&workspace.root, pinned)?;
-                steady(&again, &rules)?;
-                as_recorded(&recorded, &again, &rules)?;
+                steady(&again, rules.tolerance)?;
+                as_recorded(&recorded, &again, powers, &rules)?;
                 measured = better(measured, again);
                 tries += 1;
             }
@@ -152,6 +173,9 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
 struct Rules {
     /// How much worse than its record a number may be, as a share of it.
     tolerance: f64,
+    /// How much longer the reference work may take at one end of the run
+    /// than at the other when a record is made, as a share of it.
+    record_drift: f64,
     /// The numbers that are held to their record. Less is better for
     /// every one of them.
     held: Vec<String>,
@@ -166,7 +190,7 @@ fn rules(root: &Path) -> Result<Rules> {
         std::fs::read_to_string(&file).context(format!("could not read {}", file.display()))?;
     rules_from(&text).ok_or_else(|| {
         Error::new(format!(
-            "{} has no [local] with `tolerance`, `held` and [local.targets]",
+            "{} has no [local] with `tolerance`, `record_drift`, `held` and [local.targets]",
             file.display()
         ))
     })
@@ -179,6 +203,7 @@ fn rules_from(text: &str) -> Option<Rules> {
     let targets = local.get("targets")?.as_table()?;
     Some(Rules {
         tolerance: local.get("tolerance")?.as_float()?,
+        record_drift: local.get("record_drift")?.as_float()?,
         held: held
             .iter()
             .filter_map(|name| name.as_str().map(str::to_owned))
@@ -261,12 +286,106 @@ fn parse(printed: &str) -> BTreeMap<String, f64> {
 
 /// Refuses numbers that were measured while the machine changed its
 /// speed: the reference work took longer at one end of the run than at
-/// the other by more than the tolerance.
-fn steady(measured: &BTreeMap<String, f64>, rules: &Rules) -> Result<()> {
+/// the other by more than `allowed`, as a share of it. A record is
+/// allowed less than a check.
+fn steady(measured: &BTreeMap<String, f64>, allowed: f64) -> Result<()> {
     match measured.get("density.reference_drift") {
-        Some(drift) if *drift > 1.0 + rules.tolerance => Err(Error::new(format!(
-            "the reference work took {drift:.2} times as long at one end of the run as at the \
-             other: the machine was not left alone. Measure again"
+        Some(drift) if *drift > 1.0 + allowed => Err(Error::new(format!(
+            "the reference work took {drift:.3} times as long at one end of the run as at the \
+             other, and {:.2} is allowed: the machine was not left alone. Measure again",
+            1.0 + allowed
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// How the machine is powered, as the system says under `supplies`:
+/// `mains` when something that is not a battery supplies it, `battery`
+/// when nothing does and it has one. Nothing where the system does not
+/// say, as on a machine without a battery.
+fn power(supplies: &Path) -> Option<&'static str> {
+    let mut battery = false;
+    for supply in std::fs::read_dir(supplies).ok()?.flatten() {
+        let said = |what: &str| {
+            let text = std::fs::read_to_string(supply.path().join(what)).unwrap_or_default();
+            text.trim().to_owned()
+        };
+        // The battery of a mouse or a keyboard powers nothing here.
+        if said("scope") == "Device" {
+            continue;
+        }
+        if said("type") == "Battery" {
+            battery = true;
+        } else if said("online") == "1" {
+            return Some("mains");
+        }
+    }
+    battery.then_some("battery")
+}
+
+/// What to say of how a machine was powered for its record and is
+/// powered now, where the system said both.
+fn powers_said(powers: (Option<&str>, Option<&str>)) -> String {
+    let spoken = |power: &str| match power {
+        "battery" => "its battery",
+        _ => "mains power",
+    };
+    match powers {
+        (Some(then), Some(now)) if then == now => {
+            format!(" It is on {} now, as it was then.", spoken(now))
+        }
+        (Some(then), Some(now)) => format!(
+            " Its record was made on {}, and it is on {} now.",
+            spoken(then),
+            spoken(now)
+        ),
+        _ => String::new(),
+    }
+}
+
+/// How the speed of a processor is governed, as the system says under
+/// `processors`: its governor, and after a stroke its preference between
+/// energy and speed where it has one. It is asked of the processor the
+/// measurement is kept on, or of the first. Nothing where the system
+/// does not say.
+fn scaling(processors: &Path, cpu: Option<u32>) -> Option<String> {
+    let folder = processors
+        .join(format!("cpu{}", cpu.unwrap_or(0)))
+        .join("cpufreq");
+    let said = |what: &str| {
+        let text = std::fs::read_to_string(folder.join(what)).unwrap_or_default();
+        text.trim().to_owned()
+    };
+    let governor = said("scaling_governor");
+    if governor.is_empty() {
+        return None;
+    }
+    let preference = said("energy_performance_preference");
+    Some(if preference.is_empty() {
+        governor
+    } else {
+        format!("{governor}/{preference}")
+    })
+}
+
+/// Refuses to hold a machine to a record that was made with the speed of
+/// its processor governed otherwise than it is now.
+///
+/// How long the reference work takes does not tell the two apart, and
+/// what a session takes does. The reference work runs on, and a
+/// processor that saves energy is at speed for it soon enough. A session
+/// works in bursts of a fraction of a millisecond, and is done before
+/// the processor is. The laptop these records began with takes the same
+/// time over the reference work either way, and a quarter more of a
+/// thread for a session when its power profile is the balanced one.
+fn governed_alike(then: Option<&str>, now: Option<&str>) -> Result<()> {
+    match (then, now) {
+        (Some(then), Some(now)) if then != now => Err(Error::new(format!(
+            "the speed of this machine's processor is governed as `{now}` now, and was as \
+             `{then}` when its record was made (the governor, and its preference between \
+             energy and speed): a session works in bursts, and what it takes of a thread \
+             cannot be compared between the two. Set it as it was, which a power profile \
+             does where there are such, or make a new record with `cargo xtask perf record`"
         ))),
         _ => Ok(()),
     }
@@ -282,9 +401,13 @@ fn steady(measured: &BTreeMap<String, f64>, rules: &Rules) -> Result<()> {
 /// Held to a record made when it was fast, it would fail for no change
 /// in the code; held to one made when it was slow, it would pass
 /// whatever the change.
+///
+/// `powers` are how the machine was powered for its record and how it is
+/// powered now, which the refusal says where both are known.
 fn as_recorded(
     recorded: &BTreeMap<String, f64>,
     measured: &BTreeMap<String, f64>,
+    powers: (Option<&str>, Option<&str>),
     rules: &Rules,
 ) -> Result<()> {
     let (Some(then), Some(now)) = (recorded.get(REFERENCE), measured.get(REFERENCE)) else {
@@ -294,8 +417,9 @@ fn as_recorded(
         return Err(Error::new(format!(
             "the reference work takes this machine {now} ms now and took it {then} ms when its \
              record was made: it is not in the state it was recorded in (its power, its heat, \
-             or what else it is doing). Bring it back to that state, or make a new record with \
-             `cargo xtask perf record`"
+             or what else it is doing).{} Bring it back to that state, or make a new record \
+             with `cargo xtask perf record`",
+            powers_said(powers)
         )));
     }
     Ok(())
@@ -311,7 +435,12 @@ fn better(one: BTreeMap<String, f64>, other: BTreeMap<String, f64>) -> BTreeMap<
 }
 
 /// The record of a machine, as it is written.
-fn written(machine: &str, cpu: Option<u32>, measured: &BTreeMap<String, f64>) -> String {
+fn written(
+    machine: &str,
+    cpu: Option<u32>,
+    state: &State,
+    measured: &BTreeMap<String, f64>,
+) -> String {
     let mut text = format!(
         "# The numbers of one machine, recorded by `cargo xtask perf record`.\n\
          # `cargo xtask perf check` holds the same machine to them.\n\
@@ -323,6 +452,20 @@ fn written(machine: &str, cpu: Option<u32>, measured: &BTreeMap<String, f64>) ->
             "# The processor the measurement was kept on, and a check is kept on.\ncpu = {cpu}"
         );
     }
+    if let Some(power) = &state.power {
+        let _ = writeln!(
+            text,
+            "# How the machine was powered: on `mains`, or on its `battery`.\npower = \"{power}\""
+        );
+    }
+    if let Some(scaling) = &state.scaling {
+        let _ = writeln!(
+            text,
+            "# How the speed of that processor was governed: its governor, and its\n\
+             # preference between energy and speed. A check is made with the same.\n\
+             scaling = \"{scaling}\""
+        );
+    }
     text.push_str("\n[measured]\n");
     for (name, value) in measured {
         let _ = writeln!(text, "\"{name}\" = {value}");
@@ -330,9 +473,27 @@ fn written(machine: &str, cpu: Option<u32>, measured: &BTreeMap<String, f64>) ->
     text
 }
 
-/// Reads the record of a machine: the processor its measurement was
-/// kept on, if it was kept on one, and the numbers.
-fn recorded(file: &Path) -> Result<(Option<u32>, BTreeMap<String, f64>)> {
+/// The state a machine was in when its record was made, as far as the
+/// system said.
+#[derive(Debug, Default, PartialEq)]
+struct State {
+    /// How it was powered: on `mains` or on its `battery`.
+    power: Option<String>,
+    /// How the speed of its processor was governed.
+    scaling: Option<String>,
+}
+
+/// The record of a machine, as it is read.
+#[derive(Debug, PartialEq)]
+struct Record {
+    /// The processor its measurement was kept on, if it was kept on one.
+    cpu: Option<u32>,
+    state: State,
+    measured: BTreeMap<String, f64>,
+}
+
+/// Reads the record of a machine.
+fn recorded(file: &Path) -> Result<Record> {
     let text = std::fs::read_to_string(file).context(format!(
         "{} is not there (`cargo xtask perf record` makes it)",
         file.display()
@@ -346,11 +507,25 @@ fn recorded(file: &Path) -> Result<(Option<u32>, BTreeMap<String, f64>)> {
         .get("cpu")
         .and_then(toml::Value::as_integer)
         .and_then(|cpu| u32::try_from(cpu).ok());
+    let said = |what: &str| {
+        table
+            .get(what)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    let state = State {
+        power: said("power"),
+        scaling: said("scaling"),
+    };
     let measured = measured
         .iter()
         .filter_map(|(name, value)| Some((name.clone(), number(value)?)))
         .collect();
-    Ok((cpu, measured))
+    Ok(Record {
+        cpu,
+        state,
+        measured,
+    })
 }
 
 /// Holds what was measured against the record and the targets. Returns
@@ -450,8 +625,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Rules, as_recorded, better, command, compare, parse, recorded, rules_from, slug, steady,
-        written,
+        Record, Rules, State, as_recorded, better, command, compare, governed_alike, parse, power,
+        recorded, rules_from, scaling, slug, steady, written,
     };
 
     fn numbers(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
@@ -464,6 +639,7 @@ mod tests {
     fn rules() -> Rules {
         Rules {
             tolerance: 0.15,
+            record_drift: 0.02,
             held: vec![
                 "density.share_percent".to_owned(),
                 "start.p50_ms".to_owned(),
@@ -504,11 +680,32 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("waveport-perf-{}", std::process::id()));
         let file = folder.join("core-ultra-7-155h.toml");
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(&file, written("core-ultra-7-155h", None, &measured)).unwrap();
-        assert_eq!(recorded(&file).unwrap(), (None, measured.clone()));
-        // And with the processor it was measured on.
-        std::fs::write(&file, written("core-ultra-7-155h", Some(6), &measured)).unwrap();
-        assert_eq!(recorded(&file).unwrap(), (Some(6), measured));
+        let silent = State::default();
+        std::fs::write(
+            &file,
+            written("core-ultra-7-155h", None, &silent, &measured),
+        )
+        .unwrap();
+        let plain = Record {
+            cpu: None,
+            state: State::default(),
+            measured: measured.clone(),
+        };
+        assert_eq!(recorded(&file).unwrap(), plain);
+        // And with the processor it was measured on, and the state the
+        // machine was in.
+        let state = State {
+            power: Some("mains".to_owned()),
+            scaling: Some("powersave/performance".to_owned()),
+        };
+        let text = written("core-ultra-7-155h", Some(6), &state, &measured);
+        std::fs::write(&file, text).unwrap();
+        let whole = Record {
+            cpu: Some(6),
+            state,
+            measured,
+        };
+        assert_eq!(recorded(&file).unwrap(), whole);
         let _ = std::fs::remove_dir_all(&folder);
 
         // A machine that was never recorded is told how to be.
@@ -574,10 +771,94 @@ mod tests {
     #[test]
     fn a_machine_that_changed_its_speed_has_measured_nothing() {
         let calm = numbers(&[("density.reference_drift", 1.04)]);
-        assert!(steady(&calm, &rules()).is_ok());
+        assert!(steady(&calm, rules().tolerance).is_ok());
         let busy = numbers(&[("density.reference_drift", 1.4)]);
-        let error = steady(&busy, &rules()).unwrap_err();
+        let error = steady(&busy, rules().tolerance).unwrap_err();
         assert!(error.to_string().contains("Measure again"), "{error}");
+    }
+
+    #[test]
+    fn a_record_is_made_on_a_steadier_machine_than_a_check_asks_for() {
+        // What a check lets pass is too much for a record: the record
+        // this repository had first was made at 1.076.
+        let drifting = numbers(&[("density.reference_drift", 1.076)]);
+        assert!(steady(&drifting, rules().tolerance).is_ok());
+        let error = steady(&drifting, rules().record_drift).unwrap_err();
+        assert!(error.to_string().contains("1.02 is allowed"), "{error}");
+        let still = numbers(&[("density.reference_drift", 1.003)]);
+        assert!(steady(&still, rules().record_drift).is_ok());
+    }
+
+    #[test]
+    fn how_a_processor_is_governed_is_read_for_the_one_that_measures() {
+        let folder =
+            std::env::temp_dir().join(format!("waveport-perf-scaling-{}", std::process::id()));
+        let governed = |cpu: u32, said: &[(&str, &str)]| {
+            let cpufreq = folder.join(format!("cpu{cpu}")).join("cpufreq");
+            std::fs::create_dir_all(&cpufreq).unwrap();
+            for (what, text) in said {
+                std::fs::write(cpufreq.join(what), format!("{text}\n")).unwrap();
+            }
+        };
+        // A system that says nothing.
+        assert_eq!(scaling(&folder, Some(6)), None);
+        // A governor alone, and one with a preference.
+        governed(0, &[("scaling_governor", "schedutil")]);
+        governed(
+            6,
+            &[
+                ("scaling_governor", "powersave"),
+                ("energy_performance_preference", "balance_performance"),
+            ],
+        );
+        assert_eq!(scaling(&folder, None).as_deref(), Some("schedutil"));
+        assert_eq!(
+            scaling(&folder, Some(6)).as_deref(),
+            Some("powersave/balance_performance")
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_machine_governed_otherwise_than_for_its_record_is_not_held_to_it() {
+        let then = Some("powersave/performance");
+        assert!(governed_alike(then, then).is_ok());
+        // A record or a system that does not say holds to nothing.
+        assert!(governed_alike(None, then).is_ok());
+        assert!(governed_alike(then, None).is_ok());
+        let error = governed_alike(then, Some("powersave/balance_performance")).unwrap_err();
+        let said = error.to_string();
+        assert!(
+            said.contains("`powersave/balance_performance` now")
+                && said.contains("`powersave/performance` when its record was made")
+                && said.contains("perf record"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn how_a_machine_is_powered_is_read_from_what_supplies_it() {
+        let folder =
+            std::env::temp_dir().join(format!("waveport-perf-power-{}", std::process::id()));
+        let supply = |name: &str, said: &[(&str, &str)]| {
+            let supply = folder.join(name);
+            std::fs::create_dir_all(&supply).unwrap();
+            for (what, text) in said {
+                std::fs::write(supply.join(what), format!("{text}\n")).unwrap();
+            }
+        };
+        // A system that says nothing.
+        assert_eq!(power(&folder), None);
+        // The battery of a mouse is not the machine's.
+        supply("mouse", &[("type", "Battery"), ("scope", "Device")]);
+        assert_eq!(power(&folder), None);
+        // A laptop off its charger, and on it.
+        supply("BAT0", &[("type", "Battery")]);
+        supply("AC", &[("type", "Mains"), ("online", "0")]);
+        assert_eq!(power(&folder), Some("battery"));
+        supply("AC", &[("type", "Mains"), ("online", "1")]);
+        assert_eq!(power(&folder), Some("mains"));
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     /// The nightly run and this command measure with the same test.
@@ -597,17 +878,35 @@ mod tests {
         // A little faster or slower: the same machine.
         for now in [4.2, 4.47, 4.8] {
             let measured = numbers(&[("density.reference_ms", now)]);
-            assert!(as_recorded(&recorded, &measured, &rules()).is_ok(), "{now}");
+            let held = as_recorded(&recorded, &measured, (None, None), &rules());
+            assert!(held.is_ok(), "{now}");
         }
         // Nearly twice as fast, as when its charger is put in; and slower.
         for now in [2.49, 5.5] {
             let measured = numbers(&[("density.reference_ms", now)]);
-            let error = as_recorded(&recorded, &measured, &rules()).unwrap_err();
+            let error = as_recorded(&recorded, &measured, (None, None), &rules()).unwrap_err();
             assert!(error.to_string().contains("perf record"), "{error}");
+            assert!(!error.to_string().contains("battery"), "{error}");
         }
-        // A record without the number holds to no state.
+        // Where the record and the system say how it is powered, so does
+        // the refusal.
         let measured = numbers(&[("density.reference_ms", 2.49)]);
-        assert!(as_recorded(&BTreeMap::new(), &measured, &rules()).is_ok());
+        let powers = (Some("battery"), Some("mains"));
+        let error = as_recorded(&recorded, &measured, powers, &rules()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("made on its battery, and it is on mains power now"),
+            "{error}"
+        );
+        let powers = (Some("mains"), Some("mains"));
+        let error = as_recorded(&recorded, &measured, powers, &rules()).unwrap_err();
+        assert!(
+            error.to_string().contains("on mains power now, as it was"),
+            "{error}"
+        );
+        // A record without the number holds to no state.
+        assert!(as_recorded(&BTreeMap::new(), &measured, (None, None), &rules()).is_ok());
     }
 
     #[test]
@@ -615,6 +914,7 @@ mod tests {
         let text = include_str!("../../perf/targets.toml");
         let rules = rules_from(text).unwrap();
         assert!(rules.tolerance > 0.0 && rules.tolerance < 1.0);
+        assert!(rules.record_drift > 0.0 && rules.record_drift < rules.tolerance);
         assert!(rules.held.contains(&"density.ratio".to_owned()));
         assert!(rules.targets.contains_key("start.p99_ms"));
     }

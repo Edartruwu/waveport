@@ -9,7 +9,8 @@
 #
 # Who reads this file:
 #   benches/tests/latency.rs   [latency], on every pull request
-#   benches/tests/memory.rs    [memory] and [soak], on every pull request
+#   benches/tests/memory.rs    [memory], on every pull request, and for
+#                              the thousand calls of every night
 #   benches/tests/load.rs      [density], every night
 #   cargo xtask perf           [local], by hand, on one machine
 
@@ -60,16 +61,17 @@ active = { target_p50_kb = 1500, target_p99_kb = 4000, held_pcm_kb = 549, held_o
 [density]
 # The session's share of its shard's thread, divided by what encoding and
 # decoding a second of Opus takes on the same machine in the same run.
-# That takes the speed of the processor out of the number, and not
-# everything else about a machine: it was 0.73 on a runner of GitHub's
-# and 0.92 on one core of a laptop, where work that comes in short bursts
-# is slower than work that runs on. So the number held here is the
-# runner's own, and it holds the runner. It is from twelve runs so far,
-# on runners with three processors: the ratio was between 0.68 and 0.77
-# in all of them, while a session's share of its thread was 0.20% on the
-# fastest of the three and 0.27% on the slowest. It is measured three
-# times every night, and what is held here is set again from ten nights
-# of that: CONTRIBUTING.md says how.
+# That takes the speed of the processor out of the number: it is 0.75 on
+# one core of a laptop, and was between 0.68 and 0.77 on GitHub's
+# runners, in twelve runs on three processors, while a session's share
+# of its thread was 0.20% on the fastest of those and 0.27% on the
+# slowest. It does not take out how the speed of a processor is
+# governed: the same laptop gives 0.92 with a power profile that
+# balances speed against energy, under which work that comes in short
+# bursts is slower than work that runs on. So the number held here is
+# the runner's own, and it holds the runner. It is measured three times
+# every night, and what is held here is set again from ten nights of
+# that: CONTRIBUTING.md says how.
 held_ratio = 0.73
 # How much over what is held a run may be, as a share of it: runners
 # differ, and the same runner differs from night to night.
@@ -85,13 +87,22 @@ tolerance = 0.25
 # It is also how much longer or shorter the reference work may take than
 # it took when the record was made. Past that the machine is not in the
 # state it was recorded in, and a check refuses to compare: the same
-# laptop took 1.8 times as long over everything earlier on the day of
-# its record.
+# laptop takes 1.8 times as long over the reference work on its battery
+# as on mains.
 tolerance = 0.10
+# How much longer the reference work may take at one end of the run than
+# at the other when a record is made, as a share of it. A check allows
+# the tolerance above. A record is what checks are held to, so it is
+# made on a steadier machine. Cool and left alone, this one moved by
+# 0.1, 1.3 and 2.6 in a hundred in three runs, and by 3.2 in one that
+# something else interrupted. Its first record was made at 7.6, with a
+# power profile under which it moves so, and straight after a build it
+# moves by a quarter.
+record_drift = 0.03
 # The numbers that are held to their record. Less is better for each.
 # How long a session takes to start is not among them: it is a fraction
 # of a millisecond and moves by a third from one run to the next. It is
-# held to its target below, which is ten times what is measured.
+# held to its target below, which is over twenty times what is measured.
 held = ["density.share_percent", "density.ratio"]
 
 # The numbers that are held to a target of the design, whatever the
