@@ -291,7 +291,7 @@ cargo xtask perf record --cpu 6    # writes perf/baselines/<processor>.toml
 cargo xtask perf check             # measures the same way, and holds the machine to its record
 ```
 
-`--cpu` keeps the measurement on one processor, with `taskset`, and is worth using on a machine whose cores are not alike: the numbers then repeat to about 1%. A check that fails measures again, up to three times, because whatever else a machine does can only make a measurement worse.
+`--cpu` keeps the measurement on one processor, with `taskset`, and is worth using on a machine whose cores are not alike: the numbers then repeat to about 1%. A check that fails measures again, three times in all at most, because whatever else a machine does can only make a measurement worse.
 
 The runtime does not pin the threads of its shards ([decision 0003](docs/decisions/0003-shard-pinning.md) says when it will). On a machine whose cores are not alike, the `waveport` command is kept on the fast ones the same way, from outside: `taskset -c 0-11 waveport dev` on a processor whose performance cores are numbered 0 to 11. An Intel processor of that kind lists them in `/sys/devices/cpu_core/cpus`.
 

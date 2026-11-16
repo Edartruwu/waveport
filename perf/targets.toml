@@ -9,7 +9,8 @@
 #
 # Who reads this file:
 #   benches/tests/latency.rs   [latency], on every pull request
-#   benches/tests/memory.rs    [memory] and [soak], on every pull request
+#   benches/tests/memory.rs    [memory], on every pull request, and for
+#                              the thousand calls of every night
 #   benches/tests/load.rs      [density], every night
 #   cargo xtask perf           [local], by hand, on one machine
 
@@ -88,10 +89,16 @@ tolerance = 0.25
 # laptop took 1.8 times as long over everything earlier on the day of
 # its record.
 tolerance = 0.10
+# How much longer the reference work may take at one end of the run than
+# at the other when a record is made, as a share of it. A check allows
+# the tolerance above. A record is what checks are held to, so it is
+# made on a steadier machine: left alone, this one moves by less than
+# half of one in a hundred, and its first record was made at 7.6.
+record_drift = 0.02
 # The numbers that are held to their record. Less is better for each.
 # How long a session takes to start is not among them: it is a fraction
 # of a millisecond and moves by a third from one run to the next. It is
-# held to its target below, which is ten times what is measured.
+# held to its target below, which is over twenty times what is measured.
 held = ["density.share_percent", "density.ratio"]
 
 # The numbers that are held to a target of the design, whatever the

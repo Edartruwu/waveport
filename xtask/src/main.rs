@@ -48,6 +48,7 @@ Measurements of this machine:
   perf check     Measure again, the way the record was made, and hold the
                  machine to its record and to the targets in
                  perf/targets.toml: [--host <name>]
+                 [--cpu <n>] is allowed, and has to be the record's
 
 Setup:
   fetch-assets   Download the model files pinned in assets/assets.lock.toml
