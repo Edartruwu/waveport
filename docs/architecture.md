@@ -144,7 +144,6 @@ pub enum Event {
 pub enum Command {
     Llm(OpTag, LlmCmd),         // Start | Pause | Resume | Cancel
     Tts(OpTag, TtsCmd),         // Speak { text } | Finish | Cancel
-    Realtime(OpTag, RtCmd),     // added with speech-to-speech models in phase 2
     Stt(SttCmd),                // Finalize | Close
     Sense(SenseCmd),            // EstimateEou { turn, who } | ClassifyOverlap { turn, who }
     Playout(OpTag, PlayoutCmd), // Start | Duck | Unduck | Stop { fade_ms }
@@ -184,7 +183,7 @@ No priority lanes are needed. Pipecat has them because slow work sits in line; h
 - LLM deltas never touch the context. They pass through the kernel, which releases text to synthesis by the chunking policy and the credit rule of section 5, so committed text is a prefix of released text by construction.
 - `Playout::push(tag, now, chunk)` refuses audio whose tag is not that of the newest response there has been, so an adapter that keeps sending after a cancel is harmless. Audio for the newest response is taken before the kernel allows its playback to start as well as after, because the two can arrive in either order.
 - What playback reports never goes back: not the audio played, and not the text heard. A transport cannot acknowledge more than it was handed.
-- When a speech-to-speech provider supports truncation it receives the same cut point. When it does not, the divergence between its server-side context and the kernel's is recorded explicitly.
+- When a speech-to-speech provider supports truncation it receives the same cut point, once the response it cancelled has ended: a cut that arrives sooner shortens the audio and leaves the whole text in the model's context. When it does not, the divergence between its server-side context and the kernel's is a shortfall of the session's plan, and the next connection is seeded from the kernel's ([decision 0007](decisions/0007-speech-to-speech-port.md)).
 
 ### 4.7 Barge-in
 
@@ -252,14 +251,14 @@ The principle is: **audio drops, text blocks, control coalesces.**
 
 - High-rate signals (playback position, audio levels, interim transcripts) are latest-value slots, not queues.
 - The 3-second credit caps wasted text-to-speech spend at about 3 seconds per interruption.
-- The reorder buffer holds nothing back to smooth the pace, because the listeners are machines. A packet is waited for only when a later one has overtaken it. The wait starts at nothing, grows by 20 ms each time a packet arrives after it was given up, and shrinks by 20 ms after 10 s in which none did.
+- The reorder buffer holds nothing back to smooth the pace, because the listeners are machines. A packet is waited for only when a later one has overtaken it. The wait starts at nothing, grows by 20 ms each time a packet arrives after it was given up, and shrinks by 20 ms after 10 s in which none did. It is the adaptive jitter buffer the WebRTC endpoint of phase 2 needs, with three things added and no second buffer: the frame that comes again inside a later packet (redundant audio, and Opus's own low-rate copy) fills the place of the one that was lost, the sequence numbers a browser spends on padding and on keys are not counted as loss, and where retransmission was agreed the longest wait is what a retransmission takes ([decision 0005](decisions/0005-webrtc-endpoint.md)).
 - Filling a gap keeps the stream's length, so the media clock follows the sender's timestamps for as long as the stream is unbroken. It is set by the session clock again each time the stream begins anew. A sender whose clock drifts is not corrected for in phase 1.
 - Pacing uses absolute deadlines from one timer tick per shard; the first frame of an utterance goes out immediately. When the audio runs out in the middle of a response, or a tick comes more than 100 ms late, the pace starts again from that moment: what was due in between is not sent in a burst.
 - On transports that cannot clear a remote buffer, the send-ahead (20 ms by default) is already on the wire when the server stops or ducks.
 
 ## 6. One model for every session shape
 
-A `BrainProfile` states which port fills each of three roles (hear, think, speak) and which duties a provider handles internally (turn detection, context, synthesis). Application-layer drivers translate: `CascadeDriver` for speech-to-text, LLM and text-to-speech, `RealtimeDriver` for speech-to-speech. The kernel issues intent-level commands and never branches on "is this realtime".
+A `BrainProfile` states which port fills each of three roles (hear, think, speak) and which duties a provider handles internally (turn detection, context, synthesis). Application-layer drivers translate: `CascadeDriver` for speech-to-text, LLM and text-to-speech, `RealtimeDriver` for speech-to-speech. The kernel issues intent-level commands and never branches on "is this realtime". It has no command for a speech-to-speech model either: the driver of such a session translates the commands there are ([decision 0004](decisions/0004-session-shapes.md)).
 
 | Shape | How it fits |
 |---|---|
@@ -288,22 +287,22 @@ A session that cannot be run at all is refused: no rate in common, or an agent w
 
 ## 7. Flows on speech-to-speech models
 
-Each realtime adapter declares what it can do:
+Each realtime adapter declares what it can do. The list is in [decision 0007](decisions/0007-speech-to-speech-port.md), as two providers that share almost no commands were found to differ, one of them measured and one read:
 
-```rust
-pub struct RealtimeCaps {
-    pub instructions: Mutability,   // Live | PerResponse | ReconnectOnly
-    pub tools: Mutability,
-    pub inject: InjectCaps,
-    pub truncate: bool,
-    pub manual_response: bool,
-    pub turn_owner: TurnOwner,      // Server | Client | Either
-    pub resume: ResumeCaps,         // Handle { ttl } | ReplayText { max_tokens } | None
-    pub max_session: Option<Duration>,
-}
-```
+| What a provider says | Why a session's plan needs it |
+|---|---|
+| The audio it takes and gives | What is changed in rate on the way, and whether a telephone line's audio can be handed over as it came |
+| Whether the end of a turn and the request to respond are apart | A session that may leave a turn unanswered is refused on a provider that always answers |
+| Whether a turn's beginning stops the model, and whether input can be dropped | A turn's audio is streamed where it can be dropped, and held until the turn is committed where it cannot |
+| Whether a stop cuts its record to what was heard | Where it does not, the kernel's conversation is the truth and the provider's is a shortfall |
+| What can be injected, where, and whether that interrupts | How the conversation is kept in step, and how a new connection is seeded |
+| Who decides when a tool's result is spoken, and whether it takes calls back | The driver's decision or the provider's |
+| Which settings change on a live connection | Anything else is a new connection at a turn boundary |
+| How long a connection lives, and whether a handle resumes it | Reconnecting is routine: the next connection is opened and seeded while the old one serves |
+| When the words of a turn come | The agent of such a session is set to words that follow the turn |
+| Whether it can answer in text alone, or with silence | A response that says nothing ends without an error, with its reason |
 
-The planner of section 6 will decide this too, at session start and at every handoff. It picks the strongest strategy available and fails loudly instead of degrading silently:
+A provider that cannot give up turns to the client is refused when the session is planned, by name. The planner of section 6 will decide the strategy of a flow too, at session start and at every handoff. It picks the strongest strategy available and fails loudly instead of degrading silently:
 
 1. **Live:** update the provider session at the transition, behind a barrier. The next response is not created until the update is acknowledged.
 2. **Per response:** each response request carries the node's instructions and tools.
@@ -398,11 +397,15 @@ What the outline does not show:
 Not built yet:
 
 ```rust
-/// Send half of a speech-to-speech session. Every command is answered by Ack or Nack.
+/// Send half of a speech-to-speech session. A command says what is wanted,
+/// and the adapter owns the provider's messages for it and their order. No
+/// command has an answer of its own: what became of it is in the events, which
+/// name the response, the item or the tool call they are about (decision 0007).
 pub trait RtTx: Send {
     fn try_audio(&mut self, audio: AudioRef<'_>) -> Result<(), Full>;
-    fn try_cmd(&mut self, cmd: RtCmd) -> Result<(), Full>;
-    // RtCmd: UpdateSession, InjectItem, CreateResponse, Cancel, Truncate, ToolResult
+    fn try_cmd(&mut self, cmd: RtCmd<'_>) -> Result<(), Full>;
+    // RtCmd: TurnBegins, TurnEnds { respond }, DropInput, Respond { with },
+    //        Stop { response, heard }, Inject { item }, ToolResult { .. }, Configure { to }
 }
 ```
 
@@ -566,7 +569,7 @@ What cannot be restored, and what happens instead:
 | In-flight LLM or text-to-speech work | Discarded and regenerated from committed context |
 | A partially played utterance after a crash | Committed to the last checkpoint and flagged truncated, with up to 1 s of uncertainty |
 | Speech-to-text hypothesis state | On migration the open turn's pre-roll (up to 8 s) travels with the snapshot and is re-fed. On a crash it is lost and the agent asks again. A recogniser that fails while its session lives is opened again, after 200 ms and then after twice as long each time, up to 5 s, and is given what was heard since its last final transcript, from the same 8 s |
-| A speech-to-speech provider session | Server-side audio context is not portable. Use the provider's resumption handle if it has one; otherwise seed a new session from the kernel's text mirror (prosody is lost); otherwise from a summary |
+| A speech-to-speech provider session | Server-side audio context is not portable. Use the provider's resumption handle if it has one; otherwise seed a new session from the kernel's text mirror (prosody is lost); otherwise from a summary. A connection that ends is routine and not a failure: one provider ends it after about ten minutes, another after sixty. The next one is opened and seeded while the old one still serves, and is taken at a turn boundary ([decision 0007](decisions/0007-speech-to-speech-port.md)) |
 
 ## 10. Multi-agent
 
@@ -710,11 +713,11 @@ waveport/
 └─ docs/ · examples/
 ```
 
-`xtask/`, `benches/`, `crates/core/`, `crates/testing/` (without `-evals`), `assets/`, `perf/` and `docs/` exist today (`spikes/` held the density spike, which was deleted once the product could measure itself). So do the first adapters (`transport/local-audio`, `transport/websocket`, `stt/openai`, `stt/deepgram`, `stt/assemblyai`, `llm/openai-compat`, `tts/cartesia`, `tts/elevenlabs`, `models/onnx`, which holds both listening models, `store/memory`, `store/journal` and `telemetry/otel`) and `apps/waveport-cli`. The rest is added in the phase that needs it.
+`xtask/`, `benches/`, `crates/core/`, `crates/testing/` (without `-evals`), `assets/`, `perf/` and `docs/` exist today (`spikes/` holds the two spikes of phase 2, on WebRTC and on speech-to-speech models; the density spike of phase 1 was deleted once the product could measure itself). So do the first adapters (`transport/local-audio`, `transport/websocket`, `stt/openai`, `stt/deepgram`, `stt/assemblyai`, `llm/openai-compat`, `tts/cartesia`, `tts/elevenlabs`, `models/onnx`, which holds both listening models, `store/memory`, `store/journal` and `telemetry/otel`) and `apps/waveport-cli`. The rest is added in the phase that needs it.
 
 The root [`Cargo.toml`](../Cargo.toml) is the source of truth for workspace members, lint levels, profiles and dependency versions. What it does not say by itself:
 
-- **Only dependencies in use are declared.** Cargo and `cargo deny` reject unused ones. The pins already decided for later phases are: `tokio` `~1.53` (the long-term-support line); `str0m` `=0.25.0`, exact, because it breaks its API on most minor releases; `rsipstack` `=0.8.5`, exact, because it had 88 releases in twelve months; `ort` `=2.0.0-rc.15`, exact, because it is a release candidate.
+- **Only dependencies in use are declared.** Cargo and `cargo deny` reject unused ones. The pins already decided for later phases are: `tokio` `~1.53` (the long-term-support line); `str0m` `=0.25.0`, exact, because it breaks its API on most minor releases, and with none of its default features, because its stock crypto brings C ([decision 0005](decisions/0005-webrtc-endpoint.md)); `rsipstack` `=0.8.5`, exact, because it had 88 releases in twelve months; `ort` `=2.0.0-rc.15`, exact, because it is a release candidate.
 - **Each crate declares its layer and stability tier** under `[package.metadata.waveport]`. The lists `arch-check` uses (async runtimes, entropy crates, third-party crates each inner layer may use) are under `[workspace.metadata.waveport]`.
 - **`unsafe` is forbidden workspace-wide.** Crates that need it (DSP hot loops, FFI, bindings) do not inherit the workspace lint table. They carry a copy with `unsafe_code = "deny"`, mark each site with `#[expect]` and a safety comment, and run under Miri. `cargo xtask lint-sync` fails if the copy drifts. Today the only such crate is `waveport-alloc-counter`.
 - **The Clippy denials** for `unwrap`, `expect`, `panic` and indexing are relaxed inside tests through `clippy.toml`.
@@ -731,7 +734,7 @@ Versions and licences were checked against crates.io on 14 November 2026.
 | Concern | Choice | Notes |
 |---|---|---|
 | Async runtime | `tokio` 1.53 long-term-support line (supported to September 2027), one `LocalRuntime` per shard | io_uring is still not available for sockets. Thread-per-core runtimes (monoio, glommio) are stale |
-| WebRTC | `str0m` 0.25.0 | Sans-IO; includes DTMF and G.722. No TURN client and no jitter buffer |
+| WebRTC | `str0m` 0.25.0 | Sans-IO; includes DTMF and G.722. No TURN client and no jitter buffer. Its pure-Rust crypto asks for `rcgen`, which brings aws-lc, so the transport has a crypto provider of its own: with it there is no C in the tree, and `deny.toml` stands as it is ([decision 0005](decisions/0005-webrtc-endpoint.md)) |
 | LiveKit interop | `livekit` 0.11.0 | Optional adapter only; pulls a prebuilt C++ libwebrtc |
 | SIP | `rsipstack` 0.8.5 | `rvoip` 0.4.0 is the fallback |
 | RTP, SRTP, SDP | `rtp` and `rtcp` 0.17.3, `webrtc-srtp` 0.17.3, `sdp-types` 0.3.2 | Packet types only; sessions are written in-repo |
@@ -742,7 +745,7 @@ Versions and licences were checked against crates.io on 14 November 2026.
 | Command line | `clap` 4.6.7, `jiff` 0.2.41 | `jiff` gives the `get_time` tool the local time and its zone |
 | Local speech (optional) | `sherpa-onnx` 2.0.1 | Local LLMs run out of process behind the OpenAI-compatible adapter |
 | QUIC and MoQ | `quinn` 0.11.12, `web-transport-quinn` 0.13.6, `moq-net` 0.3.23 | Experimental transport; the drafts are still moving |
-| WebSocket, HTTP, gRPC | `tokio-tungstenite` 0.30.0, `axum` 0.8.9, `hyper` 1.12.0, `reqwest` 0.13.5, `tonic` 0.14.9, `prost` 0.14.6 | A breaking `tonic` release is pending. The WebSocket client does not go through a proxy; the HTTP client uses the proxy the environment names |
+| WebSocket, HTTP, gRPC | `tokio-tungstenite` 0.30.0, `axum` 0.8.9, `hyper` 1.12.0, `reqwest` 0.13.5, `tonic` 0.14.9, `prost` 0.14.6 | `tonic` has been in maintenance since May 2026, and the `grpc` crate that is to follow it is a preview on another protobuf runtime. So generated code stays behind one module of the daemon, where the change will be made. The WebSocket client does not go through a proxy; the HTTP client uses the proxy the environment names |
 | TLS | `rustls` 0.23 with `ring`, `tokio-rustls` 0.26.6, `rustls-platform-verifier` 0.7.1 | No OpenSSL, and no assembler to install on Windows. Certificates are checked by the platform's own verifier, so no list of roots is compiled in |
 | MCP | `rmcp` 3.10.0 | Official SDK |
 | Bus | `async-nats` 0.52.0, `redis` 1.8.2 | `fred` is dormant |
@@ -759,7 +762,7 @@ Versions and licences were checked against crates.io on 14 November 2026.
 
 - Streaming clients for OpenAI (including Realtime), Anthropic, Gemini (including Live), ElevenLabs, Cartesia, AssemblyAI and Azure Speech. AWS has official crates; Deepgram has a community one.
 - Batched Silero VAD and Smart Turn inference.
-- The jitter buffer and HTTP signalling for WebRTC.
+- For WebRTC: the reorder buffer, the unpacking of redundant audio, the framing of ICE over TCP, HTTP signalling, and the crypto provider.
 - SIP call control, RTP sessions and RFC 4733 DTMF.
 - The dispatcher, a server-sent-events parser, and OpenTelemetry GenAI attributes.
 
@@ -770,7 +773,7 @@ Multi-provider LLM crates (`genai`, `rig`) are rejected as foundations: they hav
 | Bet | Risk | Containment |
 |---|---|---|
 | `ort` | Perpetual release candidate; native binaries | `tract` as a pure-Rust fallback for the small models |
-| `str0m` | One core maintainer; frequent breaking changes | Wrapped by the transport port; `rtc` 0.21 is the alternative |
+| `str0m` | One core maintainer; frequent breaking changes | Wrapped by the transport port; `rtc` 0.21 is the alternative, and was not needed when the spike of phase 2 asked whether str0m can be had without aws-lc |
 | `rsipstack` | One company; extreme release rate | Exact pin; `rvoip` as fallback |
 | Local text-to-speech engines | Phonemisation depends on GPL-licensed espeak-ng | Optional and out of process |
 

@@ -1,0 +1,79 @@
+# str0m 0.25.0, default-features = false, features = ["rust-crypto"] (the stock pure-Rust backend)
+
+$ cargo tree -i aws-lc-sys
+aws-lc-sys v0.47.0
+└── aws-lc-rs v1.19.0
+    ├── dimpl v0.9.0
+    │   ├── str0m v0.25.0
+    │   │   └── stock-rust-crypto v0.0.0 (spikes/webrtc/checks/stock)
+    │   ├── str0m-proto v0.8.0
+    │   │   ├── is v0.12.0
+    │   │   │   └── str0m v0.25.0 (*)
+    │   │   ├── str0m v0.25.0 (*)
+    │   │   └── str0m-rust-crypto v0.7.0
+    │   │       └── str0m v0.25.0 (*)
+    │   └── str0m-rust-crypto v0.7.0 (*)
+    └── rcgen v0.14.10
+        └── dimpl v0.9.0 (*)
+
+$ cargo tree -i openssl-sys
+error: package ID specification `openssl-sys` did not match any packages
+
+$ cargo tree -i ring
+error: package ID specification `ring` did not match any packages
+
+help: a package with a similar name exists: `rand`
+
+$ cargo tree -i rcgen
+rcgen v0.14.10
+└── dimpl v0.9.0
+    ├── str0m v0.25.0
+    │   └── stock-rust-crypto v0.0.0 (spikes/webrtc/checks/stock)
+    ├── str0m-proto v0.8.0
+    │   ├── is v0.12.0
+    │   │   └── str0m v0.25.0 (*)
+    │   ├── str0m v0.25.0 (*)
+    │   └── str0m-rust-crypto v0.7.0
+    │       └── str0m v0.25.0 (*)
+    └── str0m-rust-crypto v0.7.0 (*)
+
+$ cargo tree -i cc
+cc v1.11.1
+└── cmake v0.1.58
+    [build-dependencies]
+    └── aws-lc-sys v0.47.0
+        └── aws-lc-rs v1.19.0
+            ├── dimpl v0.9.0
+            │   ├── str0m v0.25.0
+            │   │   └── stock-rust-crypto v0.0.0 (spikes/webrtc/checks/stock)
+            │   ├── str0m-proto v0.8.0
+            │   │   ├── is v0.12.0
+            │   │   │   └── str0m v0.25.0 (*)
+            │   │   ├── str0m v0.25.0 (*)
+            │   │   └── str0m-rust-crypto v0.7.0
+            │   │       └── str0m v0.25.0 (*)
+            │   └── str0m-rust-crypto v0.7.0 (*)
+            └── rcgen v0.14.10
+                └── dimpl v0.9.0 (*)
+[build-dependencies]
+└── aws-lc-sys v0.47.0 (*)
+
+$ cargo tree -i cmake
+cmake v0.1.58
+[build-dependencies]
+└── aws-lc-sys v0.47.0
+    └── aws-lc-rs v1.19.0
+        ├── dimpl v0.9.0
+        │   ├── str0m v0.25.0
+        │   │   └── stock-rust-crypto v0.0.0 (spikes/webrtc/checks/stock)
+        │   ├── str0m-proto v0.8.0
+        │   │   ├── is v0.12.0
+        │   │   │   └── str0m v0.25.0 (*)
+        │   │   ├── str0m v0.25.0 (*)
+        │   │   └── str0m-rust-crypto v0.7.0
+        │   │       └── str0m v0.25.0 (*)
+        │   └── str0m-rust-crypto v0.7.0 (*)
+        └── rcgen v0.14.10
+            └── dimpl v0.9.0 (*)
+
+packages in lockfile: 145

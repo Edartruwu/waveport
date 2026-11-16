@@ -1,0 +1,200 @@
+{
+  "handshake_auto": {
+    "answering_side_costliest_single_datagram": {
+      "max_us": 402.501,
+      "mean_us": 200.74660999999998,
+      "n": 400,
+      "p50_us": 187.112,
+      "p90_us": 261.762,
+      "p999_us": 355.813,
+      "p99_us": 318.561
+    },
+    "answering_side_cpu_until_connected": {
+      "max_us": 712.739,
+      "mean_us": 362.6093525,
+      "n": 400,
+      "p50_us": 338.828,
+      "p90_us": 470.978,
+      "p999_us": 591.425,
+      "p99_us": 569.145
+    },
+    "answering_side_datagrams_in_out_until_connected": [
+      4,
+      3
+    ],
+    "asked_for": "Auto",
+    "failed": 0,
+    "making_a_certificate": {
+      "max_us": 339.971,
+      "mean_us": 188.0031825,
+      "n": 400,
+      "p50_us": 174.085,
+      "p90_us": 250.651,
+      "p999_us": 331.452,
+      "p99_us": 312.145
+    },
+    "negotiated": "DTLS1_3",
+    "runs": 400
+  },
+  "handshake_dtls12": {
+    "answering_side_costliest_single_datagram": {
+      "max_us": 786.626,
+      "mean_us": 367.76927750000004,
+      "n": 400,
+      "p50_us": 373.076,
+      "p90_us": 393.784,
+      "p999_us": 779.545,
+      "p99_us": 600.163
+    },
+    "answering_side_cpu_until_connected": {
+      "max_us": 939.232,
+      "mean_us": 507.445005,
+      "n": 400,
+      "p50_us": 516.405,
+      "p90_us": 542.951,
+      "p999_us": 927.088,
+      "p99_us": 763.481
+    },
+    "answering_side_datagrams_in_out_until_connected": [
+      4,
+      3
+    ],
+    "asked_for": "Dtls12",
+    "failed": 0,
+    "making_a_certificate": {
+      "max_us": 521.956,
+      "mean_us": 269.07864,
+      "n": 400,
+      "p50_us": 274.655,
+      "p90_us": 289.028,
+      "p999_us": 500.625,
+      "p99_us": 331.824
+    },
+    "negotiated": "DTLS1_2",
+    "runs": 400
+  },
+  "handshake_dtls13": {
+    "answering_side_costliest_single_datagram": {
+      "max_us": 673.142,
+      "mean_us": 316.70347499999997,
+      "n": 400,
+      "p50_us": 312.192,
+      "p90_us": 332.875,
+      "p999_us": 557.566,
+      "p99_us": 428.251
+    },
+    "answering_side_cpu_until_connected": {
+      "max_us": 935.642,
+      "mean_us": 570.99049,
+      "n": 400,
+      "p50_us": 564.795,
+      "p90_us": 604.464,
+      "p999_us": 795.953,
+      "p99_us": 712.639
+    },
+    "answering_side_datagrams_in_out_until_connected": [
+      4,
+      3
+    ],
+    "asked_for": "Dtls13",
+    "failed": 0,
+    "making_a_certificate": {
+      "max_us": 441.469,
+      "mean_us": 293.7441425,
+      "n": 400,
+      "p50_us": 291.447,
+      "p90_us": 313.142,
+      "p999_us": 383.257,
+      "p99_us": 352.025
+    },
+    "negotiated": "DTLS1_3",
+    "runs": 400
+  },
+  "packets_170_bytes_as_with_red": {
+    "one_datagram_in": {
+      "rtcp": {
+        "max_us": 10.004,
+        "mean_us": 5.0140308076602835,
+        "n": 1201,
+        "p50_us": 4.823,
+        "p90_us": 5.454,
+        "p999_us": 9.374,
+        "p99_us": 8.22
+      },
+      "rtp": {
+        "max_us": 3193.933,
+        "mean_us": 1.16065745,
+        "n": 300000,
+        "p50_us": 1.089,
+        "p90_us": 1.237,
+        "p999_us": 4.026,
+        "p99_us": 2.005
+      },
+      "stun": {
+        "max_us": 5.456,
+        "mean_us": 2.176046476761619,
+        "n": 2001,
+        "p50_us": 2.088,
+        "p90_us": 2.416,
+        "p999_us": 4.851,
+        "p99_us": 3.577
+      }
+    },
+    "one_packet_out": {
+      "max_us": 30.204,
+      "mean_us": 1.1752218166666666,
+      "n": 300000,
+      "p50_us": 1.123,
+      "p90_us": 1.262,
+      "p999_us": 4.384,
+      "p99_us": 1.974
+    },
+    "packets_each_way": 300000,
+    "payload_bytes": 170,
+    "rtp_packets_received_by_the_answering_side": 300000
+  },
+  "packets_80_bytes": {
+    "one_datagram_in": {
+      "rtcp": {
+        "max_us": 21.509,
+        "mean_us": 4.764796003330558,
+        "n": 1201,
+        "p50_us": 4.626,
+        "p90_us": 5.179,
+        "p999_us": 10.66,
+        "p99_us": 7.557
+      },
+      "rtp": {
+        "max_us": 167.906,
+        "mean_us": 0.9961114033333334,
+        "n": 300000,
+        "p50_us": 0.965,
+        "p90_us": 1.055,
+        "p999_us": 3.802,
+        "p99_us": 1.717
+      },
+      "stun": {
+        "max_us": 5.832,
+        "mean_us": 2.062487256371814,
+        "n": 2001,
+        "p50_us": 2.005,
+        "p90_us": 2.251,
+        "p999_us": 5.273,
+        "p99_us": 3.083
+      }
+    },
+    "one_packet_out": {
+      "max_us": 29.553,
+      "mean_us": 1.0161335133333333,
+      "n": 300000,
+      "p50_us": 0.986,
+      "p90_us": 1.073,
+      "p999_us": 4.015,
+      "p99_us": 1.574
+    },
+    "packets_each_way": 300000,
+    "payload_bytes": 80,
+    "rtp_packets_received_by_the_answering_side": 300000
+  },
+  "what": "str0m 0.25.0 against itself in memory, pure-Rust crypto provider of this spike, release build, one thread; times are inside str0m only"
+}

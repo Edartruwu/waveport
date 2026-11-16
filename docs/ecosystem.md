@@ -2,7 +2,7 @@
 
 This document lists every component waveport needs, where it lives in the repository, and which roadmap phase builds it. It then maps each gap found in our November 2026 research on Pipecat and LiveKit to the component that closes it.
 
-**Status (14 November 2026):** every component below is planned; none is built.
+**Status (16 November 2026):** what phases 0 and 1 build is built, and phase 2 has started. The [roadmap](../ROADMAP.md) says where each item stands; this document says what there will be, where, and which gap it closes. The gap lists of sections 3 and 4 were checked again on 16 November 2026, as the roadmap asks at the start of every phase.
 
 See also the [roadmap](../ROADMAP.md) and the [architecture spec](architecture.md).
 
@@ -170,6 +170,15 @@ Provider choices are proposals until the phase that builds them starts.
 
 Each row is a gap in Pipecat as of November 2026.
 
+**Checked again on 16 November 2026,** against Pipecat 1.16.0 and its `main`. No row closed, and four moved:
+
+- **Native SIP.** A SIP transport on baresip was merged on 13 November and is in no release yet. It registers, or dials through a trunk, without Daily. Transfer through it is "not supported yet", and it has no build for Windows.
+- **Shared model sessions.** 1.16.0 has a helper that loads a local model once for a process, and one of the project's own models uses it. The voice-activity model and the end-of-turn model are still loaded for every pipeline.
+- **Text-to-speech caching.** A cache is listed in the documentation as an integration the community maintains, which the project "does not test or officially support". The pull request that would have put one in the core was closed unmerged.
+- **Windows.** There is still no statement of what is supported, and the project's CI runs on Linux alone. The WebRTC library it depends on has shipped a build for Windows since October 2026, and fixes for Windows are landing.
+
+Three rows are worded more exactly than they were, and one figure is withdrawn: the 20 to 70 MB a session was said to grow by has no source of the project's own. That it runs one process for a session is its documented practice.
+
 | Gap | Waveport answer | Phase |
 |---|---|---|
 | Non-Python server runtime | Rust core; Python and Node.js bindings over the same kernel | 1, 8 |
@@ -180,26 +189,32 @@ Each row is a gap in Pipecat as of November 2026.
 | Built-in retrieval or knowledge base | Retrieval port, vector-store adapters, memory | 4 |
 | Native SIP without Daily | SIP transport | 6 |
 | Transport-agnostic call transfer | Transfer is a domain command; each transport implements it | 6 |
-| Hosted observability dashboard | Self-hosted console | 7 |
+| Observability for more than one session at a time, self-hosted (there are two open tools for a developer to watch one) | Self-hosted console | 7 |
 | Shared model sessions across pipelines in one process | Compute plane with one model instance shared by all sessions | 1 |
 | Backpressure between processors | Every queue bounded; audio drops, text blocks, control coalesces | 1 |
-| Multi-party turn-taking logic | `Floor` with N holders and an addressee policy; models in phase 5 | 1, 5 |
+| Multi-party turn-taking logic (who spoke is told since 1.16.0, where the recogniser tells it) | `Floor` with N holders and an addressee policy; models in phase 5 | 1, 5 |
 | Text-to-speech response caching | Cache adapter | 4 |
-| Visual builder | Flow builder in the console | 8 |
+| Visual builder beyond an editor of flow definitions | Flow builder in the console | 8 |
 | Mobile SDK parity; dormant embedded SDK | One Rust client core generating every SDK | 10 |
 | Windows support | Windows in CI from the first commit | 0 |
 | Cloud assurances (SOC 2, SLA, SSO) | Non-goal as a hosted service. SSO, roles and audit log for self-hosters | 10 |
-| Memory growth of 20–70 MB per session; one process per session | Sessions as tasks with bounded buffers; flat-memory soak test in CI | 1 |
+| One process per session | Sessions as tasks with bounded buffers; flat-memory soak test in CI | 1 |
 
 ## 4. Gap traceability: LiveKit
 
 Each row is a gap in LiveKit as of November 2026.
 
+**Checked again on 16 November 2026,** against LiveKit Agents 1.8.12, agents-js 1.10.0 and the server at 1.13.11. No row closed, and one moved:
+
+- **Turn detector.** The default is now a model that listens to audio. The larger one is hosted and metered. The smaller one runs locally in 14 languages, at 140 to 250 MB for each copy that is loaded, under a licence that allows it only together with LiveKit Agents.
+
+Two are on their way: agents of text alone without a room (the server's half is released, the SDK's half is a draft) and handoff across processes (a draft). One is worded more exactly than it was.
+
 | Gap | Waveport answer | Phase |
 |---|---|---|
 | True multi-party conversation with speaker attribution | Speaker is mandatory on every perception event, turn and message; floor control and addressee detection | 1, 5 |
 | Local adaptive interruption; pluggable interruption detector | Interruption classifier is a port; open-weights model | 1, 5 |
-| Open-source noise cancellation in the framework | Noise-suppression port with open models | 5 |
+| Open-source noise cancellation in the framework (two proprietary models can be had without LiveKit Cloud, each with a licence of one's own) | Noise-suppression port with open models | 5 |
 | Multi-node rooms in open source | Multi-node SFU | 9 |
 | Cross-process multi-agent handoff | Remote brain over the bus, and session transfer across nodes | 4 |
 | Session persistence and durable state | Journal, snapshots, resume, migration | 1, 3 |
@@ -215,7 +230,7 @@ Each row is a gap in LiveKit as of November 2026.
 | Agent hosting regions | Non-goal as a hosted service. Runs in any region; multi-region routing | 3 |
 | Built-in vector store or memory | Knowledge and memory adapters | 4 |
 | Agent builder for production flows | Visual flow builder producing the same flow definitions as code | 8 |
-| Turn-detector languages | Wider-language and telephony end-of-turn models with open weights | 5 |
+| A turn detector that may be used outside LiveKit Agents; one for telephone audio | Wider-language and telephony end-of-turn models with open weights | 5 |
 | Persistent rooms; per-room webhooks | Media plane | 9 |
 | Token revocation when self-hosted | Access tokens with revocation | 3 |
 | .NET server SDK | API clients generated from the protocol definitions | 10 |
@@ -230,9 +245,9 @@ Requests with real engagement in both projects' issue trackers and forums as of 
 | Share one voice-activity model across pipelines | Pipecat #2050 | Compute plane | 1 |
 | Graceful fade on interruption | Pipecat #3985 | Playout stops with a 5 to 10 ms fade | 1 |
 | Decouple async tool results from interruption settings | Pipecat #4657 | Tool results live outside the epoch | 1 |
-| Speech-to-speech edge cases: tool results re-sent after reconnect, settings updates silently ignored | Pipecat Gemini Live issues; LiveKit #5742 | Every realtime command is acknowledged or rejected; nightly conformance kit | 2 |
+| Speech-to-speech edge cases: tool results re-sent after reconnect, settings updates silently ignored | Pipecat Gemini Live issues; LiveKit #5742 | A tool's result is sent once, whatever reconnects. A setting that cannot change on a live connection is a capability the plan reads, and a refusal is reported with the provider's reason. Nightly conformance kit ([decision 0007](decisions/0007-speech-to-speech-port.md)) | 2 |
 | Pin or exclude messages during context summarisation | Pipecat #3989 | Summarisation with pinned and excluded messages | 4 |
-| Realtime sessions longer than 60 minutes | Pipecat #3170 | Seamless re-session | 4 |
+| Realtime sessions longer than 60 minutes | Pipecat #3170 | Seamless re-session. The part a call needs to outlive a provider's connection comes with the realtime driver | 2, 4 |
 | MCP resources | Pipecat #4284 | MCP client covers tools and resources | 4 |
 | Flows on realtime models | pipecat-flows #66 | Flow engine | 4 |
 | Fewer false "incomplete" predictions; a narrowband telephony test split | smart-turn #41, #42 | Telephony end-of-turn model and public benchmark | 5 |

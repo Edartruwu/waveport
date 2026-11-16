@@ -1,0 +1,12 @@
+     12 error: slicing may panic
+      7 warning: item in documentation is missing backticks
+      5 warning: variables can be used directly in the `…` string
+      5 error: used `…` on a `…` value
+      2 warning: used `…` with an equality comparison
+      2 warning: this function could have a `…` attribute
+      2 warning: missing documentation for a struct field
+      2 error: indexing may panic
+      1 warning: unreachable `…` item
+      1 warning: constructing a `…` using a smaller unit when a larger unit would be more readable
+      1 warning: `…` (lib) generated 20 warnings
+      1 error: could not compile `…` (lib) due to 19 previous errors; 20 warnings emitted

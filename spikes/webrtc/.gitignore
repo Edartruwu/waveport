@@ -1,0 +1,9 @@
+/pipecat/node_modules/
+/web/pipecat/bundle.js
+/web/pipecat/bundle.js.map
+/__pycache__/
+# The reports of single runs hold the addresses of the machine they
+# were made on. The tables made from them are kept.
+/results/*.json.gz
+/results/sdp/
+/results/pipecat-http-*.json
