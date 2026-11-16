@@ -184,6 +184,12 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-media --test network
 
 `tests/no_alloc.rs` runs a packet in and a frame out for every codec, with losses, late packets, an interruption and a change of volume, and fails if any of it calls the allocator. `benches/ir/media.rs` counts the instructions of one frame each way for each codec, under the same 2% rule as the kernel's.
 
+**Ports.** `waveport-testkit` has a fake of every port (`fakes`). They keep time by Tokio's clock, so a test under `#[tokio::test(start_paused = true)]` takes no real time and runs the same way every time. Each fake follows a script and says what it can do; change its `caps` and it behaves as it says. `conformance` holds the rules of each port as functions that take any implementation: an adapter's tests call them against a recorded server, and its `live_*` tests against the provider. A new rule goes there, together with a case in `tests/conformance.rs` that breaks it, to show that the check sees it.
+
+`tests/voice_loop.rs` runs whole conversations through the fakes, with the real kernel and audio path: a question answered, an interruption, a tool call, and the interruption again with parts that can do less. The loop that joins the parts there is test code and stands in for the runtime. When you change a port, these are the tests that say whether a session can still be run through it.
+
+**Adapter kit.** The WebSocket and HTTP clients are tested against servers that the tests start on the loopback interface; nothing leaves the machine. A test of a connection that is refused has to accept a timeout as well: Windows takes about two seconds to refuse a closed port on the loopback interface.
+
 **Allocations.** `waveport-alloc-counter` proves a code path does not touch the heap. Install `CountingAllocator` as the global allocator of the test binary and wrap the code in `assert_no_alloc`. Without the allocator installed the assertion fails instead of passing silently.
 
 ## Benchmarks

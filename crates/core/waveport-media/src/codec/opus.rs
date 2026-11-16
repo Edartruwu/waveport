@@ -14,7 +14,7 @@ use super::CodecError;
 use crate::rate::Rate;
 
 /// The most bytes one encoded frame can take.
-pub const MAX_PACKET: usize = 1_275;
+pub const MAX_PACKET: usize = waveport_domain::audio::MAX_OPUS_PACKET;
 
 /// The longest audio one packet can hold, in milliseconds.
 pub const MAX_PACKET_MS: u32 = 120;

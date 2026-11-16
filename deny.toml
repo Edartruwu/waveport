@@ -42,6 +42,11 @@ multiple-versions = "deny"
 # crates are.
 wildcards = "deny"
 allow-wildcard-paths = true
+skip = [
+    # `ring` 0.17, the cryptography under `rustls`, still uses the 0.2 line;
+    # `tungstenite` 0.30 reaches 0.4 through `rand` 0.10. Neither can be moved.
+    { crate = "getrandom@0.2", reason = "ring 0.17 has not moved to a newer getrandom" },
+]
 
 [bans.workspace-dependencies]
 # Versions are declared once, in `[workspace.dependencies]`.

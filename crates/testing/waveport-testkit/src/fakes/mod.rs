@@ -1,0 +1,26 @@
+//! Fakes of the ports: parts that follow a script.
+//!
+//! Each fake says what it can do in the same capability types a real
+//! adapter uses, and then does exactly that, so a session can be planned
+//! for a fake as for a provider. What a fake is asked to do it writes
+//! down, for the test to read afterwards.
+//!
+//! The fakes keep time with `tokio::time`. Under a runtime whose clock is
+//! paused, which is how the tests here run, a session with them takes no
+//! real time and is the same every time.
+
+pub mod journal;
+pub mod llm;
+pub mod stt;
+pub mod tools;
+pub mod transport;
+pub mod tts;
+
+pub use journal::MemoryJournal;
+pub use llm::{Asked, LlmStep, Said, ScriptedLlm};
+pub use stt::{ScriptedStt, Spoken, SttLog, SttScript};
+pub use tools::{Called, ScriptedTools};
+pub use transport::{
+    FakeTransport, FakeTransportBuilder, SentFrame, TransportHandle, TransportLog,
+};
+pub use tts::{ScriptedTts, TtsLog, TtsScript};
