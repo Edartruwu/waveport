@@ -1,0 +1,38 @@
+# Two sentences given to one context, and then that no more text follows: "It is ten past four." and
+# " Is there anything else I can do?", model sonic-3.6, raw pcm_s16le at 24,000 Hz, add_timestamps.
+# Recorded from the provider on 16 November 2026. Every line is a message of the provider's as it came,
+# but for its audio: `data_bytes` says how many bytes of it there were.
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":35.738266,"flush_id":0,"data_bytes":7392}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["It"],"start":[0.119846635],"end":[0.28]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":27.78603,"flush_id":0,"data_bytes":7392}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":96.76141,"flush_id":0,"data_bytes":9600}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["is"],"start":[0.28],"end":[0.52]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":0,"data_bytes":9600}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["ten"],"start":[0.60000235],"end":[0.84]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":0,"data_bytes":7904}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":23.872454,"flush_id":0,"data_bytes":9600}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":0,"data_bytes":5800}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["past"],"start":[0.84000003],"end":[1.24]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":59.550846,"flush_id":0,"data_bytes":9600}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":0,"data_bytes":5800}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["four."],"start":[1.24],"end":[1.72]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":17.647943,"flush_id":0,"data_bytes":7392}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":55.71477,"flush_id":0,"data_bytes":8240}
+{"type":"flush_done","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":0,"flush_done":true,"data_bytes":0}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":67.233604,"flush_id":1,"data_bytes":9600}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["Is"],"start":[1.9278647],"end":[2.12]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":1,"data_bytes":1488}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":63.626083,"flush_id":1,"data_bytes":9600}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["there","anything"],"start":[2.12,2.36],"end":[2.28,2.52]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":1,"data_bytes":9496}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":63.05505,"flush_id":1,"data_bytes":9600}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["else","I"],"start":[2.52,2.76],"end":[2.68,2.76]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":1,"data_bytes":9600}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["can"],"start":[2.84],"end":[2.92]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":1,"data_bytes":3592}
+{"type":"timestamps","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"word_timestamps":{"words":["do?"],"start":[2.92],"end":[3.16]}}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":23.214926,"flush_id":1,"data_bytes":8008}
+{"type":"chunk","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":50.285614,"flush_id":1,"data_bytes":8136}
+{"type":"flush_done","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":1,"flush_done":true,"data_bytes":0}
+{"type":"flush_done","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":206,"done":false,"step_time":0,"flush_id":2,"flush_done":true,"data_bytes":0}
+{"type":"done","context_id":"wp-29435a-18e890ebe84768a3-1","status_code":200,"done":true}

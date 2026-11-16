@@ -9,13 +9,13 @@
 //! what lets a response that is interrupted be cut at the very character
 //! the listener heard.
 //!
-//! **This adapter was written from the provider's documentation as it
-//! stood on 15 November 2026, and has not yet been held against the
-//! provider.** The tests replay messages in the documented shapes, made
-//! up here; none of them was recorded. The tests named `live_*` are the
-//! ones that will tell, once there is a key to run them with.
+//! **This adapter was written from the provider's documentation, and
+//! was held against the provider on 16 November 2026**, with the model
+//! `eleven_flash_v2_5`. What the provider sent then is in
+//! `tests/fixtures`, and tests replay it. The tests named `live_*` ask
+//! the provider again.
 //!
-//! What the documentation says, and the adapter is built around:
+//! What the adapter is built around:
 //!
 //! - The voice, the model and the form of the audio are in the address,
 //!   so they are the same for everything said on a connection. An
@@ -28,9 +28,20 @@
 //!   speaks, unless it is told to speak what it has. The session hands
 //!   text over in whole sentences, so every piece is sent with that
 //!   request.
-//! - The times of the characters are counted from where the piece of
-//!   audio they come with begins, not from the beginning of the speech.
-//!   They are brought to the beginning of the speech here.
+//! - The times of the characters are on a clock of the provider's that
+//!   begins with the speech and runs on from one piece of audio to the
+//!   next, a little ahead of the audio itself. The characters of a piece
+//!   begin where those of the piece before ended on that clock, which
+//!   was 21 ms past the end of that piece's audio when it was recorded,
+//!   and the last character ended 11 ms past the end of all the audio.
+//!   The documentation reads as if each piece were timed from its own
+//!   beginning, and the adapter was first written so, which put the
+//!   marks of every piece but the first too late by all the audio
+//!   before it. A character is placed here by how far into its piece the
+//!   provider says it is, and never past the audio there is.
+//! - The provider puts the space between two pieces of text at the end
+//!   of the first, and adds one of its own at the very end. A character
+//!   that is not of the text marks nothing.
 //! - A context is closed when no more text follows. The provider goes on
 //!   with what it was already asked to speak, and then says that the
 //!   context is over.
@@ -39,12 +50,15 @@
 //!   it: closing the connection is the one way to be sure that nothing
 //!   more is spoken, and nothing more paid for.
 //!
-//! What the documentation does not say, and is taken here until the
-//! provider has been asked:
+//! - A key the provider does not know is not refused as the connection
+//!   is made. The provider says so once a speech is asked for, in a
+//!   message that names an `error` and has words for it in `message`.
 //!
-//! - How a failure is told on the connection. A message that names an
-//!   `error` is taken for one, and what it is worth is read from the
-//!   name and the words that come with it.
+//! What has not been seen, and is taken here until it has:
+//!
+//! - How other failures are told. Any message that names an `error` is
+//!   taken for one, and what it is worth is read from the name and the
+//!   words that come with it.
 //! - Whether the provider also says that a context is over at other
 //!   times than its end. Read before the provider was told that no more
 //!   text follows, it is passed over.
