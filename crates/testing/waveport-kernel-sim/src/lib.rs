@@ -45,18 +45,24 @@
 //! - [`invariants`] holds a monitor that checks the kernel's invariants
 //!   after every step, from the outside. Every scenario runs under it.
 //! - [`seeded`] makes up sessions from a seed, with adapters that are late,
-//!   repeat themselves, fall silent or send nonsense, and runs them under
-//!   the same monitor.
+//!   repeat themselves, fall silent or send nonsense, and a process that
+//!   dies, and runs them under the same monitor.
+//! - [`model`] takes a session small enough to try every order in which
+//!   its events can arrive, and tries them all.
+//! - [`trace`] writes a session down as the events it was given, and runs
+//!   a kernel through such a record again.
 
 pub mod check;
 mod expect;
 mod explore;
 mod failure;
 pub mod invariants;
+pub mod model;
 mod script;
 pub mod seeded;
 mod setup;
 mod sim;
+pub mod trace;
 mod world;
 
 pub use expect::{Ending, Line, cut_off, spoke, user};

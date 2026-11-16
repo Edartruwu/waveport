@@ -8,7 +8,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::view::ItemView;
-use crate::ids::{AgentId, ContextVersion, GenId, ParticipantId, TurnId};
+use crate::fact::{NoticeKind, ToolOutcome};
+use crate::ids::{AgentId, ContextVersion, GenId, ParticipantId, ToolCallId, ToolId, TurnId};
 
 /// A stretch of the conversation's text buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -31,6 +32,21 @@ enum Item {
         agent: AgentId,
         text: Span,
         truncated: bool,
+    },
+    ToolCall {
+        call: ToolCallId,
+        tool: ToolId,
+        generation: GenId,
+        args: Span,
+    },
+    ToolResult {
+        call: ToolCallId,
+        outcome: ToolOutcome,
+        text: Span,
+    },
+    Notice {
+        kind: NoticeKind,
+        text: Span,
     },
 }
 
@@ -101,6 +117,51 @@ impl Conversation {
         });
     }
 
+    /// Appends a tool call an agent asked for.
+    pub(super) fn push_tool_call(
+        &mut self,
+        call: ToolCallId,
+        tool: ToolId,
+        generation: GenId,
+        args: &str,
+    ) {
+        let args = self.keep(args);
+        self.items.push(Item::ToolCall {
+            call,
+            tool,
+            generation,
+            args,
+        });
+    }
+
+    /// Appends how a tool call ended.
+    pub(super) fn push_tool_result(&mut self, call: ToolCallId, outcome: ToolOutcome, text: &str) {
+        let text = self.keep(text);
+        self.items.push(Item::ToolResult {
+            call,
+            outcome,
+            text,
+        });
+    }
+
+    /// Appends a note to the language model.
+    pub(super) fn push_notice(&mut self, kind: NoticeKind, text: &str) {
+        let text = self.keep(text);
+        self.items.push(Item::Notice { kind, text });
+    }
+
+    /// The arguments of a tool call, as the conversation holds them.
+    pub(super) fn call_args(&self, call: ToolCallId) -> &str {
+        self.items
+            .iter()
+            .rev()
+            .find_map(|item| match *item {
+                Item::ToolCall { call: of, args, .. } if of == call => Some(self.text_of(args)),
+                _ => None,
+            })
+            .unwrap_or("")
+    }
+
     /// The items, oldest first.
     pub(super) fn iter(&self) -> impl Iterator<Item = ItemView<'_>> {
         self.items.iter().map(|item| match *item {
@@ -125,6 +186,30 @@ impl Conversation {
                 agent,
                 text: self.text_of(text),
                 truncated,
+            },
+            Item::ToolCall {
+                call,
+                tool,
+                generation,
+                args,
+            } => ItemView::ToolCall {
+                call,
+                tool,
+                generation,
+                args: self.text_of(args),
+            },
+            Item::ToolResult {
+                call,
+                outcome,
+                text,
+            } => ItemView::ToolResult {
+                call,
+                outcome,
+                text: self.text_of(text),
+            },
+            Item::Notice { kind, text } => ItemView::Notice {
+                kind,
+                text: self.text_of(text),
             },
         })
     }
@@ -182,6 +267,36 @@ mod tests {
                     who: ParticipantId(2),
                     text: "",
                     addressed: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_calls_keep_their_arguments_and_results() {
+        use crate::fact::{NoticeKind, ToolOutcome};
+        use crate::ids::{ToolCallId, ToolId};
+
+        let mut conversation = Conversation::default();
+        conversation.push_tool_call(ToolCallId(1), ToolId(0), GenId(1), r#"{"which":"last"}"#);
+        conversation.push_tool_call(ToolCallId(2), ToolId(1), GenId(1), "{}");
+        conversation.push_tool_result(ToolCallId(2), ToolOutcome::Completed, "done");
+        conversation.push_notice(NoticeKind::Recovered, "the session was resumed");
+        assert_eq!(conversation.call_args(ToolCallId(1)), r#"{"which":"last"}"#);
+        assert_eq!(conversation.call_args(ToolCallId(2)), "{}");
+        assert_eq!(conversation.call_args(ToolCallId(3)), "");
+        let items = conversation.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items[2..],
+            [
+                ItemView::ToolResult {
+                    call: ToolCallId(2),
+                    outcome: ToolOutcome::Completed,
+                    text: "done",
+                },
+                ItemView::Notice {
+                    kind: NoticeKind::Recovered,
+                    text: "the session was resumed",
                 },
             ]
         );

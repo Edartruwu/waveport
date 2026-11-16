@@ -8,24 +8,34 @@
 //! heard. A step breaks an invariant when the kernel's emissions or its
 //! state disagree with that account.
 //!
-//! The invariants are those of `docs/architecture.md`, section 13. Checked
-//! here are the ones that concern turns, responses and the session's life:
-//! 1, 2, 3, 6, 7 and 8, the numbering of facts from 10, and progress. The
-//! ones about tools and recovery arrive with the tools.
+//! The invariants are those of `docs/architecture.md`, section 13. A
+//! monitor checks all of them that can be seen in one life of a session:
+//! 1 to 8, the numbering of facts from 10, and progress. Invariant 9, that
+//! the journal rebuilds the session, is checked by [`Journal`], which
+//! keeps what the kernel journaled; and what must hold from one life of a
+//! session to the next is checked by whoever restarts it, with a monitor
+//! made by [`Monitor::restored`].
+
+mod calls;
 
 use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::time::Duration;
 
 use waveport_domain::command::{
-    Activity, ClientEvent, Command, LlmCmd, PlayoutCmd, SenseCmd, TtsCmd,
+    Activity, ClientEvent, Command, LlmCause, LlmCmd, PlayoutCmd, SenseCmd, TtsCmd,
 };
-use waveport_domain::config::Limits;
-use waveport_domain::event::{ControlInput, Event, OpEvent};
-use waveport_domain::fact::{Dismissal, Fact, Lifecycle};
-use waveport_domain::ids::{Epoch, GenId, OpTag, ParticipantId, TurnId};
-use waveport_domain::kernel::View;
+use waveport_domain::config::{KernelConfig, Limits};
+use waveport_domain::event::{ControlInput, Event, OpEvent, Part};
+use waveport_domain::fact::{Dismissal, EpochCause, Fact, Lifecycle, Stamped};
+use waveport_domain::ids::{AgentId, Epoch, GenId, OpTag, ParticipantId, Seq, ToolCallId, TurnId};
+use waveport_domain::kernel::{Kernel, Snapshot, View};
 use waveport_domain::out::Out;
+use waveport_domain::policy::{DefaultPolicies, Policies};
+use waveport_domain::text::TextArena;
 use waveport_domain::time::MonoTime;
+
+use self::calls::{Desk, Recovery};
 
 /// What a broken step broke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -39,6 +49,13 @@ pub enum Rule {
     /// Invariant 3: a response enters the conversation once, as exactly
     /// the part of its text that was heard.
     SpokenText,
+    /// Invariant 4: a tool call that may change something is sent only
+    /// once the record that cleared it is stored, at most once, and ends
+    /// once, in a way its tool accounts for.
+    Tools,
+    /// Invariant 5: the results of a batch of tool calls start at most
+    /// one response.
+    Continuation,
     /// Invariant 6: one response is heard at a time.
     OneVoice,
     /// Invariant 7: a session asked to close is closed in time, in order,
@@ -47,9 +64,15 @@ pub enum Rule {
     /// Invariant 8: every table and every step's output stays within its
     /// bound.
     Bounds,
+    /// Invariant 9: a snapshot and the facts journaled since add up to
+    /// what the session holds, and a session rebuilt from them begins by
+    /// dealing with what was lost.
+    Restore,
     /// Invariant 10: facts are numbered without gaps, and a kernel that
     /// lost its lease emits nothing.
     Journal,
+    /// The floor went from one agent to another in a way it may not.
+    Stage,
     /// Nothing more is going to happen, and something is unfinished.
     Progress,
 }
@@ -63,11 +86,14 @@ impl Rule {
             Self::Liveness => Some(1),
             Self::Turns => Some(2),
             Self::SpokenText => Some(3),
+            Self::Tools => Some(4),
+            Self::Continuation => Some(5),
             Self::OneVoice => Some(6),
             Self::Closing => Some(7),
             Self::Bounds => Some(8),
+            Self::Restore => Some(9),
             Self::Journal => Some(10),
-            Self::Progress => None,
+            Self::Stage | Self::Progress => None,
         }
     }
 }
@@ -83,9 +109,10 @@ pub struct Violation {
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.rule.number() {
-            Some(number) => write!(f, "invariant {number} is broken: {}", self.what),
-            None => write!(f, "the session is stuck: {}", self.what),
+        match (self.rule.number(), self.rule) {
+            (Some(number), _) => write!(f, "invariant {number} is broken: {}", self.what),
+            (None, Rule::Stage) => write!(f, "the floor changed hands wrongly: {}", self.what),
+            (None, _) => write!(f, "the session is stuck: {}", self.what),
         }
     }
 }
@@ -100,8 +127,158 @@ fn ensure(holds: bool, rule: Rule, what: impl FnOnce() -> String) -> Result<(), 
     }
 }
 
+/// Everything a session journaled, kept the way a journal keeps it: the
+/// facts in order with their text, and the snapshots taken on the way.
+///
+/// It checks invariant 9: the first snapshot and every later one, each
+/// with the facts journaled since, add up to what the kernel holds.
+#[derive(Clone, Debug)]
+pub struct Journal {
+    /// The snapshots, oldest first. The first is of the session before
+    /// its first fact.
+    snapshots: Vec<Snapshot>,
+    facts: Vec<Stamped>,
+    text: TextArena,
+}
+
+impl Journal {
+    /// The journal of a session that begins as `snapshot` has it.
+    #[must_use]
+    pub fn new(snapshot: Snapshot) -> Self {
+        Self {
+            snapshots: vec![snapshot],
+            facts: Vec::new(),
+            text: TextArena::default(),
+        }
+    }
+
+    /// Keeps the facts of one step.
+    pub fn record(&mut self, out: &Out) {
+        for stamped in &out.facts {
+            let fact = match stamped.fact.text() {
+                Some(at) => stamped.fact.with_text(self.text.push(out.text.get(at))),
+                None => stamped.fact,
+            };
+            self.facts.push(Stamped {
+                seq: stamped.seq,
+                fact,
+            });
+        }
+    }
+
+    /// Keeps a snapshot, as a journal does now and then so that it need
+    /// not be read from its beginning.
+    pub fn keep(&mut self, snapshot: Snapshot) {
+        self.snapshots.push(snapshot);
+    }
+
+    /// The place of the last fact kept.
+    #[must_use]
+    pub fn last(&self) -> Seq {
+        self.facts.last().map_or_else(
+            || {
+                let first = self.snapshots.first().map(Snapshot::next_seq);
+                Seq(first.map_or(0, |next| next.get().saturating_sub(1)))
+            },
+            |stamped| stamped.seq,
+        )
+    }
+
+    /// Forgets every fact after `stored` and every snapshot that holds
+    /// one: what a crash does to a journal whose last writes had not
+    /// reached the disk.
+    pub fn cut(&mut self, stored: Seq) {
+        self.facts.retain(|stamped| stamped.seq <= stored);
+        let first = self.snapshots.first().cloned();
+        self.snapshots
+            .retain(|snapshot| snapshot.next_seq() <= stored.next());
+        if self.snapshots.is_empty() {
+            self.snapshots.extend(first);
+        }
+    }
+
+    /// The facts from `from` on.
+    fn since(&self, from: Seq) -> &[Stamped] {
+        let start = self
+            .facts
+            .iter()
+            .position(|stamped| stamped.seq >= from)
+            .unwrap_or(self.facts.len());
+        self.facts.get(start..).unwrap_or(&[])
+    }
+
+    /// The newest snapshot, the facts journaled after it, and their text:
+    /// what a session is rebuilt from.
+    #[must_use]
+    pub fn latest(&self) -> Option<(&Snapshot, &[Stamped], &TextArena)> {
+        let snapshot = self.snapshots.last()?;
+        Some((snapshot, self.since(snapshot.next_seq()), &self.text))
+    }
+
+    /// The response whose speech the journal has as being heard and not
+    /// as ended, and what it has as heard of it.
+    #[must_use]
+    pub fn speech(&self) -> Option<(GenId, String)> {
+        let mut speech: Option<(GenId, String)> = None;
+        for stamped in &self.facts {
+            match stamped.fact {
+                Fact::UtteranceProgress {
+                    generation, heard, ..
+                } => {
+                    let heard = self.text.get(heard);
+                    match &mut speech {
+                        Some((of, text)) if *of == generation => text.push_str(heard),
+                        _ => speech = Some((generation, heard.to_owned())),
+                    }
+                }
+                Fact::UtteranceCommitted { generation, .. }
+                    if speech.as_ref().is_some_and(|(of, _)| *of == generation) =>
+                {
+                    speech = None;
+                }
+                _ => {}
+            }
+        }
+        speech
+    }
+
+    /// Checks that every snapshot kept, with the facts journaled after
+    /// it, adds up to what `kernel` holds.
+    ///
+    /// # Errors
+    ///
+    /// One does not: invariant 9 is broken.
+    pub fn check<P: Policies>(&self, kernel: &Kernel<P>) -> Result<(), Violation> {
+        let live = kernel.snapshot();
+        for snapshot in &self.snapshots {
+            let from = snapshot.next_seq();
+            let rebuilt = Kernel::restore(
+                kernel.config().clone(),
+                DefaultPolicies::default(),
+                snapshot,
+                self.since(from),
+                &self.text,
+            );
+            let same = rebuilt
+                .as_ref()
+                .is_ok_and(|rebuilt| rebuilt.snapshot() == live);
+            ensure(same, Rule::Restore, || match rebuilt {
+                Ok(rebuilt) => format!(
+                    "the snapshot before fact #{from} and the facts since add up to\n{:?}\nand \
+                     the session holds\n{live:?}",
+                    rebuilt.snapshot()
+                ),
+                Err(error) => format!(
+                    "the session cannot be rebuilt from the snapshot before fact #{from}: {error}"
+                ),
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// An open turn, as the monitor has it.
-#[derive(Debug)]
+#[derive(Clone, Debug, Hash)]
 struct Heard {
     turn: TurnId,
     who: ParticipantId,
@@ -112,7 +289,7 @@ struct Heard {
 }
 
 /// A response under way, as the monitor has it.
-#[derive(Debug)]
+#[derive(Clone, Debug, Hash)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each is one thing seen to happen to a response, and they are checked against each other"
@@ -136,12 +313,20 @@ struct Spoken {
     started: bool,
     lowered: bool,
     stopped: bool,
+    /// Whether synthesis was told to stop.
+    silenced: bool,
     /// Bytes of `released` reported as heard.
     heard: usize,
     /// Bytes of `released` journaled as heard.
     recorded: usize,
     /// Whether it entered the conversation.
     committed: bool,
+    /// The tool call it works on, if it does not speak.
+    works_on: Option<ToolCallId>,
+    /// The agent whose language model was asked for it.
+    agent: Option<AgentId>,
+    /// Whether its language model has finished, or was told to stop.
+    done: bool,
 }
 
 impl Spoken {
@@ -161,9 +346,13 @@ impl Spoken {
             started: false,
             lowered: false,
             stopped: false,
+            silenced: false,
             heard: 0,
             recorded: 0,
             committed: false,
+            works_on: None,
+            agent: None,
+            done: false,
         }
     }
 
@@ -180,13 +369,21 @@ impl Spoken {
 }
 
 /// Watches a kernel, one step at a time.
-#[derive(Debug)]
+///
+/// A clone goes on watching a clone of the kernel. Two monitors hash the
+/// same when they have learnt the same of their sessions.
+#[derive(Clone, Debug)]
 pub struct Monitor {
+    config: KernelConfig,
     limits: Limits,
     /// How long a session has to close once asked.
     closing_time: Duration,
     leased: bool,
     last_seq: u64,
+    /// The epoch the session was in when the monitor began to watch.
+    began: Epoch,
+    /// The epoch the session was in before the step being looked at.
+    entered: Epoch,
     epoch: Epoch,
     lifecycle: Lifecycle,
     /// When the session must be closed, once it was asked to close.
@@ -208,20 +405,58 @@ pub struct Monitor {
     replied: u32,
     /// Words that arrived in this step and must be a turn of their own.
     arrived: Option<(ParticipantId, String)>,
+    /// The tool calls, their batches, and who has the floor.
+    desk: Desk,
+}
+
+impl Hash for Monitor {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The configuration is left out: it does not change.
+        let Self {
+            config: _,
+            limits: _,
+            closing_time: _,
+            leased,
+            last_seq,
+            began,
+            entered,
+            epoch,
+            lifecycle,
+            close_by,
+            people,
+            turns,
+            last_turn,
+            responses,
+            last_generation,
+            voice,
+            context,
+            owed,
+            replied,
+            arrived,
+            desk,
+        } = self;
+        (leased, last_seq, began, entered, epoch, lifecycle, close_by).hash(state);
+        (people, turns, last_turn, responses, last_generation, voice).hash(state);
+        (context, owed, replied, arrived, desk).hash(state);
+    }
 }
 
 impl Monitor {
-    /// A monitor for a kernel in the state `view` shows: new, or just
-    /// restored, with no turn and no response under way.
+    /// A monitor for a kernel in the state `view` shows, with no turn and
+    /// no response under way: a new one.
     #[must_use]
     pub fn new(view: View<'_>) -> Self {
         let config = view.config();
         let context = view.context_version().get();
         Self {
+            config: config.clone(),
+            desk: Desk::of(view),
             limits: config.limits,
             closing_time: config.timing.drain + config.timing.grace,
             leased: true,
             last_seq: view.next_seq().get().saturating_sub(1),
+            began: view.epoch(),
+            entered: view.epoch(),
             epoch: view.epoch(),
             lifecycle: view.lifecycle(),
             close_by: None,
@@ -236,6 +471,27 @@ impl Monitor {
             replied: context,
             arrived: None,
         }
+    }
+
+    /// A monitor for a kernel that was rebuilt from its journal and has
+    /// not taken a step. `speech` is the response that was being heard
+    /// when the session's earlier life ended, and what the journal has as
+    /// heard of it. The kernel's first step has to deal with everything
+    /// that was under way then.
+    #[must_use]
+    pub fn restored(view: View<'_>, speech: Option<(GenId, String)>) -> Self {
+        let mut monitor = Self::new(view);
+        let lost = view.reply_owed() || speech.is_some() || view.calls().next().is_some();
+        if view.reply_owed() {
+            monitor.owed = monitor.context;
+            monitor.replied = monitor.context.saturating_sub(1);
+        }
+        monitor.desk.recovery = Some(Recovery {
+            speech,
+            lost,
+            noted: false,
+        });
+        monitor
     }
 
     /// Looks at one step: the event the kernel was given at `now`, what it
@@ -266,13 +522,20 @@ impl Monitor {
         }
 
         let whole = self.delivered(now, event);
+        let first = out.facts.first().map(|stamped| {
+            let recovery = EpochCause::Recovery;
+            matches!(stamped.fact, Fact::EpochAdvanced { cause, .. } if cause == recovery)
+        });
+        self.recovery_began(first)?;
         self.words_arrived(event, out)?;
+        self.entered = self.epoch;
         // Facts and commands are two lists, so the order between a fact
         // and a command is not known. A turn can begin and end in one
         // step; its beginning is a command and its end a fact, so the
-        // beginnings are read first.
+        // beginnings are read first. So are the ends of responses, which
+        // decide what may become of the tool calls they asked for.
         for command in &out.cmds {
-            self.turn_began(command)?;
+            self.foreseen(event, command, whole)?;
         }
         for stamped in &out.facts {
             ensure(
@@ -282,7 +545,7 @@ impl Monitor {
             )?;
             self.last_seq = stamped.seq.get();
             let text = stamped.fact.text().map_or("", |text| out.text.get(text));
-            self.fact(&stamped.fact, text, whole)?;
+            self.fact(event, stamped, text, whole)?;
         }
         for command in &out.cmds {
             let text = command.text().map_or("", |text| out.text.get(text));
@@ -323,6 +586,7 @@ impl Monitor {
                 .collect::<Vec<_>>();
             format!("the responses {tags:?} never ended")
         })?;
+        self.desk_at_rest()?;
         ensure(
             self.owed <= self.replied && !view.reply_owed(),
             Rule::Progress,
@@ -347,6 +611,10 @@ impl Monitor {
                     .find(|spoken| spoken.tag == *tag)?;
                 match op {
                     OpEvent::LlmDelta { text } => spoken.script.push_str(text.as_str()),
+                    OpEvent::LlmDone { .. }
+                    | OpEvent::Failed {
+                        part: Part::Think, ..
+                    } => spoken.done = true,
                     OpEvent::TtsSegment { last: true, .. } if spoken.finished => {
                         spoken.synthesized = true;
                     }
@@ -371,6 +639,10 @@ impl Monitor {
             }
             Event::Control(ControlInput::Close { .. }) if self.lifecycle == Lifecycle::Running => {
                 self.close_by = Some(now.after(self.closing_time));
+            }
+            // Nothing is stored that was not emitted.
+            Event::Durable(seq) => {
+                self.desk.durable = self.desk.durable.max(seq.get().min(self.last_seq));
             }
             _ => {}
         }
@@ -423,8 +695,14 @@ impl Monitor {
     }
 
     #[expect(clippy::too_many_lines, reason = "one arm per fact, each a few checks")]
-    fn fact(&mut self, fact: &Fact, text: &str, whole: Option<GenId>) -> Result<(), Violation> {
-        match *fact {
+    fn fact(
+        &mut self,
+        event: &Event,
+        stamped: &Stamped,
+        text: &str,
+        whole: Option<GenId>,
+    ) -> Result<(), Violation> {
+        match stamped.fact {
             Fact::ParticipantJoined { who } => {
                 ensure(!self.people.contains(&who), Rule::Bounds, || {
                     format!("{who} joined a second time")
@@ -449,11 +727,18 @@ impl Monitor {
                 })?;
                 self.lifecycle = to;
             }
-            Fact::EpochAdvanced { to, .. } => {
+            Fact::EpochAdvanced { to, cause } => {
                 ensure(to.get() == self.epoch.get() + 1, Rule::Liveness, || {
                     format!("the epoch went from {} to {to}", self.epoch)
                 })?;
                 self.epoch = to;
+                let restored = self.desk.recovering && to.get() == self.began.get() + 1;
+                ensure(
+                    (cause == EpochCause::Recovery) == restored,
+                    Rule::Restore,
+                    || format!("the epoch went to {to} for {cause:?}"),
+                )?;
+                self.floor_cut();
             }
             Fact::TurnCommitted {
                 turn,
@@ -464,6 +749,7 @@ impl Monitor {
                 self.context += 1;
                 if addressed {
                     self.owed = self.context;
+                    self.desk.cause = Some(LlmCause::Reply { turn });
                 }
                 if let Some(index) = self.turns.iter().position(|heard| heard.turn == turn) {
                     let heard = self.turns.remove(index);
@@ -539,17 +825,24 @@ impl Monitor {
             Fact::UtteranceCommitted {
                 generation,
                 truncated,
+                answers,
                 ..
             } => {
                 self.context += 1;
                 let Some(spoken) = self.spoken(generation) else {
-                    return Err(Violation {
-                        rule: Rule::SpokenText,
-                        what: format!(
-                            "response {generation} entered the conversation, and it is not under way"
-                        ),
-                    });
+                    // The one response a session can record without ever
+                    // having seen it is the one its earlier life lost.
+                    return self.lost_speech(generation, text, truncated, answers.is_some());
                 };
+                // Speech answers something only when it came from a
+                // language model and was heard to the end.
+                let may_answer = spoken.asked && !truncated;
+                ensure(answers.is_none() || may_answer, Rule::SpokenText, || {
+                    format!(
+                        "response {generation} is recorded as answering {answers:?}; it was cut \
+                         off: {truncated}"
+                    )
+                })?;
                 ensure(!spoken.committed, Rule::SpokenText, || {
                     format!("response {generation} entered the conversation twice")
                 })?;
@@ -584,8 +877,22 @@ impl Monitor {
                     },
                 )?;
             }
-            // The tools' facts are checked with the tools.
-            _ => {}
+            Fact::NoticeAppended { kind, .. } => self.noted(event, kind, text)?,
+            Fact::ToolProposed {
+                call,
+                batch,
+                generation,
+                tool,
+                ..
+            } => self.call_proposed(event, call, batch, generation, tool, text)?,
+            Fact::ToolAuthorized { call } => self.call_cleared(stamped.seq.get(), call)?,
+            Fact::ToolDispatched { call, attempt } => self.call_sent(call, attempt)?,
+            Fact::ToolFinished { call, outcome, .. } => {
+                self.call_ended(event, call, outcome, text)?;
+            }
+            Fact::BatchResolved { batch } => self.batch_resolved(batch)?,
+            Fact::HandoffRequested { to } => self.handoff_asked(event, to)?,
+            Fact::AgentActivated { agent } => self.agent_activated(event, agent)?,
         }
         Ok(())
     }
@@ -622,8 +929,14 @@ impl Monitor {
             Rule::Liveness,
             || format!("a command was emitted for {tag:?}, which has ended"),
         )?;
-        ensure(tag.epoch == self.epoch, Rule::Liveness, || {
-            format!("{tag:?} began while the session is in epoch {}", self.epoch)
+        // The epoch may have moved since it began, within the step: the
+        // facts are read before the commands.
+        let current = (self.entered..=self.epoch).contains(&tag.epoch);
+        ensure(current, Rule::Liveness, || {
+            format!(
+                "{tag:?} began in a step that took the session from epoch {} to {}",
+                self.entered, self.epoch
+            )
         })?;
         ensure(
             self.responses.len() < self.limits.generations,
@@ -640,10 +953,38 @@ impl Monitor {
         Ok(self.responses.len() - 1)
     }
 
-    /// Takes note of the turns that a step's commands open, and of the
-    /// ones they say are spoken over the agent.
-    fn turn_began(&mut self, command: &Command) -> Result<(), Violation> {
+    /// Takes note of what a step's commands tell that its facts depend
+    /// on: the turns they open, the ones they say are spoken over the
+    /// agent, and the responses they end.
+    fn foreseen(
+        &mut self,
+        event: &Event,
+        command: &Command,
+        whole: Option<GenId>,
+    ) -> Result<(), Violation> {
         match *command {
+            Command::Emit(ClientEvent::Agent {
+                generation: Some(generation),
+                activity: Activity::Listening,
+                ..
+            }) => {
+                // A response ends by itself in two ways: it is heard to
+                // its end, or its language model stops having written
+                // nothing. Every other end cuts it off.
+                let silent = self
+                    .spoken(generation)
+                    .is_none_or(|spoken| spoken.script.trim().is_empty());
+                let stopped = matches!(event, Event::Op(tag, OpEvent::LlmDone { .. }
+                    | OpEvent::Failed { part: Part::Think, .. }) if tag.generation == generation);
+                let cut = whole != Some(generation) && !(stopped && silent);
+                self.desk.ending.push((generation, cut));
+                if !cut {
+                    self.asker_done(generation);
+                }
+            }
+            // Its language model writes until the step is over: what it
+            // asked for in this step, it asked for in time.
+            Command::Llm(tag, LlmCmd::Cancel) => self.desk.stopping.push(tag),
             Command::Emit(ClientEvent::UserSpeaking {
                 who,
                 turn,
@@ -699,6 +1040,9 @@ impl Monitor {
                     format!("turn {turn} was taken for speech over the agent's, and it is not")
                 })?;
             }
+            // The agent that worked on a call that ended in this step is
+            // gone from the account already.
+            Command::Llm(tag, LlmCmd::Cancel) if self.retires(tag) => {}
             Command::Llm(tag, llm) => {
                 let index = self.response(tag, event)?;
                 let (running, context) = (self.lifecycle == Lifecycle::Running, self.context);
@@ -706,10 +1050,27 @@ impl Monitor {
                     return Ok(());
                 };
                 let holds = match llm {
-                    LlmCmd::Start { context: on, .. } => {
+                    LlmCmd::Start {
+                        agent,
+                        context: on,
+                        cause,
+                    } => {
                         let first = !spoken.asked;
+                        if first {
+                            // What a language model is asked for, it
+                            // writes: nothing was given to it to say, even
+                            // in a step that begins with words to say.
+                            spoken.script.clear();
+                        }
                         spoken.asked = true;
-                        self.replied = self.replied.max(on.get());
+                        spoken.agent = Some(agent);
+                        let works_on = self.started(tag, agent, cause)?;
+                        if works_on.is_none() {
+                            self.replied = self.replied.max(on.get());
+                        }
+                        if let Some(spoken) = self.responses.get_mut(index) {
+                            spoken.works_on = works_on;
+                        }
                         first && running && on.get() <= context
                     }
                     LlmCmd::Pause => {
@@ -722,7 +1083,10 @@ impl Monitor {
                         spoken.waiting = false;
                         may
                     }
-                    LlmCmd::Cancel => spoken.asked,
+                    LlmCmd::Cancel => {
+                        spoken.done = true;
+                        spoken.asked
+                    }
                 };
                 ensure(holds, Rule::Liveness, || {
                     format!(
@@ -735,9 +1099,13 @@ impl Monitor {
                 let Some(spoken) = self.responses.get_mut(index) else {
                     return Ok(());
                 };
+                ensure(spoken.works_on.is_none(), Rule::OneVoice, || {
+                    format!("{tag:?} works on a tool call, and was given something to say")
+                })?;
                 match tts {
                     TtsCmd::Speak { .. } => {
-                        let open = !spoken.finished && !text.is_empty();
+                        // White space alone is nothing to say.
+                        let open = !spoken.finished && !text.trim().is_empty();
                         spoken.released.push_str(text);
                         let written = spoken.script.starts_with(spoken.released.as_str());
                         ensure(open && written, Rule::SpokenText, || {
@@ -758,6 +1126,7 @@ impl Monitor {
                         })?;
                     }
                     TtsCmd::Cancel => {
+                        spoken.silenced = true;
                         ensure(!spoken.released.is_empty(), Rule::SpokenText, || {
                             format!(
                                 "synthesis for {tag:?} was cancelled, and it was never given text"
@@ -773,6 +1142,9 @@ impl Monitor {
                 let Some(spoken) = self.responses.get_mut(index) else {
                     return Ok(());
                 };
+                ensure(spoken.works_on.is_none(), Rule::OneVoice, || {
+                    format!("{tag:?} works on a tool call, and was given a voice")
+                })?;
                 let holds = match playout {
                     PlayoutCmd::Start => {
                         let may = voice.is_none() && !spoken.started && !spoken.released.is_empty();
@@ -816,13 +1188,11 @@ impl Monitor {
                     })?;
                 }
             },
+            Command::Tool(call, tool) => self.tool_command(call, tool, text)?,
+            Command::AwaitDurable(seq) => self.storing_asked(seq.get())?,
             // Timers are only wake-ups, and what a kernel tells the
-            // transcriber is advice. Tools arrive later.
-            Command::Emit(_)
-            | Command::SetTimer(..)
-            | Command::Stt(_)
-            | Command::Tool(..)
-            | Command::AwaitDurable(_) => {}
+            // transcriber is advice.
+            Command::Emit(_) | Command::SetTimer(..) | Command::Stt(_) => {}
         }
         Ok(())
     }
@@ -848,7 +1218,22 @@ impl Monitor {
         if self.voice == Some(generation) {
             self.voice = None;
         }
-        let heard = spoken.audible(whole == Some(generation));
+        // No part is left working for a response that is over.
+        let whole = whole == Some(generation);
+        let writing = spoken.asked && !spoken.done;
+        let synthesizing = !spoken.released.is_empty() && !spoken.synthesized && !spoken.silenced;
+        let playing = spoken.started && !whole && !spoken.stopped;
+        ensure(
+            !writing && !synthesizing && !playing,
+            Rule::Liveness,
+            || {
+                format!(
+                    "response {generation} ended and left work going on for it: its language \
+                     model writing: {writing}, synthesis: {synthesizing}, playback: {playing}"
+                )
+            },
+        )?;
+        let heard = spoken.audible(whole);
         ensure(
             spoken.committed || heard.is_empty(),
             Rule::SpokenText,
@@ -1023,11 +1408,16 @@ impl Monitor {
             format!("someone has two turns open at once: {open:?}")
         })?;
 
+        self.desk_settled(view)?;
+
         let limits = self.limits;
         let within = self.people.len() <= limits.participants
             && self.turns.len() <= limits.open_turns
-            && self.responses.len() <= limits.generations;
-        let most = 8 * (limits.participants + limits.open_turns + limits.generations + 4);
+            && self.responses.len() <= limits.generations
+            && self.desk.calls.len() <= limits.open_calls;
+        let tables =
+            limits.participants + limits.open_turns + limits.generations + limits.open_calls;
+        let most = 8 * (tables + 4);
         ensure(
             within && out.cmds.len() <= most && out.facts.len() <= most,
             Rule::Bounds,

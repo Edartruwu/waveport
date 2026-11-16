@@ -156,6 +156,10 @@ pub struct Timing {
     pub checkpoint_every: Duration,
     /// How long a cancelled tool call may take to confirm a rollback.
     pub rollback_wait: Duration,
+    /// How long the parts that serve an agent may take to become ready
+    /// when it is given the floor. After that the agent that had the floor
+    /// keeps it.
+    pub stage_wait: Duration,
     /// How long a closing session may spend finishing what is under way.
     pub drain: Duration,
     /// How long it may then spend stopping.
@@ -176,6 +180,7 @@ impl Default for Timing {
             generation_max: Duration::from_secs(60),
             checkpoint_every: Duration::from_secs(1),
             rollback_wait: Duration::from_secs(2),
+            stage_wait: Duration::from_secs(5),
             drain: Duration::from_secs(5),
             grace: Duration::from_secs(2),
             stop_fade_ms: 8,

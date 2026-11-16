@@ -29,23 +29,32 @@ mod fingerprint;
 mod floor;
 mod lifecycle;
 mod response;
+mod tools;
 mod view;
 
 use core::fmt;
 
-pub use view::{CallState, CallView, GenerationRole, GenerationView, ItemView, TurnView, View};
+pub use view::{
+    BatchView, CallState, CallView, GenerationRole, GenerationView, ItemView, TurnView, View,
+};
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use self::conversation::Conversation;
 use self::coordinator::Step;
 use self::floor::OpenTurn;
 use self::lifecycle::Closing;
 use self::response::Generation;
+use self::tools::{Batch, Call};
 use crate::bounded::Bounded;
 use crate::command::LlmCause;
 use crate::config::{AgentSpec, ConfigError, KernelConfig, ToolSpec};
-use crate::event::{ControlInput, Event};
-use crate::fact::{Fact, Lifecycle, Stamped};
-use crate::ids::{AgentId, ContextVersion, Epoch, GenId, ParticipantId, Seq, ToolId, TurnId};
+use crate::event::{CloseReason, ControlInput, Event};
+use crate::fact::{Fact, Lifecycle, Stamped, ToolOutcome};
+use crate::ids::{
+    AgentId, BatchId, ContextVersion, Epoch, GenId, ParticipantId, Seq, ToolCallId, ToolId, TurnId,
+};
 use crate::out::Out;
 use crate::policy::{DefaultPolicies, Policies};
 use crate::text::TextArena;
@@ -54,35 +63,72 @@ use crate::time::MonoTime;
 /// Everything about a session that a step may change. It is plain data:
 /// two kernels with equal state behave the same from then on.
 ///
-/// Part of it outlives a crash: the conversation, the participants, the
-/// epoch and the stage of the session's life. That part changes only in
-/// [`State::apply`], by a fact that is journaled, so the journal can
-/// rebuild it. The rest, the turns and responses under way, is lost with
-/// the process, and the session carries on without it.
+/// The first part outlives a crash. It changes only in [`State::apply`],
+/// by a fact that is journaled, so the journal can rebuild it, and it is
+/// what a [`Snapshot`] holds. The second part, the turns and responses
+/// under way and everything that is a matter of time, is lost with the
+/// process, and the session carries on without it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct State {
+    // ---- Journaled -----------------------------------------------------
     epoch: Epoch,
     lifecycle: Lifecycle,
-    closing: Option<Closing>,
-    attached: bool,
-    /// Whether this kernel still owns the session.
-    leased: bool,
+    /// Why the session is closing, once it is.
+    closed_for: Option<CloseReason>,
+    /// The agent that holds the floor.
     front: AgentId,
+    /// The agent that was asked to take the floor and has not yet.
+    handoff: Option<AgentId>,
     /// The sequence number the next fact gets.
     next_seq: Seq,
-    next_turn: TurnId,
-    next_gen: GenId,
+    /// The lowest turn number no fact has named.
+    turn_floor: TurnId,
+    /// The lowest response number no fact has named.
+    gen_floor: GenId,
+    next_call: ToolCallId,
+    next_batch: BatchId,
     participants: Bounded<ParticipantId>,
-    turns: Bounded<OpenTurn>,
-    generations: Bounded<Generation>,
+    /// The tool calls that have not ended. What a call is waiting for is
+    /// not journaled.
+    calls: Bounded<Call>,
+    /// The batches that are not resolved. Whether the response that asked
+    /// has ended is not journaled.
+    batches: Bounded<Batch>,
     conversation: Conversation,
     /// The newest item of the conversation that is owed a response, as the
     /// version of the conversation that holds it, and what the response is
     /// for.
     owed: Option<(ContextVersion, LlmCause)>,
-    /// The conversation the latest response was started on. A response is
-    /// owed while `owed` is newer than this.
+    /// The conversation that has had its response: an agent answered it
+    /// and was heard to the end.
     answered: ContextVersion,
+    /// The response whose speech is being heard, as far as that has been
+    /// recorded, and what was recorded as heard of it.
+    speech: Option<(GenId, AgentId)>,
+    speech_text: String,
+
+    // ---- Not journaled -------------------------------------------------
+    closing: Option<Closing>,
+    attached: bool,
+    /// Whether this kernel still owns the session.
+    leased: bool,
+    /// Whether the session was rebuilt from its journal and has not yet
+    /// dealt with what was lost.
+    recovering: bool,
+    /// The number the next turn gets. Never below `turn_floor`.
+    next_turn: TurnId,
+    /// The number the next response gets. Never below `gen_floor`.
+    next_gen: GenId,
+    /// Every fact up to this one is stored durably.
+    durable: Seq,
+    /// The conversation the latest response was started on. A response is
+    /// owed while `owed` is newer than this and than `answered`.
+    started: ContextVersion,
+    /// When an agent that was asked to take the floor has had its time to
+    /// become ready.
+    stage_until: Option<MonoTime>,
+    turns: Bounded<OpenTurn>,
+    generations: Bounded<Generation>,
 }
 
 impl State {
@@ -91,19 +137,35 @@ impl State {
         Self {
             epoch: Epoch(0),
             lifecycle: Lifecycle::Running,
-            closing: None,
-            attached: true,
-            leased: true,
+            closed_for: None,
             front: config.front,
+            handoff: None,
             next_seq: Seq(1),
-            next_turn: TurnId(1),
-            next_gen: GenId(1),
+            turn_floor: TurnId(1),
+            gen_floor: GenId(1),
+            next_call: ToolCallId(1),
+            next_batch: BatchId(1),
             participants: Bounded::new(limits.participants),
-            turns: Bounded::new(limits.open_turns),
-            generations: Bounded::new(limits.generations),
+            calls: Bounded::new(limits.open_calls),
+            // A batch that is not resolved has a call that has not ended,
+            // or a response that may still ask for one.
+            batches: Bounded::new(limits.open_calls.saturating_add(limits.generations)),
             conversation: Conversation::default(),
             owed: None,
             answered: ContextVersion(0),
+            speech: None,
+            speech_text: String::with_capacity(limits.response_text),
+            closing: None,
+            attached: true,
+            leased: true,
+            recovering: false,
+            next_turn: TurnId(1),
+            next_gen: GenId(1),
+            durable: Seq(0),
+            started: ContextVersion(0),
+            stage_until: None,
+            turns: Bounded::new(limits.open_turns),
+            generations: Bounded::new(limits.generations),
         }
     }
 
@@ -112,6 +174,10 @@ impl State {
     /// This only sets values. Every decision was taken before the fact was
     /// emitted, so applying the same facts in the same order gives the
     /// same state, in this build or a later one.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per fact, and each only sets values"
+    )]
     fn apply(&mut self, fact: &Fact, text: &TextArena) {
         match *fact {
             Fact::ParticipantJoined { who } => {
@@ -122,7 +188,10 @@ impl State {
                 }
             }
             Fact::ParticipantLeft { who } => self.participants.retain(|known| *known != who),
-            Fact::LifecycleChanged { to, .. } => self.lifecycle = to,
+            Fact::LifecycleChanged { to, reason } => {
+                self.lifecycle = to;
+                self.closed_for = reason.or(self.closed_for);
+            }
             Fact::EpochAdvanced { to, .. } => self.epoch = to,
             Fact::TurnCommitted {
                 turn,
@@ -136,32 +205,195 @@ impl State {
                 if addressed {
                     self.owed = Some((self.conversation.version(), LlmCause::Reply { turn }));
                 }
-                self.next_turn = self.next_turn.max(turn.next());
+                self.saw_turn(turn);
             }
-            Fact::TurnDismissed { turn, .. } => {
-                self.next_turn = self.next_turn.max(turn.next());
+            Fact::TurnDismissed { turn, .. } => self.saw_turn(turn),
+            Fact::NoticeAppended { kind, text: note } => {
+                self.conversation.push_notice(kind, text.get(note));
+            }
+            Fact::UtteranceProgress {
+                generation,
+                agent,
+                heard,
+            } => {
+                if self.speech != Some((generation, agent)) {
+                    self.speech = Some((generation, agent));
+                    self.speech_text.clear();
+                }
+                self.speech_text.push_str(text.get(heard));
+                self.saw_generation(generation);
             }
             Fact::UtteranceCommitted {
                 generation,
                 agent,
+                answers,
                 text: words,
                 truncated,
             } => {
                 self.conversation
                     .push_utterance(generation, agent, text.get(words), truncated);
-                self.next_gen = self.next_gen.max(generation.next());
+                if let Some(answers) = answers {
+                    self.answered = self.answered.max(answers);
+                }
+                if self.speech.is_some_and(|(of, _)| of == generation) {
+                    self.speech = None;
+                    self.speech_text.clear();
+                }
+                self.saw_generation(generation);
             }
-            // Recorded for recovery, which arrives with the tools.
-            Fact::UtteranceProgress { .. }
-            | Fact::NoticeAppended { .. }
-            | Fact::ToolProposed { .. }
-            | Fact::ToolAuthorized { .. }
-            | Fact::ToolDispatched { .. }
-            | Fact::ToolFinished { .. }
-            | Fact::BatchResolved { .. }
-            | Fact::HandoffRequested { .. }
-            | Fact::AgentActivated { .. } => {}
+            Fact::ToolProposed {
+                call,
+                batch,
+                generation,
+                tool,
+                args,
+            } => {
+                self.conversation
+                    .push_tool_call(call, tool, generation, text.get(args));
+                // The tables had room when the fact was emitted.
+                let _ = self
+                    .calls
+                    .push(Call::proposed(call, tool, batch, generation));
+                match self.batch_mut(batch) {
+                    Some(open) => open.pending = open.pending.saturating_add(1),
+                    None => {
+                        let _ = self.batches.push(Batch::begin(batch, generation));
+                    }
+                }
+                self.next_call = self.next_call.max(call.next());
+                self.next_batch = self.next_batch.max(batch.next());
+                self.saw_generation(generation);
+            }
+            Fact::ToolAuthorized { call } => {
+                if let Some(open) = self.call_mut(call) {
+                    open.state = CallState::Authorized;
+                }
+            }
+            Fact::ToolDispatched { call, attempt } => {
+                let Some(open) = self.call_mut(call) else {
+                    return;
+                };
+                open.state = CallState::Dispatched;
+                open.attempt = attempt;
+                let batch = open.batch;
+                if let Some(open) = self.batch_mut(batch) {
+                    open.ran = true;
+                }
+            }
+            Fact::ToolFinished {
+                call,
+                outcome,
+                result,
+            } => {
+                self.conversation
+                    .push_tool_result(call, outcome, text.get(result));
+                let ended = self
+                    .calls
+                    .iter()
+                    .position(|open| open.id == call)
+                    .and_then(|index| self.calls.remove(index));
+                if let Some(open) = ended.and_then(|ended| self.batch_mut(ended.batch)) {
+                    open.pending = open.pending.saturating_sub(1);
+                    open.ran |= outcome != ToolOutcome::Cancelled;
+                }
+            }
+            Fact::BatchResolved { batch } => {
+                let resolved = self
+                    .batches
+                    .iter()
+                    .position(|open| open.id == batch)
+                    .and_then(|index| self.batches.remove(index));
+                if resolved.is_some_and(|resolved| resolved.ran) {
+                    let cause = LlmCause::Continuation { batch };
+                    self.owed = Some((self.conversation.version(), cause));
+                }
+            }
+            Fact::HandoffRequested { to } => self.handoff = Some(to),
+            Fact::AgentActivated { agent } => {
+                self.front = agent;
+                self.handoff = None;
+            }
         }
+    }
+
+    fn saw_turn(&mut self, turn: TurnId) {
+        self.turn_floor = self.turn_floor.max(turn.next());
+        self.next_turn = self.next_turn.max(self.turn_floor);
+    }
+
+    fn saw_generation(&mut self, generation: GenId) {
+        self.gen_floor = self.gen_floor.max(generation.next());
+        self.next_gen = self.next_gen.max(self.gen_floor);
+    }
+
+    fn call_mut(&mut self, call: ToolCallId) -> Option<&mut Call> {
+        self.calls.iter_mut().find(|open| open.id == call)
+    }
+
+    fn batch_mut(&mut self, batch: BatchId) -> Option<&mut Batch> {
+        self.batches.iter_mut().find(|open| open.id == batch)
+    }
+
+    /// Whether a response is owed and none has been started for it.
+    fn reply_owed(&self) -> bool {
+        self.owed
+            .is_some_and(|(needs, _)| needs > self.answered.max(self.started))
+    }
+
+    /// The journaled part of the state.
+    fn journaled(&self) -> Snapshot {
+        Snapshot {
+            epoch: self.epoch,
+            lifecycle: self.lifecycle,
+            closed_for: self.closed_for,
+            front: self.front,
+            handoff: self.handoff,
+            next_seq: self.next_seq,
+            turn_floor: self.turn_floor,
+            gen_floor: self.gen_floor,
+            next_call: self.next_call,
+            next_batch: self.next_batch,
+            participants: self.participants.to_vec(),
+            calls: self.calls.iter().map(Call::journaled).collect(),
+            batches: self.batches.iter().map(Batch::journaled).collect(),
+            conversation: self.conversation.clone(),
+            owed: self.owed,
+            answered: self.answered,
+            speech: self.speech,
+            speech_text: self.speech_text.clone(),
+        }
+    }
+
+    /// The state of a session that is rebuilt from `snapshot`: what was
+    /// journaled, and nothing under way. The error names the limit of
+    /// `config` that is too small for what the snapshot holds.
+    fn revive(config: &KernelConfig, snapshot: &Snapshot) -> Result<Self, &'static str> {
+        let mut state = Self::new(config);
+        state.epoch = snapshot.epoch;
+        state.lifecycle = snapshot.lifecycle;
+        state.closed_for = snapshot.closed_for;
+        state.front = snapshot.front;
+        state.handoff = snapshot.handoff;
+        state.next_seq = snapshot.next_seq;
+        state.turn_floor = snapshot.turn_floor;
+        state.gen_floor = snapshot.gen_floor;
+        state.next_call = snapshot.next_call;
+        state.next_batch = snapshot.next_batch;
+        for &who in &snapshot.participants {
+            state.participants.push(who).map_err(|_| "participants")?;
+        }
+        for &call in &snapshot.calls {
+            state.calls.push(call).map_err(|_| "open_calls")?;
+        }
+        for &batch in &snapshot.batches {
+            state.batches.push(batch).map_err(|_| "open_calls")?;
+        }
+        state.conversation = snapshot.conversation.clone();
+        state.owed = snapshot.owed;
+        state.answered = snapshot.answered;
+        state.speech = snapshot.speech;
+        state.speech_text.push_str(&snapshot.speech_text);
+        Ok(state)
     }
 }
 
@@ -170,6 +402,10 @@ impl State {
 /// The kernel performs no I/O, reads no clock and never waits. Everything
 /// it learns arrives through [`step`](Self::step), and everything it wants
 /// done leaves through the [`Out`] passed to it.
+///
+/// A clone is a second session in the same state, which goes its own way
+/// from there: what a test needs to try two futures of one session.
+#[derive(Clone)]
 pub struct Kernel<P: Policies = DefaultPolicies> {
     config: KernelConfig,
     policies: P,
@@ -212,6 +448,9 @@ impl<P: Policies> Kernel<P> {
     /// `out` is cleared first. `now` must not go backwards from one step to
     /// the next. The same events at the same times always produce the same
     /// output.
+    ///
+    /// The first step of a session that was [restored](Self::restore) also
+    /// deals with what the crash lost, before it takes its event.
     pub fn step(&mut self, now: MonoTime, event: &Event, out: &mut Out) {
         out.clear();
         if matches!(event, Event::Control(ControlInput::LeaseLost)) {
@@ -229,6 +468,9 @@ impl<P: Policies> Kernel<P> {
             state: &mut self.state,
             out,
         };
+        if step.state.recovering {
+            step.recover();
+        }
         step.run(event);
     }
 
@@ -250,22 +492,32 @@ impl<P: Policies> Kernel<P> {
         &self.policies
     }
 
-    /// The session's state, to be stored. Together with the facts emitted
-    /// after it, a snapshot rebuilds the session.
+    /// What the journal knows of the session, to be stored. Together with
+    /// the facts emitted after it, a snapshot rebuilds the session.
+    ///
+    /// A snapshot holds what the facts so far add up to and nothing else:
+    /// a snapshot taken at any earlier time, with the facts emitted since
+    /// applied to it, is equal to this one.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            state: self.state.clone(),
-        }
+        self.state.journaled()
     }
 
     /// Rebuilds a session from a snapshot and the facts journaled after it.
     /// `text` is the arena the facts' text refers to.
     ///
+    /// What was under way when the snapshot's session stopped is not in
+    /// the journal. The first [`step`](Self::step) of the rebuilt session
+    /// deals with that: it advances the epoch, records the speech that was
+    /// being heard as cut off where it was last known to be, fails the
+    /// tool calls that had not been sent, sends again those that may be
+    /// repeated, marks the others as in doubt, and leaves a note for the
+    /// language model.
+    ///
     /// # Errors
     ///
-    /// The configuration is unusable, or `tail` does not continue the
-    /// snapshot without a gap.
+    /// The configuration is unusable or too small for the snapshot, or
+    /// `tail` does not continue the snapshot without a gap.
     pub fn restore(
         config: KernelConfig,
         policies: P,
@@ -274,7 +526,7 @@ impl<P: Policies> Kernel<P> {
         text: &TextArena,
     ) -> Result<Self, RestoreError> {
         config.validate().map_err(RestoreError::Config)?;
-        let mut state = snapshot.state.clone();
+        let mut state = State::revive(&config, snapshot).map_err(RestoreError::TooSmall)?;
         for stamped in tail {
             if stamped.seq != state.next_seq {
                 return Err(RestoreError::Gap {
@@ -285,6 +537,26 @@ impl<P: Policies> Kernel<P> {
             state.next_seq = state.next_seq.next();
             state.apply(&stamped.fact, text);
         }
+        // Everything read back was stored.
+        state.durable = Seq(state.next_seq.get().saturating_sub(1));
+        // Turns and responses that were under way had numbers of their
+        // own, which no fact names. The new ones start above them.
+        let limits = &config.limits;
+        let skip = |limit: usize| u32::try_from(limit).unwrap_or(u32::MAX);
+        state.next_turn = TurnId(
+            state
+                .turn_floor
+                .get()
+                .saturating_add(skip(limits.open_turns)),
+        );
+        state.next_gen = GenId(
+            state
+                .gen_floor
+                .get()
+                .saturating_add(skip(limits.generations)),
+        );
+        state.started = state.answered;
+        state.recovering = true;
         Ok(Self {
             config,
             policies,
@@ -299,7 +571,10 @@ impl<P: Policies> Kernel<P> {
         state.participants.park();
         state.turns.park();
         state.generations.park();
+        state.calls.park();
+        state.batches.park();
         state.conversation.park();
+        state.speech_text.shrink_to_fit();
     }
 
     /// Bytes of heap the kernel holds: its state and its configuration.
@@ -327,7 +602,10 @@ impl<P: Policies> Kernel<P> {
             state.participants.heap_bytes(),
             state.turns.heap_bytes(),
             state.generations.heap_bytes(),
+            state.calls.heap_bytes(),
+            state.batches.heap_bytes(),
             state.conversation.heap_bytes(),
+            state.speech_text.capacity(),
             config
                 .agents
                 .capacity()
@@ -356,17 +634,35 @@ impl<P: Policies> fmt::Debug for Kernel<P> {
     }
 }
 
-/// A session's state at one point in its journal.
+/// What the journal knows of a session at one point: everything its facts
+/// up to there add up to, and nothing that was only under way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
-    state: State,
+    epoch: Epoch,
+    lifecycle: Lifecycle,
+    closed_for: Option<CloseReason>,
+    front: AgentId,
+    handoff: Option<AgentId>,
+    next_seq: Seq,
+    turn_floor: TurnId,
+    gen_floor: GenId,
+    next_call: ToolCallId,
+    next_batch: BatchId,
+    participants: Vec<ParticipantId>,
+    calls: Vec<Call>,
+    batches: Vec<Batch>,
+    conversation: Conversation,
+    owed: Option<(ContextVersion, LlmCause)>,
+    answered: ContextVersion,
+    speech: Option<(GenId, AgentId)>,
+    speech_text: String,
 }
 
 impl Snapshot {
     /// The sequence number of the first fact that is not in the snapshot.
     #[must_use]
     pub const fn next_seq(&self) -> Seq {
-        self.state.next_seq
+        self.next_seq
     }
 }
 
@@ -375,6 +671,9 @@ impl Snapshot {
 pub enum RestoreError {
     /// The configuration is unusable.
     Config(ConfigError),
+    /// The named limit of the configuration is too small for what the
+    /// snapshot holds.
+    TooSmall(&'static str),
     /// The facts do not continue the snapshot.
     Gap {
         /// The sequence number that should have come next.
@@ -388,6 +687,9 @@ impl fmt::Display for RestoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(error) => write!(f, "unusable configuration: {error}"),
+            Self::TooSmall(limit) => {
+                write!(f, "the limit `{limit}` is too small for the snapshot")
+            }
             Self::Gap { expected, found } => {
                 write!(f, "the journal skips from fact {expected} to fact {found}")
             }
@@ -399,7 +701,7 @@ impl core::error::Error for RestoreError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Config(error) => Some(error),
-            Self::Gap { .. } => None,
+            Self::TooSmall(_) | Self::Gap { .. } => None,
         }
     }
 }
@@ -479,8 +781,8 @@ mod tests {
             &TextArena::default(),
         )
         .unwrap();
-        assert_eq!(restored.fingerprint(), kernel.fingerprint());
         assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(restored.view().next_seq(), Seq(1));
     }
 
     #[test]

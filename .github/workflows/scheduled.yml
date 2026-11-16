@@ -27,3 +27,34 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny check advisories
+
+  # More random sessions than a pull request has time for, and other ones
+  # every night: 200,000 for each profile of adapter behaviour, with every
+  # kernel invariant checked after every step. A failure prints its seed,
+  # and `WAVEPORT_SIM_SEED=<seed>` runs that session alone.
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: cargo test --release -p waveport-domain --test simulation
+        run: |
+          first=$(( GITHUB_RUN_NUMBER * 200000 ))
+          export WAVEPORT_SIM_SEEDS="${first}..$(( first + 200000 ))"
+          echo "seeds ${WAVEPORT_SIM_SEEDS}"
+          cargo test --release --locked -p waveport-domain --test simulation
+
+  # Every path through sessions small enough to try them all, the larger
+  # ones included: millions of states, each step checked.
+  model-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo test --release --locked -p waveport-domain --test model -- --include-ignored

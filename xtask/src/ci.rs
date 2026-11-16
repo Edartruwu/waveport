@@ -394,6 +394,23 @@ mod tests {
         );
     }
 
+    /// What runs every night and not on pull requests is named in
+    /// `CONTRIBUTING.md` with these commands. A change to one fails here.
+    #[test]
+    fn scheduled_workflow_runs_the_sweep_and_the_model_check() {
+        let text = workflow("scheduled.yml");
+        assert_runs(
+            "scheduled.yml",
+            &text,
+            &[
+                "cargo deny check advisories",
+                "cargo test --release --locked -p waveport-domain --test simulation",
+                "WAVEPORT_SIM_SEEDS=",
+                "cargo test --release --locked -p waveport-domain --test model -- --include-ignored",
+            ],
+        );
+    }
+
     #[test]
     fn pull_request_workflow_runs_the_title_and_semver_gates() {
         let text = workflow("pr-meta.yml");

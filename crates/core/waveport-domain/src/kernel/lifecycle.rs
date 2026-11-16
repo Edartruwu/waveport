@@ -1,9 +1,12 @@
 //! The end of a session's life.
 //!
-//! A session asked to close first drains: it finishes the response under
-//! way and starts nothing new. When that is done, or the drain time is up,
-//! it stops whatever is left and is closed. Nothing in this depends on an
-//! adapter answering: every transition is taken on the clock.
+//! A session asked to close first drains: it finishes the response and
+//! the tool calls under way and starts nothing new. When that is done, or
+//! the drain time is up, it stops whatever can be stopped. A tool call
+//! that may have changed something cannot: its result is waited for, for
+//! the grace time at most, and then the session is closed. Nothing in this
+//! depends on an adapter answering: every transition is taken on the
+//! clock.
 
 use crate::event::CloseReason;
 use crate::time::MonoTime;
@@ -15,4 +18,6 @@ pub(super) struct Closing {
     pub(super) reason: CloseReason,
     /// When the session stops waiting for what is under way.
     pub(super) drain_until: MonoTime,
+    /// When it stops waiting for tool calls that may have taken effect.
+    pub(super) grace_until: MonoTime,
 }
