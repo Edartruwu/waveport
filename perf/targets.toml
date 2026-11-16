@@ -50,8 +50,12 @@ active = { target_p50_kb = 1500, target_p99_kb = 4000, held_pcm_kb = 612, held_o
 # everything else about a machine: it was 0.73 on a runner of GitHub's
 # and 0.92 on one core of a laptop, where work that comes in short bursts
 # is slower than work that runs on. So the number held here is the
-# runner's own, and it holds the runner. It is from two runs so far,
-# which gave 0.73 and 0.75.
+# runner's own, and it holds the runner. It is from three runs so far:
+# 0.73 and 0.75, and 0.68 on a runner that took a tenth longer over the
+# reference work while a session took the same share of its thread. So
+# far, then, the ratio moves more from runner to runner than the share
+# does. It is measured three times every night, and what is held here is
+# set again from ten nights of that: CONTRIBUTING.md says how.
 held_ratio = 0.73
 # How much over what is held a run may be, as a share of it: runners
 # differ, and the same runner differs from night to night.

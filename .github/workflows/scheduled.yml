@@ -121,15 +121,39 @@ jobs:
   # to `perf/targets.toml`. How long the parts of a turn take in real
   # time is measured and printed as well. The numbers themselves are
   # checked on a machine that is left alone, with `cargo xtask perf check`.
+  #
+  # It is measured three times a night, on three runners, because runners
+  # are not alike: one measurement that fails says something about its
+  # runner, and three that fail say something about the code. Each says
+  # in its summary which processor it ran on and what it measured, so
+  # that what is held can be set from many nights (`CONTRIBUTING.md` says
+  # how).
   density:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3]
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install
+      - name: processor
+        run: lscpu | grep -E '^(Model name|CPU\(s\)):' | tee "$RUNNER_TEMP/processor.txt"
+      # The shell of this workflow fails a step when any command of a
+      # pipe fails, so a measurement that fails is not hidden by `tee`.
       - name: cargo test --release -p waveport-benches --test load
         env:
           WAVEPORT_PERF_GATE: "1"
-        run: cargo test --release --locked -p waveport-benches --test load -- --ignored --nocapture --test-threads 1
+        run: cargo test --release --locked -p waveport-benches --test load -- --ignored --nocapture --test-threads 1 | tee "$RUNNER_TEMP/load.log"
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '```'
+            cat "$RUNNER_TEMP/processor.txt" || true
+            grep -o 'PERF .*' "$RUNNER_TEMP/load.log" | cut -d' ' -f2 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
