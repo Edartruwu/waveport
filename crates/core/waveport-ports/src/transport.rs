@@ -4,6 +4,10 @@
 //! Decoding, reordering and pacing are done by the media path; a
 //! transport hands over what arrived, in the order it arrived, and sends
 //! what it is given when it is given it.
+//!
+//! A transport need not carry audio. One that carries text alone says so
+//! in what it can do ([`TransportCaps::audio`]), and a session that
+//! hears and speaks is not started on it.
 
 use core::task::{Context, Poll};
 
@@ -135,14 +139,21 @@ pub enum TransportControl {
 /// What a transport can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportCaps {
+    /// How it carries audio. `None` for one that carries none.
+    pub audio: Option<AudioCaps>,
+    /// Whether participants can send text.
+    pub text: bool,
+}
+
+/// How a transport carries audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioCaps {
     /// How the audio that arrives is written.
     pub inbound: Codec,
     /// How the audio to send has to be written.
     pub outbound: Codec,
     /// What can be known and done about audio the far end holds.
     pub remote_buffer: RemoteBuffer,
-    /// Whether participants can send text.
-    pub text: bool,
 }
 
 /// What can be known and done about audio that was sent and that the far

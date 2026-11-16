@@ -269,7 +269,7 @@ A `BrainProfile` states which port fills each of three roles (hear, think, speak
 | Multi-party | Every perception event carries a `ParticipantId`; speaker is mandatory on turns and messages. `Floor` tracks N holders, and an `AddresseePolicy` decides whether the agent is addressed. One-to-one is N = 1 with the policy `Always` |
 | Text-only | A session with zero tracks and no transport. A text input opens and commits a turn in one step, and "played" means delivered |
 
-Every port says what it can do (section 8.2), and a pure function decides from that how the session is run: `plan(&AgentNeeds, &BrainProfile, &TransportCaps) -> Result<SessionPlan, PlanError>`. It runs before the session starts. For a cascaded session it settles:
+Every port says what it can do (section 8.2), and a pure function decides from that how the session is run: `plan(&AgentNeeds, &BrainProfile, Option<&TransportCaps>) -> Result<SessionPlan, PlanError>`. It runs before the session starts. The transport is optional because a session may have none, and a transport may carry no audio; parts that hear and speak are refused on either. For a cascaded session it settles:
 
 | Question | Answer |
 |---|---|
@@ -353,7 +353,7 @@ pub trait Llm: Send + Sync + 'static {
 }
 
 pub trait Transport: Send + 'static {
-    fn caps(&self) -> TransportCaps; // codec each way, remote buffer (clearable, says what it played), text
+    fn caps(&self) -> TransportCaps; // audio, if it carries any: codec each way, remote buffer (clearable, says what it played); text
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
     fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full>;
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full>; // Clear

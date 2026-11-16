@@ -28,7 +28,7 @@ use waveport_domain::ids::Seq;
 use waveport_domain::policy::Policies;
 use waveport_ports::control::{ControlError, EventRx, SessionControl, SessionEvent, SessionInput};
 use waveport_ports::journal::SessionId;
-use waveport_ports::plan::CascadePlan;
+use waveport_ports::plan::SessionPlan;
 
 use crate::session::{Ended, Parts, Rebuilt, Request, Session, SessionSpec, StartError};
 pub use crate::watch::ShardStats;
@@ -125,7 +125,7 @@ pub struct Started {
     /// Its name.
     pub id: SessionId,
     /// How it is run with the parts it has.
-    pub plan: CascadePlan,
+    pub plan: SessionPlan,
     /// What it was rebuilt from, if it goes on after an earlier life.
     pub rebuilt: Option<Rebuilt>,
     exit: oneshot::Receiver<Exit>,

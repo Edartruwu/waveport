@@ -187,9 +187,9 @@ async fn the_person_is_there_says_their_piece_and_hangs_up() {
 async fn a_response_is_played_and_said_to_be_as_it_goes() {
     let (mut transport, recording, mut seen) =
         scripted(vec![Step::Silence(Duration::from_secs(5))]);
-    let caps = transport.caps();
-    assert!(caps.remote_buffer.clearable && caps.remote_buffer.reports_played);
-    assert_eq!(caps.outbound.clock(), RATE);
+    let audio = transport.caps().audio.unwrap();
+    assert!(audio.remote_buffer.clearable && audio.remote_buffer.reports_played);
+    assert_eq!(audio.outbound.clock(), RATE);
     listen(&mut transport, &mut seen, Duration::from_millis(100)).await;
     assert!(seen.joined);
 

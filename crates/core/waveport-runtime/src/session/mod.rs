@@ -19,7 +19,17 @@
 //! The order in which the parts are looked at is fixed and nothing here
 //! is random, so a session on a clock that a test controls does the same
 //! thing every time.
+//!
+//! What a session hears with and speaks with depends on its shape, which
+//! is what its [`Brain`] is made of. Those parts are behind a driver, and
+//! the session asks the driver for what it used to ask them. The kernel,
+//! the timers, the tools, the journal, the followers and the language
+//! model are the same in every shape and stay here. The one shape there
+//! is recognises speech, has a language model write and synthesises what
+//! it wrote.
 
+mod cascade;
+mod drive;
 mod hear;
 mod speak;
 mod store;
@@ -35,11 +45,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
-use waveport_domain::command::{Command, LlmCmd, PlayoutCmd, SenseCmd, SttCmd, ToolCmd, TtsCmd};
+use waveport_domain::command::{Command, LlmCmd, PlayoutCmd, SttCmd, ToolCmd, TtsCmd};
 use waveport_domain::config::{ConfigError, KernelConfig};
 use waveport_domain::event::{CloseReason, ControlInput, Event, TimerId, ToolEvent};
 use waveport_domain::fact::{Fact, Lifecycle, Stamped};
-use waveport_domain::ids::{ParticipantId, Seq, ToolCallId, ToolId, TurnId};
+use waveport_domain::ids::{Seq, ToolCallId, ToolId};
 use waveport_domain::kernel::{Kernel, RestoreError, Snapshot, View};
 use waveport_domain::out::Out;
 use waveport_domain::policy::{DefaultPolicies, Policies};
@@ -52,8 +62,8 @@ pub use waveport_ports::control::{SessionEvent, SessionInput};
 use waveport_ports::error::{BoxFuture, Full};
 use waveport_ports::journal::{Journal, JournalError, Recovered, SessionId};
 use waveport_ports::llm::Llm;
-use waveport_ports::plan::{AgentNeeds, BrainProfile, CascadePlan, PlanError, SessionPlan, plan};
-use waveport_ports::stt::{Stt, SttRx};
+use waveport_ports::plan::{AgentNeeds, BrainProfile, PlanError, SessionPlan, plan};
+use waveport_ports::stt::Stt;
 use waveport_ports::telemetry::{EventSink, Stage, StageMark};
 use waveport_ports::tool::{ToolExecutor, ToolReply, ToolRequest};
 use waveport_ports::transport::{
@@ -61,15 +71,16 @@ use waveport_ports::transport::{
 };
 use waveport_ports::tts::Tts;
 
-use self::hear::Ear;
+use self::cascade::Cascade;
+use self::drive::Driver;
 pub use self::hear::HearStats;
+use self::speak::Milestone;
 pub use self::speak::SpeakStats;
-use self::speak::{Milestone, Voice};
 use self::store::Store;
 pub use self::store::{StateStats, StoreBroken};
 use self::think::Mind;
 use crate::codec::{self, CodecError};
-use crate::compute::{Compute, Wants};
+use crate::compute::Compute;
 use crate::context::{AgentDef, Asking, ToolDef};
 use crate::edges::EdgeConfig;
 
@@ -166,27 +177,54 @@ impl SessionSpec {
 
 /// The parts a session reaches the world through.
 pub struct Parts {
-    /// The connection to its participants.
-    pub transport: Box<dyn Transport>,
-    /// The speech recogniser.
-    pub stt: Arc<dyn Stt>,
-    /// The language model.
-    pub llm: Arc<dyn Llm>,
-    /// The speech synthesiser.
-    pub tts: Arc<dyn Tts>,
+    /// What it hears, thinks and speaks with, which is what gives a
+    /// session its shape.
+    pub brain: Brain,
+    /// The connection to its participants. `None` for a session that is
+    /// reached through the application alone: what is asked of it comes
+    /// as requests, and what it says goes to whoever follows it.
+    pub transport: Option<Box<dyn Transport>>,
     /// What runs its tools.
     pub tools: Arc<dyn ToolExecutor>,
     /// Where its facts are kept.
     pub journal: Arc<dyn Journal>,
-    /// The listening models.
-    pub compute: Arc<Compute>,
     /// Who is told what happens in it, for timing and for the record.
     pub sink: Option<Arc<dyn EventSink>>,
+    /// What is shown every step of it from its first, as
+    /// [`Session::tap`] shows the steps after it was called.
+    pub taps: Vec<Box<dyn Tap>>,
+}
+
+/// What a session hears, thinks and speaks with. Which parts it has is
+/// the shape of the session.
+pub enum Brain {
+    /// Speech is recognised, a language model writes, and what it writes
+    /// is synthesised.
+    Cascaded {
+        /// The speech recogniser.
+        stt: Arc<dyn Stt>,
+        /// The language model.
+        llm: Arc<dyn Llm>,
+        /// The speech synthesiser.
+        tts: Arc<dyn Tts>,
+        /// The listening models.
+        compute: Arc<Compute>,
+    },
+}
+
+impl fmt::Debug for Brain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cascaded { .. } => "Cascaded",
+        })
+    }
 }
 
 impl fmt::Debug for Parts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Parts").finish_non_exhaustive()
+        f.debug_struct("Parts")
+            .field("brain", &self.brain)
+            .finish_non_exhaustive()
     }
 }
 
@@ -346,23 +384,19 @@ pub struct Session<P: Policies = DefaultPolicies> {
     offset: Duration,
     kernel: Kernel<P>,
     out: Out,
-    plan: CascadePlan,
+    plan: SessionPlan,
     defs: Arc<Defs>,
-    edges: EdgeConfig,
-    language: Option<String>,
-    wants: Wants,
 
     transport: Box<dyn Transport>,
     transport_open: bool,
-    stt: Arc<dyn Stt>,
     llm: Arc<dyn Llm>,
     tools: Arc<dyn ToolExecutor>,
-    compute: Arc<Compute>,
     sink: Option<Arc<dyn EventSink>>,
 
-    ears: Vec<Ear>,
+    /// What the session hears with and speaks with: the parts that depend
+    /// on its shape.
+    driver: Driver,
     minds: Vec<Mind>,
-    voice: Voice,
     calls: Vec<(ToolCallId, Calling)>,
     undoing: Vec<(ToolCallId, Undoing)>,
     timers: Vec<(TimerId, MonoTime)>,
@@ -381,12 +415,9 @@ pub struct Session<P: Policies = DefaultPolicies> {
     stage_reported: bool,
     taps: Vec<Box<dyn Tap>>,
     sleep: Pin<Box<Sleep>>,
-    /// Recognisers of participants who are no longer listened to, told
-    /// that no more audio follows and read until they end. What they
-    /// still write down is for nobody.
-    parting: Vec<Pin<Box<dyn SttRx>>>,
     /// Until when the session, which has closed, waits for its transport
-    /// to have said so to the far end and for its recognisers to end.
+    /// to have said so to the far end and for what it listened with to
+    /// end.
     leaving: Option<MonoTime>,
     /// Whether the transport has said so.
     far_end_told: bool,
@@ -400,7 +431,6 @@ pub struct Session<P: Policies = DefaultPolicies> {
     /// What the session was rebuilt from, if it goes on after an earlier
     /// life.
     rebuilt: Option<Rebuilt>,
-    stats: SessionStats,
 }
 
 impl<P: Policies> Session<P> {
@@ -422,10 +452,16 @@ impl<P: Policies> Session<P> {
         {
             return Err(StartError::Defs);
         }
+        let Brain::Cascaded {
+            stt,
+            llm,
+            tts,
+            compute,
+        } = parts.brain;
         let brain = BrainProfile::Cascaded {
-            hear: parts.stt.caps(),
-            think: parts.llm.caps(),
-            speak: parts.tts.caps(),
+            hear: stt.caps(),
+            think: llm.caps(),
+            speak: tts.caps(),
         };
         let most_tools = spec
             .kernel
@@ -436,17 +472,18 @@ impl<P: Policies> Session<P> {
         let needs = AgentNeeds {
             tools: most_tools.unwrap_or(0),
         };
-        let SessionPlan::Cascaded(plan) =
-            plan(&needs, &brain, &parts.transport.caps()).map_err(StartError::Plan)?;
-        let wants = parts.compute.wants();
-        if wants.rate != plan.listen.rate {
-            return Err(StartError::ModelRate {
-                models: wants.rate,
-                session: plan.listen.rate,
-            });
-        }
-        let voice = Voice::new(plan.speak, plan.playback, parts.tts, spec.language.clone())
-            .map_err(StartError::Codec)?;
+        let line = parts.transport.as_ref().map(|transport| transport.caps());
+        let plan = plan(&needs, &brain, line.as_ref()).map_err(StartError::Plan)?;
+        let driver = match &plan {
+            SessionPlan::Cascaded(cascade) => Driver::Cascade(Cascade::new(
+                cascade.clone(),
+                stt,
+                tts,
+                compute,
+                spec.edges,
+                spec.language,
+            )?),
+        };
 
         let recovered = parts
             .journal
@@ -480,19 +517,13 @@ impl<P: Policies> Session<P> {
                 agents: spec.agents,
                 tools: spec.tools,
             }),
-            edges: spec.edges,
-            language: spec.language,
-            wants,
-            transport: parts.transport,
-            transport_open: true,
-            stt: parts.stt,
-            llm: parts.llm,
+            transport_open: parts.transport.is_some(),
+            transport: parts.transport.unwrap_or_else(|| Box::new(Gone)),
+            llm,
             tools: parts.tools,
-            compute: parts.compute,
             sink: parts.sink,
-            ears: Vec::new(),
+            driver,
             minds: Vec::new(),
-            voice,
             calls: Vec::new(),
             undoing: Vec::new(),
             timers: Vec::new(),
@@ -503,9 +534,8 @@ impl<P: Policies> Session<P> {
             queue: Vec::new(),
             next,
             stage_reported: false,
-            taps: Vec::new(),
+            taps: parts.taps,
             sleep: Box::pin(tokio::time::sleep_until(origin)),
-            parting: Vec::new(),
             leaving: None,
             far_end_told: false,
             rule: spec.states,
@@ -513,7 +543,6 @@ impl<P: Policies> Session<P> {
             state_upto: rebuilt.and_then(|from| from.state).unwrap_or(Seq(0)),
             state_at: began,
             rebuilt,
-            stats: SessionStats::default(),
         })
     }
 
@@ -526,7 +555,7 @@ impl<P: Policies> Session<P> {
     /// How the session is run with the parts it has, and what it does
     /// less well for them.
     #[must_use]
-    pub const fn plan(&self) -> &CascadePlan {
+    pub const fn plan(&self) -> &SessionPlan {
         &self.plan
     }
 
@@ -553,14 +582,9 @@ impl<P: Policies> Session<P> {
     /// What went wrong so far that the session could carry on from.
     #[must_use]
     pub fn stats(&self) -> SessionStats {
-        let mut stats = self.stats;
-        stats.speaking = self.voice.stats();
+        let mut stats = SessionStats::default();
+        self.driver.count(&mut stats);
         stats.states = self.store.states();
-        for ear in &self.ears {
-            let hearing = ear.stats();
-            stats.hearing.recogniser_failures += hearing.recogniser_failures;
-            stats.hearing.finalize_refused += hearing.finalize_refused;
-        }
         stats
     }
 
@@ -671,57 +695,29 @@ impl<P: Policies> Session<P> {
     /// to take anything back: whoever has the session now decides that.
     fn fall_silent(&mut self, now: MonoTime) {
         let fade_ms = self.kernel.config().timing.stop_fade_ms;
-        self.voice.halt(fade_ms, now, self.transport.as_mut());
+        self.driver.halt(fade_ms, now, self.transport.as_mut());
         self.minds.clear();
         self.calls.clear();
         self.undoing.clear();
-        self.ears.clear();
-        self.parting.clear();
         self.timers.clear();
     }
 
     /// Has the transport tell the far end that the session, which has
-    /// closed, is over, and lets go of the recognisers. Returns whether
-    /// that is done with: it is said and they have ended, or it has been
-    /// waited for long enough.
+    /// closed, is over, and lets go of what it listened with. Returns
+    /// whether that is done with: it is said and they have ended, or it
+    /// has been waited for long enough.
     fn farewell(&mut self, cx: &mut Context<'_>, now: MonoTime) -> bool {
         let until = *self.leaving.get_or_insert_with(|| now.after(FAREWELL));
         // Whoever is still listened to is not any more.
-        for ear in core::mem::take(&mut self.ears) {
-            self.let_go(ear);
-        }
+        self.driver.leave();
         self.far_end_told = self.far_end_told || self.transport.poll_close(cx).is_ready();
-        self.part(cx);
-        if now >= until || (self.far_end_told && self.parting.is_empty()) {
+        let parted = self.driver.parted(cx);
+        if now >= until || (self.far_end_told && parted) {
             return true;
         }
         let at = self.instant(until);
         self.sleep.as_mut().reset(at);
         self.sleep.as_mut().poll(cx).is_ready()
-    }
-
-    /// Stops listening to a participant: what went wrong while they were
-    /// heard is kept, and their recogniser is told that no more audio
-    /// follows.
-    fn let_go(&mut self, ear: Ear) {
-        let (hearing, left) = ear.leave();
-        self.stats.hearing.recogniser_failures += hearing.recogniser_failures;
-        self.stats.hearing.finalize_refused += hearing.finalize_refused;
-        self.parting.extend(left);
-    }
-
-    /// Reads the recognisers that were told that no more audio follows,
-    /// and lets go of the ones that have ended.
-    fn part(&mut self, cx: &mut Context<'_>) {
-        self.parting.retain_mut(|left| {
-            loop {
-                match left.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(Ok(_))) => {}
-                    Poll::Ready(Some(Err(_)) | None) => return false,
-                    Poll::Pending => return true,
-                }
-            }
-        });
     }
 
     /// How the session has ended, if it has.
@@ -737,10 +733,8 @@ impl<P: Policies> Session<P> {
     /// for.
     fn deadline(&self) -> Option<MonoTime> {
         let timers = self.timers.iter().map(|(_, at)| *at);
-        let ears = self.ears.iter().filter_map(Ear::deadline);
         timers
-            .chain(ears)
-            .chain(self.voice.deadline())
+            .chain(self.driver.deadline())
             .chain(self.store.deadline())
             .min()
     }
@@ -752,7 +746,7 @@ impl<P: Policies> Session<P> {
         let mut changed = false;
         // How far playback has got comes first, so that whatever else
         // happened is decided on what had been heard by then.
-        if let Some(position) = self.voice.position(now) {
+        if let Some(position) = self.driver.position(now) {
             self.queue.push(position);
         }
         self.queue.append(&mut self.next);
@@ -794,10 +788,7 @@ impl<P: Policies> Session<P> {
             self.follow(from, to);
         }
 
-        for ear in &mut self.ears {
-            changed |= ear.poll(cx, now, &mut self.queue);
-        }
-        self.part(cx);
+        changed |= self.driver.hear(cx, now, &mut self.queue);
 
         for index in 0..self.minds.len() {
             let Some(mind) = self.minds.get_mut(index) else {
@@ -813,11 +804,13 @@ impl<P: Policies> Session<P> {
         self.minds.retain(|mind| !mind.is_over());
 
         let (sink, id) = (self.sink.as_ref(), self.id);
-        changed |= self.voice.poll(cx, now, &mut self.queue, &mut |milestone| {
-            if let Milestone::FirstAudio(tag) = milestone {
-                mark(sink, id, now, Stage::FirstAudio(tag.generation));
-            }
-        });
+        changed |= self
+            .driver
+            .speak(cx, now, &mut self.queue, &mut |milestone| {
+                if let Milestone::FirstAudio(tag) = milestone {
+                    mark(sink, id, now, Stage::FirstAudio(tag.generation));
+                }
+            });
 
         self.poll_tools(cx, now);
         changed |= self.store.poll(cx, now, &mut self.queue);
@@ -831,7 +824,8 @@ impl<P: Policies> Session<P> {
             };
             match event {
                 Some(TransportEvent::Joined { who }) => {
-                    self.joined(who);
+                    let most = self.kernel.config().limits.participants;
+                    self.driver.joined(who, most);
                     self.queue.push(Event::Control(ControlInput::Join { who }));
                 }
                 Some(TransportEvent::Left { who }) => {
@@ -848,12 +842,9 @@ impl<P: Policies> Session<P> {
                         timestamp,
                         payload: &payload,
                     };
-                    match self.ears.iter_mut().find(|ear| ear.who == who) {
-                        Some(ear) => ear.packet(now, packet),
-                        None => self.stats.strays += 1,
-                    }
+                    self.driver.packet(now, who, packet);
                 }
-                Some(TransportEvent::Played { tag, played }) => self.voice.acked(tag, played),
+                Some(TransportEvent::Played { tag, played }) => self.driver.acked(tag, played),
                 Some(TransportEvent::Text { who, text }) => self.queue.push(Event::TextIn {
                     who,
                     text: text.into(),
@@ -872,7 +863,7 @@ impl<P: Policies> Session<P> {
                 // all.
                 None => {
                     self.transport_open = false;
-                    self.transport = Box::new(Gone(self.transport.caps()));
+                    self.transport = Box::new(Gone);
                     self.queue.push(Event::Control(ControlInput::Detached));
                     let reason = CloseReason::Abandoned;
                     self.queue
@@ -880,30 +871,6 @@ impl<P: Policies> Session<P> {
                     self.queue.push(Event::Control(ControlInput::Interrupt));
                 }
             }
-        }
-    }
-
-    /// A participant is there: from now on they are heard.
-    fn joined(&mut self, who: ParticipantId) {
-        if self.ears.iter().any(|ear| ear.who == who) {
-            return;
-        }
-        if self.ears.len() >= self.kernel.config().limits.participants {
-            self.stats.unheard += 1;
-            return;
-        }
-        let ear = Ear::new(
-            who,
-            self.plan.listen,
-            MonoTime::ZERO,
-            self.compute.listen(),
-            self.edges,
-            Arc::clone(&self.stt),
-            self.language.clone(),
-        );
-        match ear {
-            Ok(ear) => self.ears.push(ear),
-            Err(_) => self.stats.unheard += 1,
         }
     }
 
@@ -945,7 +912,7 @@ impl<P: Policies> Session<P> {
     /// Hands the frames that are due to the transport.
     fn send_frames(&mut self, now: MonoTime) -> bool {
         let (sink, id) = (self.sink.as_ref(), self.id);
-        self.voice
+        self.driver
             .send_frames(now, self.transport.as_mut(), &mut |milestone| {
                 if let Milestone::FirstFrame(tag) = milestone {
                     mark(sink, id, now, Stage::FirstFrameOut(tag.generation));
@@ -1042,35 +1009,19 @@ impl<P: Policies> Session<P> {
             // Dropping the stream is all there is to cancelling it.
             Command::Llm(tag, LlmCmd::Cancel) => self.minds.retain(|mind| mind.tag != tag),
             Command::Tts(tag, TtsCmd::Speak { text: piece }) => {
-                if self.voice.speak(tag, text.get(piece)) {
+                if self.driver.say(tag, text.get(piece)) {
                     let stage = Stage::FirstText(tag.generation);
                     mark(self.sink.as_ref(), self.id, now, stage);
                 }
             }
-            Command::Tts(tag, TtsCmd::Finish) => self.voice.finish(tag),
-            Command::Tts(tag, TtsCmd::Cancel) => self.voice.cancel(tag),
-            Command::Stt(SttCmd::Finalize { who }) => {
-                if let Some(ear) = self.ears.iter_mut().find(|ear| ear.who == who) {
-                    ear.finalize();
-                }
-            }
-            Command::Stt(SttCmd::Close { who }) => {
-                if let Some(index) = self.ears.iter().position(|ear| ear.who == who) {
-                    let ear = self.ears.remove(index);
-                    self.let_go(ear);
-                }
-            }
-            Command::Sense(SenseCmd::EstimateEou { turn, who }) => {
-                self.judge(turn, who, self.wants.turn_window, false);
-            }
-            Command::Sense(SenseCmd::ClassifyOverlap { turn, who }) => {
-                if let Some(window) = self.wants.overlap_window {
-                    self.judge(turn, who, window, true);
-                }
-            }
-            Command::Playout(tag, PlayoutCmd::Start) => self.voice.start(tag, now),
+            Command::Tts(tag, TtsCmd::Finish) => self.driver.finish(tag),
+            Command::Tts(tag, TtsCmd::Cancel) => self.driver.cancel(tag),
+            Command::Stt(SttCmd::Finalize { who }) => self.driver.finalize(who),
+            Command::Stt(SttCmd::Close { who }) => self.driver.close(who),
+            Command::Sense(command) => self.driver.sense(self.kernel.view(), command),
+            Command::Playout(tag, PlayoutCmd::Start) => self.driver.start(tag, now),
             Command::Playout(tag, PlayoutCmd::Duck) => {
-                self.voice.duck(tag);
+                self.driver.duck(tag);
                 mark(
                     self.sink.as_ref(),
                     self.id,
@@ -1078,9 +1029,9 @@ impl<P: Policies> Session<P> {
                     Stage::Lowered(tag.generation),
                 );
             }
-            Command::Playout(tag, PlayoutCmd::Unduck) => self.voice.unduck(tag),
+            Command::Playout(tag, PlayoutCmd::Unduck) => self.driver.unduck(tag),
             Command::Playout(tag, PlayoutCmd::Stop { fade_ms }) => {
-                self.voice.stop(tag, fade_ms, now, self.transport.as_mut());
+                self.driver.stop(tag, fade_ms, now, self.transport.as_mut());
                 mark(
                     self.sink.as_ref(),
                     self.id,
@@ -1169,40 +1120,30 @@ impl<P: Policies> Session<P> {
         self.calls.push((call, Box::pin(calling)));
         mark(self.sink.as_ref(), self.id, now, Stage::ToolSent(call));
     }
-
-    /// Asks the listening models about a turn.
-    fn judge(&mut self, turn: TurnId, who: ParticipantId, window: usize, overlap: bool) {
-        let began = self
-            .kernel
-            .view()
-            .turns()
-            .find(|open| open.turn == turn)
-            .map_or(MediaTime::from_ticks(0), |open| open.span.start);
-        if let Some(ear) = self.ears.iter_mut().find(|ear| ear.who == who) {
-            ear.judge(turn, began, window, overlap);
-        }
-    }
 }
 
 impl<P: Policies> fmt::Debug for Session<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Session")
             .field("id", &self.id)
-            .field("ears", &self.ears)
+            .field("driver", &self.driver)
             .field("minds", &self.minds)
-            .field("voice", &self.voice)
             .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
 
-/// What stands in for a transport that has closed: nothing comes from it,
-/// and what is sent to it goes nowhere.
-struct Gone(TransportCaps);
+/// What stands in for a transport that has closed, and for the transport
+/// of a session that has none: nothing comes from it, and what is sent to
+/// it goes nowhere.
+struct Gone;
 
 impl Transport for Gone {
     fn caps(&self) -> TransportCaps {
-        self.0
+        TransportCaps {
+            audio: None,
+            text: false,
+        }
     }
 
     fn poll_event(&mut self, _: &mut Context<'_>) -> Poll<Option<TransportEvent>> {

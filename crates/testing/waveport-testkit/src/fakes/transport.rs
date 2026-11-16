@@ -21,7 +21,7 @@ use waveport_media::codec::opus::OpusSettings;
 use waveport_ports::audio::{Codec, Rate};
 use waveport_ports::error::Full;
 use waveport_ports::transport::{
-    FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
+    AudioCaps, FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
 };
 
 use super::tts::tone;
@@ -211,7 +211,15 @@ impl FakeTransportBuilder {
         to_ms: u64,
         talks: &[(u64, u64)],
     ) -> Self {
-        let codec = self.caps.inbound;
+        #[expect(
+            clippy::expect_used,
+            reason = "a fake that cannot be set up fails the test that asked for it"
+        )]
+        let codec = self
+            .caps
+            .audio
+            .expect("a far end with a microphone is on a transport that carries audio")
+            .inbound;
         let rate = codec.clock();
         #[expect(
             clippy::expect_used,
@@ -350,12 +358,14 @@ impl FakeTransport {
     #[must_use]
     pub const fn sound_card() -> FakeTransportBuilder {
         Self::with(TransportCaps {
-            inbound: Codec::Pcm(Rate::Hz48000),
-            outbound: Codec::Pcm(Rate::Hz48000),
-            remote_buffer: RemoteBuffer {
-                clearable: true,
-                reports_played: true,
-            },
+            audio: Some(AudioCaps {
+                inbound: Codec::Pcm(Rate::Hz48000),
+                outbound: Codec::Pcm(Rate::Hz48000),
+                remote_buffer: RemoteBuffer {
+                    clearable: true,
+                    reports_played: true,
+                },
+            }),
             text: true,
         })
     }
@@ -376,9 +386,17 @@ impl FakeTransport {
         self.log.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// What the far end can do with audio it holds. One that carries no
+    /// audio can do nothing with any.
+    fn remote_buffer(&self) -> RemoteBuffer {
+        self.caps
+            .audio
+            .map_or_else(RemoteBuffer::default, |audio| audio.remote_buffer)
+    }
+
     /// What the loudspeaker has to report at `now`, if anything.
     fn report(&mut self, now: Instant) -> Option<TransportEvent> {
-        if !self.caps.remote_buffer.reports_played {
+        if !self.remote_buffer().reports_played {
             return None;
         }
         let playing = self.playing.as_mut()?;
@@ -404,7 +422,7 @@ impl FakeTransport {
 
     /// When the loudspeaker next has something to report.
     fn next_report(&self, now: Instant) -> Option<Instant> {
-        if !self.caps.remote_buffer.reports_played {
+        if !self.remote_buffer().reports_played {
             return None;
         }
         let playing = self.playing.as_ref()?;
@@ -522,7 +540,7 @@ impl Transport for FakeTransport {
         let TransportControl::Clear { tag } = control;
         let when = now.saturating_duration_since(self.start);
         self.log().cleared.push((when, tag));
-        if self.caps.remote_buffer.clearable
+        if self.remote_buffer().clearable
             && let Some(playing) = &mut self.playing
             && playing.tag == tag
         {

@@ -28,17 +28,17 @@ use waveport_domain::time::{MediaDur, MonoTime};
 use waveport_ports::audio::{Codec, Law, PcmBytes, Rate};
 use waveport_ports::error::PortError;
 use waveport_ports::journal::{Batch, Journal, SessionId, Snapshot};
-use waveport_ports::plan::{Marks, Shortfall};
+use waveport_ports::plan::{CascadePlan, Marks, PlanError, SessionPlan, Shortfall};
 use waveport_ports::stt::{SttFinalize, SttTiming};
 use waveport_ports::telemetry::{EventSink, Stage, StageMark};
 use waveport_ports::tool::ToolReply;
-use waveport_ports::transport::{RemoteBuffer, TransportCaps};
+use waveport_ports::transport::{AudioCaps, RemoteBuffer, TransportCaps};
 use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::compute::Compute;
 use waveport_runtime::context::ToolDef;
 use waveport_runtime::session::{
-    Ended, Parts, Rebuilt, Request, Session, SessionEvent, SessionInput, SessionSpec, StartError,
-    StateRule, StateStats, StoreBroken, Tap,
+    Brain, Ended, Parts, Rebuilt, Request, Session, SessionEvent, SessionInput, SessionSpec,
+    StartError, StateRule, StateStats, StoreBroken, Tap,
 };
 use waveport_testkit::fakes::{
     FakeTransport, FakeTransportBuilder, LlmStep, LoudVad, MemoryJournal, Said, ScriptedLlm,
@@ -144,16 +144,25 @@ impl World {
 
     fn parts(&self, transport: FakeTransport) -> Parts {
         Parts {
-            transport: Box::new(transport),
-            stt: Arc::new(self.stt.clone()),
-            llm: Arc::new(self.llm.clone()),
-            tts: Arc::new(self.tts.clone()),
+            brain: Brain::Cascaded {
+                stt: Arc::new(self.stt.clone()),
+                llm: Arc::new(self.llm.clone()),
+                tts: Arc::new(self.tts.clone()),
+                compute: Arc::clone(&self.compute),
+            },
+            transport: Some(Box::new(transport)),
             tools: Arc::new(self.tools.clone()),
             journal: Arc::new(self.journal.clone()),
-            compute: Arc::clone(&self.compute),
             sink: self.sink.clone().map(|sink| -> Arc<dyn EventSink> { sink }),
+            taps: Vec::new(),
         }
     }
+}
+
+/// How a session in which speech is recognised and synthesised is run.
+fn cascade(session: &Session) -> &CascadePlan {
+    let SessionPlan::Cascaded(plan) = session.plan();
+    plan
 }
 
 /// A session with one agent that has one tool.
@@ -191,11 +200,13 @@ impl Running {
     async fn start_as(spec: SessionSpec, world: &World, transport: FakeTransportBuilder) -> Self {
         let began = Instant::now();
         let (transport, far_end) = transport.build();
-        let mut session = Session::open(spec, world.parts(transport), DefaultPolicies::default())
+        // The session is watched from its first step.
+        let watch = Watch::default();
+        let mut parts = world.parts(transport);
+        parts.taps.push(Box::new(watch.clone()));
+        let session = Session::open(spec, parts, DefaultPolicies::default())
             .await
             .unwrap();
-        let watch = Watch::default();
-        session.tap(Box::new(watch.clone()));
         Self {
             session,
             began,
@@ -288,7 +299,7 @@ async fn a_caller_asks_and_hears_the_whole_answer() {
             .join(0, CALLER)
             .microphone(CALLER, 0, 8_000, &talks(&speech));
     let mut running = Running::start(&world, transport).await;
-    assert_eq!(running.session.plan().shortfalls, []);
+    assert_eq!(running.session.plan().shortfalls(), []);
     assert_eq!(running.until(8_000).await, None, "the session goes on");
 
     // The model was shown what the caller said, and what it wrote was
@@ -661,9 +672,11 @@ async fn parts_that_can_do_less_still_hold_a_conversation() {
     // back, a recogniser that decides for itself and gives no times, and
     // a synthesiser that says nothing about where its words are.
     let line = TransportCaps {
-        inbound: Codec::G711(Law::Mu),
-        outbound: Codec::G711(Law::Mu),
-        remote_buffer: RemoteBuffer::default(),
+        audio: Some(AudioCaps {
+            inbound: Codec::G711(Law::Mu),
+            outbound: Codec::G711(Law::Mu),
+            remote_buffer: RemoteBuffer::default(),
+        }),
         text: false,
     };
     let story = "Of course. Once upon a time there was a ship. It sailed all the seas of \
@@ -702,7 +715,7 @@ async fn parts_that_can_do_less_still_hold_a_conversation() {
 
     // The plan names every weakness, and is for the line's 8 kHz as far
     // as the synthesiser can go down.
-    let plan = running.session.plan();
+    let plan = cascade(&running.session);
     assert_eq!(
         plan.shortfalls,
         [
@@ -775,7 +788,7 @@ async fn a_synthesiser_given_text_by_the_piece_that_gives_no_times_says_all_of_i
             .join(0, CALLER)
             .microphone(CALLER, 0, 12_000, &talks(&speech));
     let mut running = Running::start(&world, transport).await;
-    assert_eq!(running.session.plan().speak.marks, Marks::Spread);
+    assert_eq!(cascade(&running.session).speak.marks, Marks::Spread);
     assert_eq!(running.until(12_000).await, None);
 
     // Every sentence was said, not only the first: the ones after it do
@@ -805,7 +818,7 @@ async fn a_synthesiser_that_marks_only_its_words_says_all_of_it() {
             .join(0, CALLER)
             .microphone(CALLER, 0, 12_000, &talks(&speech));
     let mut running = Running::start(&world, transport).await;
-    assert_eq!(running.session.plan().speak.marks, Marks::Timed);
+    assert_eq!(cascade(&running.session).speak.marks, Marks::Timed);
     assert_eq!(running.until(12_000).await, None);
 
     assert_eq!(running.utterances(), [(story.to_owned(), false)]);
@@ -1681,6 +1694,37 @@ async fn a_session_that_never_settles_stores_its_state_all_the_same() {
     let upto = state.unwrap().upto.get();
     assert_eq!(upto % 8, 0, "a state as of record {upto} of {kinds:?}");
     assert!(running.session.stats().states.stored >= 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_that_hears_and_speaks_is_not_started_without_audio() {
+    let world = World::new(&[], ScriptedLlm::replies(vec![]));
+    let refused = |parts: Parts| async {
+        Session::open(spec(), parts, DefaultPolicies::default())
+            .await
+            .map(|_| ())
+            .unwrap_err()
+    };
+
+    // No transport at all.
+    let (transport, _far_end) = FakeTransport::sound_card().build();
+    let mut parts = world.parts(transport);
+    parts.transport = None;
+    let error = refused(parts).await;
+    assert_eq!(error, StartError::Plan(PlanError::NoAudio));
+    assert!(error.to_string().contains("carries audio"), "{error}");
+
+    // A transport for text alone.
+    let written = TransportCaps {
+        audio: None,
+        text: true,
+    };
+    let (transport, _far_end) = FakeTransport::with(written).build();
+    let error = refused(world.parts(transport)).await;
+    assert_eq!(error, StartError::Plan(PlanError::NoAudio));
+
+    // Nothing of it reached the journal.
+    assert_eq!(world.journal.records(SESSION), Vec::<bytes::Bytes>::new());
 }
 
 #[tokio::test(start_paused = true)]

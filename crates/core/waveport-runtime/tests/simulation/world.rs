@@ -45,12 +45,12 @@ use waveport_ports::error::{BoxFuture, PortError};
 use waveport_ports::journal::{Journal, SessionId};
 use waveport_ports::stt::{SttFinalize, SttTiming};
 use waveport_ports::tool::{ToolExecutor, ToolReply, ToolRequest};
-use waveport_ports::transport::{RemoteBuffer, TransportCaps};
+use waveport_ports::transport::{AudioCaps, RemoteBuffer, TransportCaps};
 use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::codec;
 use waveport_runtime::compute::Compute;
 use waveport_runtime::session::{
-    Ended, Parts, Request, Session, SessionInput, SessionSpec, StateRule, StoreBroken, Tap,
+    Brain, Ended, Parts, Request, Session, SessionInput, SessionSpec, StateRule, StoreBroken, Tap,
 };
 use waveport_sim::{Seed, SimRng};
 use waveport_testkit::fakes::{
@@ -93,30 +93,36 @@ impl Line {
     const fn caps(self) -> TransportCaps {
         match self {
             Self::SoundCard => TransportCaps {
-                inbound: Codec::Pcm(Rate::Hz48000),
-                outbound: Codec::Pcm(Rate::Hz48000),
-                remote_buffer: RemoteBuffer {
-                    clearable: true,
-                    reports_played: true,
-                },
+                audio: Some(AudioCaps {
+                    inbound: Codec::Pcm(Rate::Hz48000),
+                    outbound: Codec::Pcm(Rate::Hz48000),
+                    remote_buffer: RemoteBuffer {
+                        clearable: true,
+                        reports_played: true,
+                    },
+                }),
                 text: true,
             },
             Self::Telephone => TransportCaps {
-                inbound: Codec::G711(Law::Mu),
-                outbound: Codec::G711(Law::Mu),
-                remote_buffer: RemoteBuffer {
-                    clearable: false,
-                    reports_played: false,
-                },
+                audio: Some(AudioCaps {
+                    inbound: Codec::G711(Law::Mu),
+                    outbound: Codec::G711(Law::Mu),
+                    remote_buffer: RemoteBuffer {
+                        clearable: false,
+                        reports_played: false,
+                    },
+                }),
                 text: false,
             },
             Self::Opus => TransportCaps {
-                inbound: Codec::Opus,
-                outbound: Codec::Opus,
-                remote_buffer: RemoteBuffer {
-                    clearable: false,
-                    reports_played: true,
-                },
+                audio: Some(AudioCaps {
+                    inbound: Codec::Opus,
+                    outbound: Codec::Opus,
+                    remote_buffer: RemoteBuffer {
+                        clearable: false,
+                        reports_played: true,
+                    },
+                }),
                 text: true,
             },
         }
@@ -727,10 +733,13 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         let compute = Compute::inline(LoudVad::default(), turns, overlap)
             .map_err(|error| Broken(format!("no listening models: {error:?}")))?;
         let parts = Parts {
-            transport: Box::new(fresh.transport),
-            stt: Arc::new(fresh.stt),
-            llm: Arc::new(llm.clone()),
-            tts: Arc::new(ScriptedTts::new(plan.tts.clone())),
+            brain: Brain::Cascaded {
+                stt: Arc::new(fresh.stt),
+                llm: Arc::new(llm.clone()),
+                tts: Arc::new(ScriptedTts::new(plan.tts.clone())),
+                compute: Arc::new(compute),
+            },
+            transport: Some(Box::new(fresh.transport)),
             tools: Arc::new(Guarded {
                 tools: tools.clone(),
                 journal: journal.clone(),
@@ -738,8 +747,8 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
                 early: Arc::clone(&early),
             }),
             journal: Arc::new(journal.clone()),
-            compute: Arc::new(compute),
             sink: None,
+            taps: Vec::new(),
         };
         let mut session = Session::open(plan.spec.clone(), parts, plan.policies())
             .await
@@ -856,18 +865,20 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         let held = session.snapshot();
         drop(session);
         let idle = plan.fresh(lives.len(), plan.until_ms, 0);
+        let compute = Compute::inline(LoudVad::default(), Box::new(ScriptedTurns::always()), None)
+            .map_err(|error| Broken(format!("no listening models: {error:?}")))?;
         let parts = Parts {
-            transport: Box::new(idle.transport),
-            stt: Arc::new(idle.stt),
-            llm: Arc::new(llm.clone()),
-            tts: Arc::new(ScriptedTts::new(plan.tts.clone())),
+            brain: Brain::Cascaded {
+                stt: Arc::new(idle.stt),
+                llm: Arc::new(llm.clone()),
+                tts: Arc::new(ScriptedTts::new(plan.tts.clone())),
+                compute: Arc::new(compute),
+            },
+            transport: Some(Box::new(idle.transport)),
             tools: Arc::new(tools.clone()),
             journal: Arc::new(journal.clone()),
-            compute: Arc::new(
-                Compute::inline(LoudVad::default(), Box::new(ScriptedTurns::always()), None)
-                    .map_err(|error| Broken(format!("no listening models: {error:?}")))?,
-            ),
             sink: None,
+            taps: Vec::new(),
         };
         let rebuilt = Session::open(plan.spec.clone(), parts, plan.policies())
             .await
@@ -910,7 +921,11 @@ fn tail(log: &[String]) -> String {
 
 /// What must hold of a run beyond the kernel's own invariants.
 fn checked(plan: &Plan, outcome: &Outcome, early: &[ToolCallId]) -> Result<(), Broken> {
-    let reports = plan.line.caps().remote_buffer.reports_played;
+    let reports = plan
+        .line
+        .caps()
+        .audio
+        .is_some_and(|audio| audio.remote_buffer.reports_played);
     // How much of each response the far end played, over all lives.
     let mut played: BTreeMap<GenId, u32> = BTreeMap::new();
     for (index, life) in outcome.lives.iter().enumerate() {

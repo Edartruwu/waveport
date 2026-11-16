@@ -76,6 +76,9 @@ pub enum PlanError {
     NoRate(Role),
     /// The agent has tools and the language model cannot call any.
     NoTools,
+    /// The parts hear and speak, and the session has no transport that
+    /// carries audio: it has none at all, or one for text alone.
+    NoAudio,
 }
 
 impl fmt::Display for PlanError {
@@ -91,6 +94,9 @@ impl fmt::Display for PlanError {
             Self::NoTools => {
                 f.write_str("the agent has tools and the language model cannot call any")
             }
+            Self::NoAudio => f.write_str(
+                "the parts hear and speak, and the session has no transport that carries audio",
+            ),
         }
     }
 }
@@ -239,7 +245,9 @@ impl fmt::Display for Shortfall {
     }
 }
 
-/// Decides how a session is run with the parts it has.
+/// Decides how a session is run with the parts it has. `transport` is
+/// what its transport can do, or `None` for a session that has none: one
+/// that is reached through the application alone.
 ///
 /// # Errors
 ///
@@ -247,7 +255,7 @@ impl fmt::Display for Shortfall {
 pub fn plan(
     agent: &AgentNeeds,
     brain: &BrainProfile,
-    transport: &TransportCaps,
+    transport: Option<&TransportCaps>,
 ) -> Result<SessionPlan, PlanError> {
     let BrainProfile::Cascaded { hear, think, speak } = brain else {
         return Err(PlanError::Realtime);
@@ -255,6 +263,9 @@ pub fn plan(
     if agent.tools > 0 && !think.tools {
         return Err(PlanError::NoTools);
     }
+    let Some(transport) = transport.and_then(|transport| transport.audio) else {
+        return Err(PlanError::NoAudio);
+    };
     let mut shortfalls = Vec::new();
 
     // Listening. The models decide the rate of the inbound path; the
@@ -326,7 +337,7 @@ mod tests {
     use crate::audio::{Codec, Law, Rate, RateSet};
     use crate::llm::LlmCaps;
     use crate::stt::{SttCaps, SttFinalize, SttTiming};
-    use crate::transport::{RemoteBuffer, TransportCaps};
+    use crate::transport::{AudioCaps, RemoteBuffer, TransportCaps};
     use crate::tts::{Alignment, TtsCaps, TtsInput};
 
     /// A recogniser with nothing to wish for.
@@ -348,23 +359,28 @@ mod tests {
     };
     /// A sound card: plain samples, and the far end is this process.
     const CARD: TransportCaps = TransportCaps {
+        audio: Some(CARD_AUDIO),
+        text: false,
+    };
+    const CARD_AUDIO: AudioCaps = AudioCaps {
         inbound: Codec::Pcm(Rate::Hz48000),
         outbound: Codec::Pcm(Rate::Hz48000),
         remote_buffer: RemoteBuffer {
             clearable: true,
             reports_played: true,
         },
-        text: false,
     };
     /// A telephone line that can neither take audio back nor say what it
     /// played.
     const LINE: TransportCaps = TransportCaps {
-        inbound: Codec::G711(Law::Mu),
-        outbound: Codec::G711(Law::Mu),
-        remote_buffer: RemoteBuffer {
-            clearable: false,
-            reports_played: false,
-        },
+        audio: Some(AudioCaps {
+            inbound: Codec::G711(Law::Mu),
+            outbound: Codec::G711(Law::Mu),
+            remote_buffer: RemoteBuffer {
+                clearable: false,
+                reports_played: false,
+            },
+        }),
         text: false,
     };
 
@@ -373,7 +389,7 @@ mod tests {
     }
 
     fn cascade(agent: AgentNeeds, brain: &BrainProfile, transport: TransportCaps) -> CascadePlan {
-        let SessionPlan::Cascaded(plan) = plan(&agent, brain, &transport).unwrap();
+        let SessionPlan::Cascaded(plan) = plan(&agent, brain, Some(&transport)).unwrap();
         plan
     }
 
@@ -430,10 +446,16 @@ mod tests {
             let speak = TtsCaps { rates, ..SPEAK };
             let plan = cascade(AgentNeeds::default(), &brain(HEAR, THINK, speak), transport);
             assert_eq!(plan.speak.rate, expected, "{rates:?} on {transport:?}");
-            assert_eq!(plan.speak.wire, transport.outbound);
+            assert_eq!(
+                Some(plan.speak.wire),
+                transport.audio.map(|audio| audio.outbound)
+            );
         }
         let opus = TransportCaps {
-            outbound: Codec::Opus,
+            audio: Some(AudioCaps {
+                outbound: Codec::Opus,
+                ..CARD_AUDIO
+            }),
             ..CARD
         };
         let plan = cascade(AgentNeeds::default(), &brain(HEAR, THINK, SPEAK), opus);
@@ -497,10 +519,13 @@ mod tests {
         assert_eq!((plan.shortfalls.len(), plan.speak.marks), (0, Marks::Timed));
 
         let no_reports = TransportCaps {
-            remote_buffer: RemoteBuffer {
-                clearable: true,
-                reports_played: false,
-            },
+            audio: Some(AudioCaps {
+                remote_buffer: RemoteBuffer {
+                    clearable: true,
+                    reports_played: false,
+                },
+                ..CARD_AUDIO
+            }),
             ..CARD
         };
         let plan = cascade(
@@ -516,7 +541,7 @@ mod tests {
     fn what_cannot_work_is_refused() {
         let agent = AgentNeeds::default();
         assert_eq!(
-            plan(&agent, &BrainProfile::Realtime, &CARD),
+            plan(&agent, &BrainProfile::Realtime, Some(&CARD)),
             Err(PlanError::Realtime)
         );
 
@@ -525,7 +550,7 @@ mod tests {
             ..HEAR
         };
         assert_eq!(
-            plan(&agent, &brain(deaf, THINK, SPEAK), &CARD),
+            plan(&agent, &brain(deaf, THINK, SPEAK), Some(&CARD)),
             Err(PlanError::NoRate(Role::Hear))
         );
         let mute = TtsCaps {
@@ -533,7 +558,7 @@ mod tests {
             ..SPEAK
         };
         assert_eq!(
-            plan(&agent, &brain(HEAR, THINK, mute), &CARD),
+            plan(&agent, &brain(HEAR, THINK, mute), Some(&CARD)),
             Err(PlanError::NoRate(Role::Speak))
         );
 
@@ -543,23 +568,39 @@ mod tests {
         };
         let with_tools = AgentNeeds { tools: 1 };
         assert_eq!(
-            plan(&with_tools, &brain(HEAR, no_tools, SPEAK), &CARD),
+            plan(&with_tools, &brain(HEAR, no_tools, SPEAK), Some(&CARD)),
             Err(PlanError::NoTools)
         );
         // An agent without tools does not need a model that can call them.
-        assert!(plan(&agent, &brain(HEAR, no_tools, SPEAK), &CARD).is_ok());
+        assert!(plan(&agent, &brain(HEAR, no_tools, SPEAK), Some(&CARD)).is_ok());
         // One call at a time is enough.
         let one_at_a_time = LlmCaps {
             tools: true,
             parallel_tools: false,
         };
-        assert!(plan(&with_tools, &brain(HEAR, one_at_a_time, SPEAK), &CARD).is_ok());
+        assert!(plan(&with_tools, &brain(HEAR, one_at_a_time, SPEAK), Some(&CARD)).is_ok());
+
+        // Parts that hear and speak need a transport, and one that
+        // carries audio.
+        let written = TransportCaps {
+            audio: None,
+            text: true,
+        };
+        assert_eq!(
+            plan(&agent, &brain(HEAR, THINK, SPEAK), None),
+            Err(PlanError::NoAudio)
+        );
+        assert_eq!(
+            plan(&agent, &brain(HEAR, THINK, SPEAK), Some(&written)),
+            Err(PlanError::NoAudio)
+        );
 
         for error in [
             PlanError::Realtime,
             PlanError::NoRate(Role::Hear),
             PlanError::NoRate(Role::Speak),
             PlanError::NoTools,
+            PlanError::NoAudio,
         ] {
             assert!(error.to_string().len() > 30, "{error:?}");
         }
