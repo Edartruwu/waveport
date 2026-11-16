@@ -42,11 +42,11 @@ use waveport_ports::model::TurnModel;
 use waveport_ports::telemetry::{EventSink, Stage, StageMark};
 use waveport_ports::tool::ToolReply;
 use waveport_ports::transport::{
-    FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
+    AudioCaps, FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
 };
 use waveport_runtime::compute::Compute;
 use waveport_runtime::context::ToolDef;
-use waveport_runtime::session::{Parts, SessionSpec};
+use waveport_runtime::session::{Brain, Parts, SessionSpec};
 use waveport_testkit::fakes::tts::tone;
 use waveport_testkit::fakes::{
     LlmStep, LoudVad, ScriptedLlm, ScriptedStt, ScriptedTools, ScriptedTts, Spoken, SttScript,
@@ -295,11 +295,13 @@ impl Line {
         let sent = Arc::new(Mutex::new(Sent::default()));
         let line = Self {
             caps: TransportCaps {
-                inbound: packets.codec,
-                outbound: packets.codec,
-                // A line that cannot take audio back and does not say
-                // what it played, as a telephone line.
-                remote_buffer: RemoteBuffer::default(),
+                audio: Some(AudioCaps {
+                    inbound: packets.codec,
+                    outbound: packets.codec,
+                    // A line that cannot take audio back and does not say
+                    // what it played, as a telephone line.
+                    remote_buffer: RemoteBuffer::default(),
+                }),
                 text: false,
             },
             began: None,
@@ -726,14 +728,17 @@ impl Shared {
         let tools = ScriptedTools::with(|_| ToolReply::Completed("15:10".to_owned()));
         let sink: Arc<dyn EventSink> = Arc::clone(&self.watch) as Arc<dyn EventSink>;
         let parts = Parts {
-            transport: Box::new(line),
-            stt: Arc::new(ScriptedStt::new(heard)),
-            llm: Arc::new(self.llm.clone()),
-            tts: Arc::new(self.tts.clone()),
+            brain: Brain::Cascaded {
+                stt: Arc::new(ScriptedStt::new(heard)),
+                llm: Arc::new(self.llm.clone()),
+                tts: Arc::new(self.tts.clone()),
+                compute: Arc::clone(&self.compute),
+            },
+            transport: Some(Box::new(line)),
             tools: Arc::new(tools),
             journal: Arc::new(Forgetful),
-            compute: Arc::clone(&self.compute),
             sink: Some(sink),
+            taps: Vec::new(),
         };
         (spec, parts, sent)
     }

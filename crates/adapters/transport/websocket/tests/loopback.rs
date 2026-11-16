@@ -150,9 +150,10 @@ async fn hears(session: &mut Session, client: &mut Client) -> Heard {
 async fn a_transport_says_what_its_client_asked_for() {
     let (session, _client) = call(Rate::Hz16000).await;
     let caps = session.transport.caps();
-    assert_eq!(caps.inbound, Codec::Pcm(Rate::Hz16000));
-    assert_eq!(caps.outbound, Codec::Pcm(Rate::Hz16000));
-    assert!(caps.remote_buffer.clearable && caps.remote_buffer.reports_played);
+    let audio = caps.audio.unwrap();
+    assert_eq!(audio.inbound, Codec::Pcm(Rate::Hz16000));
+    assert_eq!(audio.outbound, Codec::Pcm(Rate::Hz16000));
+    assert!(audio.remote_buffer.clearable && audio.remote_buffer.reports_played);
     assert!(caps.text);
 }
 

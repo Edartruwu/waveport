@@ -18,7 +18,7 @@ use waveport_domain::ids::{OpTag, ParticipantId};
 use waveport_ports::audio::{Codec, Rate};
 use waveport_ports::error::{Full, PortError};
 use waveport_ports::transport::{
-    FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
+    AudioCaps, FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
 };
 
 use crate::wire::{self, FromClient, FromServer, PATH, PROTOCOL};
@@ -289,12 +289,14 @@ pub struct WsTransport {
 impl Transport for WsTransport {
     fn caps(&self) -> TransportCaps {
         TransportCaps {
-            inbound: Codec::Pcm(self.rate),
-            outbound: Codec::Pcm(self.rate),
-            remote_buffer: RemoteBuffer {
-                clearable: true,
-                reports_played: true,
-            },
+            audio: Some(AudioCaps {
+                inbound: Codec::Pcm(self.rate),
+                outbound: Codec::Pcm(self.rate),
+                remote_buffer: RemoteBuffer {
+                    clearable: true,
+                    reports_played: true,
+                },
+            }),
             text: true,
         }
     }

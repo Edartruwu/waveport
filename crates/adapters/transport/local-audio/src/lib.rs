@@ -51,7 +51,7 @@ use waveport_domain::time::MediaDur;
 use waveport_ports::audio::{Codec, Rate};
 use waveport_ports::error::Full;
 use waveport_ports::transport::{
-    FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
+    AudioCaps, FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
 };
 
 use crate::card::Card;
@@ -339,12 +339,14 @@ impl LocalAudio {
 impl Transport for LocalAudio {
     fn caps(&self) -> TransportCaps {
         TransportCaps {
-            inbound: Codec::Pcm(RATE),
-            outbound: Codec::Pcm(RATE),
-            remote_buffer: RemoteBuffer {
-                clearable: true,
-                reports_played: true,
-            },
+            audio: Some(AudioCaps {
+                inbound: Codec::Pcm(RATE),
+                outbound: Codec::Pcm(RATE),
+                remote_buffer: RemoteBuffer {
+                    clearable: true,
+                    reports_played: true,
+                },
+            }),
             text: false,
         }
     }

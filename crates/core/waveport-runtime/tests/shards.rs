@@ -24,7 +24,7 @@ use waveport_ports::journal::SessionId;
 use waveport_ports::tool::ToolReply;
 use waveport_runtime::compute::Compute;
 use waveport_runtime::context::ToolDef;
-use waveport_runtime::session::{Ended, Parts, SessionSpec};
+use waveport_runtime::session::{Brain, Ended, Parts, SessionSpec};
 use waveport_runtime::shard::{Exit, Runtime, RuntimeConfig, SpawnError};
 use waveport_testkit::fakes::{
     FakeTransport, LlmStep, LoudVad, MemoryJournal, ScriptedLlm, ScriptedStt, ScriptedTools,
@@ -58,14 +58,17 @@ fn parts(compute: &Arc<Compute>, journal: &MemoryJournal, tools: ScriptedTools) 
     let (transport, _) = FakeTransport::sound_card().join(0, CALLER).build();
     let llm = ScriptedLlm::with(|_| vec![LlmStep::call("look_up", "{}")]);
     Parts {
-        transport: Box::new(transport),
-        stt: Arc::new(ScriptedStt::new(SttScript::new(vec![]))),
-        llm: Arc::new(llm),
-        tts: Arc::new(ScriptedTts::default()),
+        brain: Brain::Cascaded {
+            stt: Arc::new(ScriptedStt::new(SttScript::new(vec![]))),
+            llm: Arc::new(llm),
+            tts: Arc::new(ScriptedTts::default()),
+            compute: Arc::clone(compute),
+        },
+        transport: Some(Box::new(transport)),
         tools: Arc::new(tools),
         journal: Arc::new(journal.clone()),
-        compute: Arc::clone(compute),
         sink: None,
+        taps: Vec::new(),
     }
 }
 

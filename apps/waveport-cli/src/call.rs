@@ -17,7 +17,7 @@ use waveport_ports::telemetry::EventSink;
 use waveport_ports::transport::Transport;
 use waveport_ports::tts::Tts;
 use waveport_runtime::compute::Compute;
-use waveport_runtime::session::{Ended, Parts, Rebuilt, SessionSpec, StateRule};
+use waveport_runtime::session::{Brain, Ended, Parts, Rebuilt, SessionSpec, StateRule};
 use waveport_runtime::shard::{Exit, Runtime, RuntimeConfig, Started};
 use waveport_runtime::tools::Registry;
 use waveport_stt_assemblyai::AssemblyAiStt;
@@ -359,14 +359,17 @@ impl Stack {
             sinks.push(summary);
         }
         let parts = Parts {
-            transport,
-            stt: self.stt.clone(),
-            llm: self.llm.clone(),
-            tts: self.tts.clone(),
+            brain: Brain::Cascaded {
+                stt: self.stt.clone(),
+                llm: self.llm.clone(),
+                tts: self.tts.clone(),
+                compute: Arc::clone(&self.compute),
+            },
+            transport: Some(transport),
             tools: self.tools.clone(),
             journal: self.kept.journal(),
-            compute: Arc::clone(&self.compute),
             sink: Some(Arc::new(sinks)),
+            taps: Vec::new(),
         };
         let started = self
             .runtime
@@ -375,7 +378,7 @@ impl Stack {
             .with(|| "the call could not be started".to_owned())?;
         let notes = started
             .plan
-            .shortfalls
+            .shortfalls()
             .iter()
             .map(ToString::to_string)
             .collect();
