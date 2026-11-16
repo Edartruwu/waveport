@@ -54,8 +54,8 @@ const HEARD: &str =
 
 /// What a stand-in for Deepgram says in a call with one question:
 /// nothing until it is asked what it has heard, and then the question
-/// with where its words were. Made up, in the shapes of the provider's
-/// documentation.
+/// with where its words were. Made up, in the shapes of what the
+/// provider says.
 const HEARD_BY_DEEPGRAM: &str = "> \"type\":\"Finalize\"\n\
     < {\"type\":\"Results\",\"channel_index\":[0,1],\"duration\":2.5,\"start\":0.0,\
     \"is_final\":true,\"speech_final\":true,\"from_finalize\":true,\"channel\":\
@@ -170,18 +170,20 @@ fn spoken() -> Vec<WsStep> {
 
 /// The same answer as a stand-in for ElevenLabs gives it: the same
 /// 1.2 s of a tone in three pieces, each with the characters spoken in
-/// it, timed from where that piece begins.
+/// it, timed as the provider times them: on a clock that runs on
+/// through the speech, and with the space between two pieces at the end
+/// of the first.
 fn spoken_by_characters() -> Vec<WsStep> {
     let tone: Vec<i16> = (0..Rate::Hz24000.samples_in_millis(400))
         .map(|n| if n % 48 < 24 { 3_000 } else { -3_000 })
         .collect();
     let mut data = String::new();
     write_base64(&tone, &mut data);
-    let piece = |text: &str| {
+    let piece = |text: &str, from: u32| {
         let count = u32::try_from(text.chars().count()).unwrap();
         let each = 400 / count;
         let chars: Vec<String> = text.chars().map(|c| format!("\"{c}\"")).collect();
-        let starts: Vec<String> = (0..count).map(|n| (n * each).to_string()).collect();
+        let starts: Vec<String> = (0..count).map(|n| (from + n * each).to_string()).collect();
         let lengths = vec![each.to_string(); chars.len()];
         format!(
             "< {{\"audio\":\"{data}\",\"contextId\":\"{{{{context_id}}}}\",\"alignment\":\
@@ -193,14 +195,13 @@ fn spoken_by_characters() -> Vec<WsStep> {
         )
     };
     let script = [
-        // The first sentence. The space a response is begun with is
-        // among its characters.
+        // The first sentence.
         "> \"text\":\"It is".to_owned(),
-        piece(" It is ten"),
-        piece(" past three."),
+        piece("It is ten ", 0),
+        piece("past three. ", 400),
         // The second, which is given once the first has its audio.
         "> Goodbye!".to_owned(),
-        piece(" Goodbye!"),
+        piece("Goodbye! ", 800),
         // And once the adapter has said that no more text follows.
         "> \"close_context\":true".to_owned(),
         "< {\"isFinal\":true,\"contextId\":\"{{context_id}}\"}".to_owned(),

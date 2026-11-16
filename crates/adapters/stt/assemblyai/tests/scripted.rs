@@ -1,11 +1,13 @@
-//! The adapter against a server on this machine that answers in the
-//! shapes the provider's documentation gives, and, when asked, against
-//! the provider.
+//! The adapter against a server on this machine that answers as the
+//! provider was recorded to, and, when asked, against the provider.
 //!
-//! Nothing here was recorded: there has been no key to record with. The
-//! messages are made up, as the documentation of 15 November 2026 has
-//! them. The checks of `waveport_testkit::conformance` are the same ones
-//! that the fakes pass.
+//! The files in `tests/fixtures` are what the provider said on 16
+//! November 2026 to the audio of `waveport_testkit::speech`, and where
+//! in that audio it said it. The other scripts here are made up in the
+//! shapes of those: what the provider does when it fails has not been
+//! seen, and is as its documentation has it. The checks of
+//! `waveport_testkit::conformance` are the same ones that the fakes
+//! pass.
 //!
 //! The tests named `live_*` talk to the provider. They are ignored
 //! unless asked for, and need `ASSEMBLYAI_API_KEY`:
@@ -35,6 +37,17 @@ use waveport_testkit::speech::{WHAT_TIME_IS_IT, framed, what_time_is_it};
 
 const RATE: Rate = Rate::Hz16000;
 const MODEL: &str = "universal-3-6-pro";
+
+/// The provider's other model for speech as it is spoken, which answers
+/// differently where nothing is being said.
+const ENGLISH: &str = "universal-streaming-english";
+
+/// What the provider said, and where in what it was sent. See the files.
+const QUESTION: &str = include_str!("fixtures/question.ws");
+const QUESTION_ENGLISH: &str = include_str!("fixtures/question_english.ws");
+const TWO_TURNS: &str = include_str!("fixtures/two_turns.ws");
+const TWO_TURNS_ENGLISH: &str = include_str!("fixtures/two_turns_english.ws");
+const WRONG_KEY: &str = include_str!("fixtures/wrong_key.ws");
 
 const fn ms(millis: u64) -> MediaTime {
     MediaTime::from_millis(millis)
@@ -66,18 +79,10 @@ fn refusal(code: u16, said: &str) -> String {
     format!("< {{\"type\":\"Error\",\"error_code\":{code},\"error\":\"{said}\"}}\n! {code} {said}")
 }
 
-/// Waits for `count` messages of audio. The adapter puts the pieces of
-/// 20 ms that the checks send together by threes, so that is 60 ms each.
-/// The provider cannot write down what it has not been sent.
-fn audio(count: usize) -> String {
-    vec![">b"; count].join("\n")
-}
-
-const PARTIAL: &str = "\"turn_is_formatted\":false,\"end_of_turn\":false,";
 const OVER: &str = "\"turn_is_formatted\":true,\"end_of_turn\":true,";
 
-/// What the provider says about a turn. `words` are where each begins
-/// and ends, in milliseconds of the audio.
+/// What the provider says about a turn. `words` are where it says each
+/// begins and ends, in milliseconds.
 fn turn(order: u64, flags: &str, transcript: &str, words: &[(u32, u32)]) -> String {
     let words: Vec<String> = words
         .iter()
@@ -99,49 +104,37 @@ fn turn(order: u64, flags: &str, transcript: &str, words: &[(u32, u32)]) -> Stri
 const SUMMARY: &str = "< {\"type\":\"Termination\",\"audio_duration_seconds\":3,\
     \"session_duration_seconds\":3}\n! 1000 ";
 
-/// The script of a session in which the question is asked once: the
-/// turn as it grows while the audio arrives, and the turn ended when
-/// that is asked for.
-fn question_script() -> String {
-    [
-        begin(MODEL),
-        // Nine tenths of a second.
-        audio(15),
-        "< {\"type\":\"SpeechStarted\",\"timestamp\":350,\"confidence\":0.98}".to_owned(),
-        turn(0, PARTIAL, "what time", &[(350, 550), (600, 850)]),
-        // Two seconds, nearly.
-        audio(18),
-        turn(
-            0,
-            PARTIAL,
-            "what time is it right now",
-            &[(350, 550), (1_650, 1_950)],
-        ),
-        "> \"type\":\"ForceEndpoint\"".to_owned(),
-        turn(
-            0,
-            OVER,
-            "What time is it right now?",
-            &[(350, 550), (1_650, 2_000)],
-        ),
-        "> \"type\":\"Terminate\"".to_owned(),
-        SUMMARY.to_owned(),
-    ]
-    .join("\n")
-}
-
 async fn server(script: &str) -> WsServer {
     WsServer::start(vec![WsStep::script(script)]).await
 }
 
 /// An adapter that talks to `server`, and that does not wait long.
 fn adapter(server: &WsServer) -> AssemblyAiStt {
+    adapter_with(server, MODEL)
+}
+
+/// The same, for another model.
+fn adapter_with(server: &WsServer, model: &str) -> AssemblyAiStt {
     AssemblyAiStt::new(Config {
         url: server.url("/v3/ws"),
         timeout: Duration::from_secs(2),
         answer_timeout: Duration::from_millis(300),
-        ..Config::new(MODEL, Some(Secret::new("aai-not-a-key")))
+        ..Config::new(model, Some(Secret::new("aai-not-a-key")))
     })
+}
+
+/// Whether final transcripts cover the audio from `from` to `to` between
+/// them, each beginning where the one before it ended. A transcript is
+/// placed in the audio that was sent since the one before it.
+fn cover(finals: &[Transcript], from: MediaTime, to: MediaTime) -> bool {
+    let mut at = from;
+    for transcript in finals {
+        if transcript.span.start != at {
+            return false;
+        }
+        at = transcript.span.end;
+    }
+    at == to
 }
 
 async fn open(stt: &AssemblyAiStt) -> SttStream {
@@ -209,7 +202,7 @@ const TAKEN: core::ops::RangeInclusive<usize> = 640..=32_000;
 
 #[tokio::test]
 async fn a_question_is_heard_as_the_port_says() {
-    let server = server(&question_script()).await;
+    let server = server(QUESTION).await;
     let stt = adapter(&server);
     let audio = question();
     let talk = Talk {
@@ -223,37 +216,18 @@ async fn a_question_is_heard_as_the_port_says() {
     let end = end_of(ms(1_000), &audio);
     assert_eq!(end, ms(3_735));
 
-    // The words are placed where the provider says they were spoken, on
-    // the clock of the audio that was sent, which began at one second.
-    let grew: Vec<(&str, MediaSpan)> = seen
-        .interim
-        .iter()
-        .map(|t| (t.text.as_str(), t.span))
-        .collect();
-    assert_eq!(
-        grew,
-        [
-            ("what time", MediaSpan::new(ms(1_350), ms(1_850))),
-            (
-                "what time is it right now",
-                MediaSpan::new(ms(1_350), ms(2_950))
-            ),
-        ]
-    );
-    let finals: Vec<(&str, MediaSpan)> = seen
-        .finals
-        .iter()
-        .map(|t| (t.text.as_str(), t.span))
-        .collect();
-    assert_eq!(
-        finals,
-        [
-            (WHAT_TIME_IS_IT, MediaSpan::new(ms(1_350), ms(3_000))),
-            // The words end before the audio does. That all of it was
-            // heard is said apart.
-            ("", MediaSpan::new(end, end)),
-        ]
-    );
+    // The turn as it grew, in the audio that was sent, which began at
+    // one second.
+    let grew: Vec<&str> = seen.interim.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(grew, ["What time", WHAT_TIME_IS_IT]);
+    for interim in &seen.interim {
+        assert_eq!(interim.span.start, ms(1_000), "{interim:?}");
+        assert!(interim.span.end <= end, "{interim:?}");
+    }
+    // The provider ended the turn by itself, and said nothing when it
+    // was asked to end one after that. Whichever of the two came first
+    // here, the final transcripts cover all of the audio between them.
+    assert!(cover(&seen.finals, ms(1_000), end), "{:?}", seen.finals);
 
     // What the provider was sent: what the session asked for in the
     // address, the key in a header, all the audio as it was and in
@@ -270,7 +244,8 @@ async fn a_question_is_heard_as_the_port_says() {
     assert_eq!(audio_sent(sent), audio);
     let sizes = sizes(sent);
     assert!(sizes.iter().all(|size| TAKEN.contains(size)), "{sizes:?}");
-    // By threes, and what was left when the turn was to end.
+    // By threes, and what was left when the turn was to end: as many
+    // messages as when it was recorded.
     assert_eq!(sizes.len(), 46, "{sizes:?}");
     let texts: Vec<&str> = sent.texts().collect();
     assert_eq!(
@@ -280,36 +255,79 @@ async fn a_question_is_heard_as_the_port_says() {
 }
 
 #[tokio::test]
+async fn a_model_that_answers_a_request_with_an_empty_turn_is_heard_the_same() {
+    let server = server(QUESTION_ENGLISH).await;
+    let stt = adapter_with(&server, ENGLISH);
+    let audio = question();
+    let talk = Talk {
+        at: ms(1_000),
+        rate: RATE,
+        samples: &audio,
+        paced: false,
+    };
+    let seen = stt_utterance(&stt, talk).await.unwrap();
+    // This model writes neither capitals nor points, and of a turn that
+    // goes on it gives the words it is sure of.
+    assert_eq!(seen.text(), "what time is it right now");
+    let grew: Vec<&str> = seen.interim.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(
+        grew,
+        [
+            "what",
+            "what time",
+            "what time is",
+            "what time is it",
+            "what time is it right",
+            "what time is it right",
+        ]
+    );
+    let end = end_of(ms(1_000), &audio);
+    assert!(cover(&seen.finals, ms(1_000), end), "{:?}", seen.finals);
+
+    let connections = server.over(1).await;
+    let sent = &connections[0];
+    assert_eq!(
+        sent.path,
+        "/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-streaming-english"
+    );
+    assert_eq!(audio_sent(sent), audio);
+    let texts: Vec<&str> = sent.texts().collect();
+    assert_eq!(
+        texts,
+        ["{\"type\":\"ForceEndpoint\"}", "{\"type\":\"Terminate\"}"]
+    );
+}
+
+#[tokio::test]
 async fn two_turns_on_one_stream_are_each_placed_in_their_own_audio() {
-    let script = [
-        begin(MODEL),
-        "> \"type\":\"ForceEndpoint\"".to_owned(),
-        turn(0, OVER, "What time is it right now?", &[(350, 2_000)]),
-        "> \"type\":\"ForceEndpoint\"".to_owned(),
-        // The provider counts on through the audio it was sent, and not
-        // through the minute in which it was sent nothing.
-        turn(1, OVER, "And the date?", &[(3_085, 4_185)]),
-    ]
-    .join("\n");
-    let server = server(&script).await;
+    let server = server(TWO_TURNS).await;
     let stt = adapter(&server);
     let mut stream = open(&stt).await;
     let audio = question();
 
+    // The first turn ends when that is asked for.
     let end = send(&mut stream, ms(1_000), &audio, 100);
     assert_eq!(end, end_of(ms(1_000), &audio));
     stream.tx.try_finalize().unwrap();
     let first = next_final(&mut stream).await;
     assert_eq!(first.text, WHAT_TIME_IS_IT);
-    assert_eq!(first.span, MediaSpan::new(ms(1_350), ms(3_000)));
-    assert_eq!(next_final(&mut stream).await.span, MediaSpan::new(end, end));
+    assert_eq!(first.span, MediaSpan::new(ms(1_000), end));
 
-    // A minute later, on the session's clock.
-    send(&mut stream, ms(61_000), &audio, 100);
-    stream.tx.try_finalize().unwrap();
+    // A minute later, on the session's clock. The provider ends this
+    // turn by itself, 2.6 s into its audio.
+    let (most, rest) = audio.split_at(26 * RATE.samples_in_millis(100));
+    let paused = send(&mut stream, ms(61_000), most, 100);
+    assert_eq!(paused, ms(63_600));
     let second = next_final(&mut stream).await;
-    assert_eq!(second.text, "And the date?");
-    assert_eq!(second.span, MediaSpan::new(ms(61_350), ms(62_450)));
+    assert_eq!(second.text, WHAT_TIME_IS_IT);
+    assert_eq!(second.span, MediaSpan::new(ms(61_000), paused));
+    // Asked to end a turn after that, when it is writing none, it says
+    // nothing. Nothing was said in what was sent since.
+    let end = send(&mut stream, paused, rest, 100);
+    stream.tx.try_finalize().unwrap();
+    let nothing = next_final(&mut stream).await;
+    assert_eq!(nothing.text, "");
+    assert_eq!(nothing.span, MediaSpan::new(paused, end));
 
     // The language the session named went in the address, as the
     // provider knows it.
@@ -320,6 +338,37 @@ async fn two_turns_on_one_stream_are_each_placed_in_their_own_audio() {
         "/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro\
          &language_codes=%5B%22en%22%5D"
     );
+}
+
+#[tokio::test]
+async fn a_request_after_a_turn_the_provider_ended_is_answered_by_its_empty_turn() {
+    let server = server(TWO_TURNS_ENGLISH).await;
+    // An adapter that would wait longer for an answer than this test
+    // waits for a transcript: the answers here are the provider's.
+    let stt = AssemblyAiStt::new(Config {
+        answer_timeout: Duration::from_secs(60),
+        ..adapter_with(&server, ENGLISH).config().clone()
+    });
+    let mut stream = open(&stt).await;
+    let audio = question();
+    let (most, rest) = audio.split_at(27 * RATE.samples_in_millis(100));
+    let mut at = ms(0);
+    for turn in 0..2 {
+        // The provider ends each turn by itself, 2.7 s into its audio.
+        let began = at;
+        at = send(&mut stream, at, most, 100);
+        let words = next_final(&mut stream).await;
+        assert_eq!(words.text, "what time is it right now", "turn {turn}");
+        assert_eq!(words.span, MediaSpan::new(began, at), "turn {turn}");
+        // Asked to end a turn after that, this model ends one that
+        // holds nothing.
+        let paused = at;
+        at = send(&mut stream, at, rest, 100);
+        stream.tx.try_finalize().unwrap();
+        let nothing = next_final(&mut stream).await;
+        assert_eq!(nothing.text, "", "turn {turn}");
+        assert_eq!(nothing.span, MediaSpan::new(paused, at), "turn {turn}");
+    }
 }
 
 #[tokio::test]
@@ -340,9 +389,9 @@ async fn audio_in_small_pieces_goes_in_messages_the_provider_takes() {
     }
     stream.tx.try_finalize().unwrap();
     // Nothing ends a turn here, so the request is answered with nothing,
-    // at the end of everything the session sent.
+    // of everything the session sent.
     let answer = next_final(&mut stream).await;
-    assert_eq!(answer.span, MediaSpan::new(at, at));
+    assert_eq!(answer.span, MediaSpan::new(ms(0), at));
     drop(stream);
 
     let connections = server.over(1).await;
@@ -365,7 +414,7 @@ async fn a_request_the_provider_does_not_answer_is_answered_with_nothing() {
     let began = std::time::Instant::now();
     let answer = next_final(&mut stream).await;
     assert_eq!(answer.text, "");
-    assert_eq!(answer.span, MediaSpan::new(end, end));
+    assert_eq!(answer.span, MediaSpan::new(ms(0), end));
     // Not at once, and not long after: the provider had its time.
     let took = began.elapsed();
     assert!(
@@ -396,7 +445,7 @@ async fn a_provider_that_does_not_say_it_is_over_is_not_waited_for_long() {
         .await
         .unwrap();
     let answer = SttEvent::Transcript(Transcript {
-        span: MediaSpan::new(end, end),
+        span: MediaSpan::new(ms(0), end),
         text: String::new(),
         is_final: true,
     });
@@ -421,15 +470,16 @@ async fn what_the_provider_writes_down_after_the_end_is_still_passed_on() {
     let server = server(&script).await;
     let stt = adapter(&server);
     let mut stream = open(&stt).await;
-    send(&mut stream, ms(0), &question(), 100);
+    let end = send(&mut stream, ms(0), &question(), 100);
     let SttStream { tx, mut rx } = stream;
     drop(tx);
     let mut all = Vec::new();
     while let Some(next) = next_stt(&mut rx).await {
         all.push(next.unwrap());
     }
+    // In all the audio that was sent: no transcript came before it.
     let last = SttEvent::Transcript(Transcript {
-        span: MediaSpan::new(ms(400), ms(1_100)),
+        span: MediaSpan::new(ms(0), end),
         text: "Never mind.".to_owned(),
         is_final: true,
     });
@@ -439,8 +489,9 @@ async fn what_the_provider_writes_down_after_the_end_is_still_passed_on() {
 #[tokio::test]
 async fn a_provider_that_refuses_the_session_fails_the_opening() {
     for (script, class) in [
-        // A key it does not take. The provider may repeat what it was
-        // sent.
+        // A key it does not know, as it was recorded.
+        (WRONG_KEY.to_owned(), RetryClass::Auth),
+        // The provider may repeat what it was sent.
         (
             refusal(
                 1008,
@@ -602,14 +653,12 @@ async fn live_a_question_is_heard_as_the_port_says() {
     };
     let seen = stt_utterance(&stt, talk).await.unwrap();
     assert_eq!(plain(&seen.text()), plain(WHAT_TIME_IS_IT), "{seen:?}");
-    // The words are placed in the speech, which begins 0.3 s into the
-    // audio and lasts a second and three quarters.
-    let spoken = seen.finals.iter().find(|t| !t.text.is_empty()).unwrap();
-    assert!(
-        spoken.span.start >= ms(1_100) && spoken.span.start <= ms(1_700),
-        "{:?}",
-        spoken.span
-    );
+    // The words are placed in the audio that was sent, and the final
+    // transcripts cover all of it between them. The provider's times
+    // for its words are not where the words are: the speech begins
+    // 0.3 s into the audio, and both of its models say otherwise.
+    let end = end_of(ms(1_000), &audio);
+    assert!(cover(&seen.finals, ms(1_000), end), "{:?}", seen.finals);
 }
 
 #[tokio::test]
@@ -621,6 +670,7 @@ async fn live_two_turns_on_one_stream_are_each_heard() {
     let mut at = ms(0);
     for turn in 0..2 {
         let began = at;
+        let mut finals = Vec::new();
         for piece in audio.chunks(RATE.samples_in_millis(100)) {
             let audio = AudioRef {
                 at,
@@ -629,10 +679,13 @@ async fn live_two_turns_on_one_stream_are_each_heard() {
             };
             stream.tx.try_send(audio).unwrap();
             at = audio.span().end;
-            // At the pace it is spoken, with the loop run meanwhile.
+            // At the pace it is spoken, with the loop run meanwhile. The
+            // provider may end the turn by itself before it is asked
+            // to, and the words come then.
             let _ = tokio::time::timeout(Duration::from_millis(100), async {
                 loop {
                     match next_stt(&mut stream.rx).await {
+                        Some(Ok(SttEvent::Transcript(said))) if said.is_final => finals.push(said),
                         Some(Ok(_)) => {}
                         other => panic!("the stream ended: {other:?}"),
                     }
@@ -641,14 +694,16 @@ async fn live_two_turns_on_one_stream_are_each_heard() {
             .await;
         }
         stream.tx.try_finalize().unwrap();
-        // The words, and then that all of the audio was heard. The
-        // provider may have ended the turn by itself before it was
-        // asked to, in which case the words came during the audio.
-        let last = next_final(&mut stream).await;
-        assert!(
-            last.span.start >= began && last.span.end <= at,
+        // What was asked for: the words, or that nothing more was said.
+        finals.push(next_final(&mut stream).await);
+        let heard: Vec<&str> = finals.iter().map(|said| said.text.as_str()).collect();
+        assert_eq!(
+            plain(&heard.join(" ")),
+            plain(WHAT_TIME_IS_IT),
             "turn {turn}"
         );
+        // Each turn is in its own audio, all of it.
+        assert!(cover(&finals, began, at), "turn {turn}: {finals:?}");
     }
 }
 
