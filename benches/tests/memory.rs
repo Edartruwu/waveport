@@ -54,6 +54,25 @@ fn begin(local: &LocalSet, shared: &Shared, first: u128, sessions: u32, apart: D
     }
 }
 
+/// Runs a few calls to their ends and lets go of everything they were
+/// made of.
+///
+/// What is counted afterwards is then the sessions' and their parts'.
+/// The runtime the test itself runs on makes some things the first time
+/// they are used, and keeps them for as long as it lives: on macOS a
+/// lock is 64 bytes on the heap from its first use. Without this they
+/// would be made in the middle of the count and read as bytes that were
+/// never given back.
+async fn warm_up() {
+    let script = Script::asking(1, Codec::Opus, Delays::USUAL);
+    let watch = Watch::counting();
+    let shared = Shared::new(script, &watch);
+    let local = LocalSet::new();
+    begin(&local, &shared, 1, 20, Duration::from_millis(17));
+    local.await;
+    assert_eq!(watch.closed(), 20);
+}
+
 /// What has been allocated since `before` and not freed, for each of
 /// `sessions`, in kilobytes.
 fn each_holds(before: AllocStats, sessions: u32) -> f64 {
@@ -127,6 +146,7 @@ async fn nothing_is_left_of_sessions_that_are_over() {
     let script = Script::asking(2, Codec::Opus, Delays::USUAL);
     // Made before the count begins, so that it is not in it.
     let mut after_wave = Vec::with_capacity(6);
+    warm_up().await;
     let before = snapshot();
     {
         let watch = Watch::counting();
@@ -148,12 +168,14 @@ async fn nothing_is_left_of_sessions_that_are_over() {
             after_wave.push(snapshot().since(before).live_bytes());
         }
     }
-    // What the shared parts hold is room for the calls that are under
-    // way at once. It is there after the first wave and does not grow
-    // with the waves after it: under a kilobyte, which is the list the
-    // stand-in for the end-of-turn model keeps of what it was asked.
-    let (first, last) = (after_wave.first().unwrap(), after_wave.last().unwrap());
-    assert!(last.saturating_sub(*first) < 1_024, "{after_wave:?}");
+    // What the shared parts hold between waves is room for the calls
+    // that are under way at once. It is there after the first wave, and
+    // it is the same after every wave that follows: not a byte more.
+    let first = *after_wave.first().unwrap();
+    assert!(
+        after_wave.iter().all(|held| *held == first),
+        "{after_wave:?}"
+    );
     // And when the parts are gone too, every byte is back.
     assert_eq!(snapshot().since(before).live_bytes(), 0);
 }
@@ -163,6 +185,7 @@ async fn nothing_is_left_of_sessions_that_are_over() {
 async fn soak(sessions: u32, questions: u32) {
     let targets = Targets::load();
     let script = Script::asking(questions, Codec::Opus, Delays::USUAL);
+    warm_up().await;
     let before = snapshot();
     {
         let watch = Watch::keeping();

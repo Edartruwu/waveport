@@ -20,7 +20,7 @@ use core::future::{Future, ready};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
@@ -33,11 +33,12 @@ use waveport_domain::text::TextArena;
 use waveport_domain::time::MonoTime;
 use waveport_media::codec::Encoder;
 use waveport_media::codec::opus::OpusSettings;
-use waveport_ports::audio::Codec;
-use waveport_ports::error::{BoxFuture, Full};
+use waveport_ports::audio::{Codec, Rate};
+use waveport_ports::error::{BoxFuture, Full, PortError};
 use waveport_ports::journal::{
     Batch, Journal, JournalError, Lease, Recovered, SessionId, Snapshot,
 };
+use waveport_ports::model::TurnModel;
 use waveport_ports::telemetry::{EventSink, Stage, StageMark};
 use waveport_ports::tool::ToolReply;
 use waveport_ports::transport::{
@@ -48,8 +49,8 @@ use waveport_runtime::context::ToolDef;
 use waveport_runtime::session::{Parts, SessionSpec};
 use waveport_testkit::fakes::tts::tone;
 use waveport_testkit::fakes::{
-    LlmStep, LoudVad, ScriptedLlm, ScriptedStt, ScriptedTools, ScriptedTts, ScriptedTurns, Spoken,
-    SttScript, TtsScript,
+    LlmStep, LoudVad, ScriptedLlm, ScriptedStt, ScriptedTools, ScriptedTts, Spoken, SttScript,
+    TtsScript,
 };
 
 /// The caller.
@@ -467,10 +468,43 @@ const fn kind(what: &What) -> usize {
     }
 }
 
+/// A stand-in for the end-of-turn model that is sure of every turn it
+/// is asked about, and keeps nothing of what it was asked: the one in
+/// the testkit keeps a list, for a test to read, that grows with every
+/// turn of every call.
+#[derive(Clone, Copy, Debug)]
+struct Sure;
+
+impl TurnModel for Sure {
+    fn rate(&self) -> Rate {
+        Rate::Hz16000
+    }
+
+    fn window(&self) -> usize {
+        // Eight seconds, as Smart Turn looks at.
+        128_000
+    }
+
+    fn max_batch(&self) -> usize {
+        8
+    }
+
+    fn infer(&mut self, turns: &[&[i16]], out: &mut [f32]) -> Result<(), PortError> {
+        for (_, likely) in turns.iter().zip(out) {
+            *likely = 0.95;
+        }
+        Ok(())
+    }
+}
+
 /// What a watch has seen.
 #[derive(Debug, Default)]
 struct Seen {
-    trackers: HashMap<SessionId, Tracker>,
+    /// One for each session that is under way. In an ordered map, which
+    /// holds nothing once the sessions are over: a hashed one keeps its
+    /// room, and after enough sessions have come and gone it takes
+    /// twice as much, on some machines and not on others.
+    trackers: BTreeMap<SessionId, Tracker>,
     /// How long each kind of part took, every time.
     took: [Vec<Duration>; KINDS],
     /// How many parts of each kind there were, kept or not.
@@ -631,7 +665,7 @@ impl Shared {
             forgets: true,
             ..TtsScript::default()
         });
-        let turns = Box::new(ScriptedTurns::always());
+        let turns = Box::new(Sure);
         #[expect(
             clippy::expect_used,
             reason = "a measurement that cannot be set up has nothing to measure"
