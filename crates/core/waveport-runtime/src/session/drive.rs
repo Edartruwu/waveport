@@ -7,6 +7,10 @@
 //! those parts, behind the calls the session makes of them. It is an enum
 //! and not a trait object: the shapes are few, they are all known here,
 //! and every step of every session goes through it.
+//!
+//! The kernel asks the same of every shape. What a shape has no part for
+//! it does nothing about: a session of text is asked to make a response
+//! quieter and has nothing to turn down.
 
 use core::task::Context;
 
@@ -21,13 +25,32 @@ use waveport_ports::transport::Transport;
 use super::SessionStats;
 use super::cascade::Cascade;
 use super::speak::Milestone;
+use super::write::Writer;
 
 /// The parts of a session that depend on its shape.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a session has one driver for as long as it lives and is never moved, and a box \
+              would put a pointer between a call and its audio path. A session of text pays \
+              for it with 900 bytes it does not use"
+)]
 pub(crate) enum Driver {
     /// Speech is recognised, a language model writes, a synthesiser
     /// speaks.
     Cascade(Cascade),
+    /// A language model writes, and what it writes is read.
+    Text(Writer),
+}
+
+/// What became of a piece of text the kernel released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Said {
+    /// Whether it is the first of its response.
+    pub first: bool,
+    /// Whether it has gone out: to speech synthesis, or to the reader.
+    /// Text that has not waits until its response may be read.
+    pub out: bool,
 }
 
 impl Driver {
@@ -35,6 +58,7 @@ impl Driver {
     pub(crate) fn count(&self, stats: &mut SessionStats) {
         match self {
             Self::Cascade(parts) => parts.count(stats),
+            Self::Text(writer) => stats.strays = writer.unheard(),
         }
     }
 
@@ -43,6 +67,8 @@ impl Driver {
     pub(crate) fn position(&mut self, now: MonoTime) -> Option<Event> {
         match self {
             Self::Cascade(parts) => parts.position(now),
+            // What was read is told at once: see `settle`.
+            Self::Text(_) => None,
         }
     }
 
@@ -50,6 +76,7 @@ impl Driver {
     pub(crate) fn joined(&mut self, who: ParticipantId, most: usize) {
         match self {
             Self::Cascade(parts) => parts.joined(who, most),
+            Self::Text(_) => {}
         }
     }
 
@@ -57,6 +84,7 @@ impl Driver {
     pub(crate) fn packet(&mut self, now: MonoTime, who: ParticipantId, packet: Packet<'_>) {
         match self {
             Self::Cascade(parts) => parts.packet(now, who, packet),
+            Self::Text(writer) => writer.packet(),
         }
     }
 
@@ -64,6 +92,7 @@ impl Driver {
     pub(crate) fn acked(&mut self, tag: OpTag, played: MediaDur) {
         match self {
             Self::Cascade(parts) => parts.acked(tag, played),
+            Self::Text(_) => {}
         }
     }
 
@@ -78,6 +107,7 @@ impl Driver {
     ) -> bool {
         match self {
             Self::Cascade(parts) => parts.hear(cx, now, events),
+            Self::Text(_) => false,
         }
     }
 
@@ -92,6 +122,7 @@ impl Driver {
     ) -> bool {
         match self {
             Self::Cascade(parts) => parts.speak(cx, now, events, milestone),
+            Self::Text(_) => false,
         }
     }
 
@@ -105,6 +136,7 @@ impl Driver {
     ) -> bool {
         match self {
             Self::Cascade(parts) => parts.send_frames(now, transport, milestone),
+            Self::Text(_) => false,
         }
     }
 
@@ -113,6 +145,19 @@ impl Driver {
     pub(crate) fn deadline(&self) -> Option<MonoTime> {
         match self {
             Self::Cascade(parts) => parts.deadline(),
+            Self::Text(_) => None,
+        }
+    }
+
+    /// What a step set in motion that takes no time, for the kernel to
+    /// be told before anything else that has happened is looked at.
+    /// Returns whether there was anything.
+    pub(crate) fn settle(&mut self, events: &mut Vec<Event>) -> bool {
+        match self {
+            // Recognising, synthesising and playing take time, and say
+            // what came of them when the session next looks.
+            Self::Cascade(_) => false,
+            Self::Text(writer) => writer.settle(events),
         }
     }
 
@@ -121,6 +166,7 @@ impl Driver {
     pub(crate) fn halt(&mut self, fade_ms: u16, now: MonoTime, transport: &mut dyn Transport) {
         match self {
             Self::Cascade(parts) => parts.halt(fade_ms, now, transport),
+            Self::Text(writer) => writer.halt(),
         }
     }
 
@@ -129,6 +175,7 @@ impl Driver {
     pub(crate) fn leave(&mut self) {
         match self {
             Self::Cascade(parts) => parts.leave(),
+            Self::Text(_) => {}
         }
     }
 
@@ -136,14 +183,19 @@ impl Driver {
     pub(crate) fn parted(&mut self, cx: &mut Context<'_>) -> bool {
         match self {
             Self::Cascade(parts) => parts.parted(cx),
+            Self::Text(_) => true,
         }
     }
 
     /// The kernel releases a piece of the text of the response `tag`.
-    /// Returns whether it is the first of that response.
-    pub(crate) fn say(&mut self, tag: OpTag, piece: &str) -> bool {
+    pub(crate) fn say(&mut self, tag: OpTag, piece: &str) -> Said {
         match self {
-            Self::Cascade(parts) => parts.say(tag, piece),
+            // What a session says aloud is told as it goes to synthesis.
+            Self::Cascade(parts) => Said {
+                first: parts.say(tag, piece),
+                out: true,
+            },
+            Self::Text(writer) => writer.say(tag, piece),
         }
     }
 
@@ -151,6 +203,7 @@ impl Driver {
     pub(crate) fn finish(&mut self, tag: OpTag) {
         match self {
             Self::Cascade(parts) => parts.finish(tag),
+            Self::Text(writer) => writer.finish(tag),
         }
     }
 
@@ -159,6 +212,7 @@ impl Driver {
     pub(crate) fn cancel(&mut self, tag: OpTag) {
         match self {
             Self::Cascade(parts) => parts.cancel(tag),
+            Self::Text(writer) => writer.stop(tag),
         }
     }
 
@@ -166,6 +220,7 @@ impl Driver {
     pub(crate) fn finalize(&mut self, who: ParticipantId) {
         match self {
             Self::Cascade(parts) => parts.finalize(who),
+            Self::Text(_) => {}
         }
     }
 
@@ -173,6 +228,7 @@ impl Driver {
     pub(crate) fn close(&mut self, who: ParticipantId) {
         match self {
             Self::Cascade(parts) => parts.close(who),
+            Self::Text(_) => {}
         }
     }
 
@@ -180,13 +236,19 @@ impl Driver {
     pub(crate) fn sense(&mut self, view: View<'_>, command: SenseCmd) {
         match self {
             Self::Cascade(parts) => parts.sense(view, command),
+            Self::Text(_) => {}
         }
     }
 
-    /// The response `tag` may be heard from now on.
-    pub(crate) fn start(&mut self, tag: OpTag, now: MonoTime) {
+    /// The response `tag` may be heard from now on. Returns the text of
+    /// it that was released before and has gone out only now.
+    pub(crate) fn start(&mut self, tag: OpTag, now: MonoTime) -> Option<String> {
         match self {
-            Self::Cascade(parts) => parts.start(tag, now),
+            Self::Cascade(parts) => {
+                parts.start(tag, now);
+                None
+            }
+            Self::Text(writer) => writer.start(tag),
         }
     }
 
@@ -194,6 +256,7 @@ impl Driver {
     pub(crate) fn duck(&mut self, tag: OpTag) {
         match self {
             Self::Cascade(parts) => parts.duck(tag),
+            Self::Text(_) => {}
         }
     }
 
@@ -201,6 +264,7 @@ impl Driver {
     pub(crate) fn unduck(&mut self, tag: OpTag) {
         match self {
             Self::Cascade(parts) => parts.unduck(tag),
+            Self::Text(_) => {}
         }
     }
 
@@ -214,6 +278,7 @@ impl Driver {
     ) {
         match self {
             Self::Cascade(parts) => parts.stop(tag, fade_ms, now, transport),
+            Self::Text(writer) => writer.stop(tag),
         }
     }
 }

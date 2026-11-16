@@ -45,12 +45,13 @@ use waveport_ports::error::{BoxFuture, PortError};
 use waveport_ports::journal::{Journal, SessionId};
 use waveport_ports::stt::{SttFinalize, SttTiming};
 use waveport_ports::tool::{ToolExecutor, ToolReply, ToolRequest};
-use waveport_ports::transport::{AudioCaps, RemoteBuffer, TransportCaps};
+use waveport_ports::transport::{AudioCaps, RemoteBuffer, Transport, TransportCaps};
 use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::codec;
 use waveport_runtime::compute::Compute;
 use waveport_runtime::session::{
-    Brain, Ended, Parts, Request, Session, SessionInput, SessionSpec, StateRule, StoreBroken, Tap,
+    Brain, Ended, Parts, Request, Session, SessionEvent, SessionInput, SessionSpec, StateRule,
+    StoreBroken, Tap,
 };
 use waveport_sim::{Seed, SimRng};
 use waveport_testkit::fakes::{
@@ -75,6 +76,22 @@ pub(crate) struct Utterance {
     pub from_ms: u64,
     pub to_ms: u64,
     pub text: String,
+}
+
+/// How many things a follower of a session is told before it has to be
+/// listened to again. More than a session tells between two things that
+/// are done to it.
+const FOLLOWS: usize = 1 << 16;
+
+/// What kind of session a run is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// The callers speak and are spoken to, over a line.
+    Speech,
+    /// The callers type and are written to. There is no line: what they
+    /// type is asked of the session, and what it writes is told to
+    /// whoever follows it.
+    Text,
 }
 
 /// What the line to the callers is like.
@@ -147,6 +164,7 @@ pub(crate) type Answer = Arc<dyn Fn(&Called) -> ToolReply + Send + Sync>;
 #[derive(Clone)]
 pub(crate) struct Plan {
     pub seed: u64,
+    pub shape: Shape,
     pub spec: SessionSpec,
     /// The names the agent answers to. With none it takes every turn to
     /// be meant for it.
@@ -201,6 +219,7 @@ impl Plan {
         }
         Self {
             seed,
+            shape: Shape::Speech,
             spec,
             names: Vec::new(),
             classifier: None,
@@ -241,8 +260,45 @@ impl Plan {
         to_ms
     }
 
+    /// Caller `who` types `text` at `at_ms`.
+    pub(crate) fn types(&mut self, who: usize, at_ms: u64, text: &str) {
+        let typed = SessionInput::Text {
+            who: ParticipantId(u16::try_from(who + 1).unwrap_or(u16::MAX)),
+            text: text.to_owned(),
+        };
+        self.doings.push((at_ms, Doing::Ask(typed)));
+    }
+
     fn rng(&self, label: &str) -> SimRng {
         SimRng::new(Seed(self.seed)).fork(label)
+    }
+
+    /// What a session of the plan's shape hears, thinks and speaks with,
+    /// and the line it does so over.
+    fn brain(
+        &self,
+        stt: ScriptedStt,
+        line: FakeTransport,
+        llm: &ScriptedLlm,
+        compute: Compute,
+    ) -> (Brain, Option<Box<dyn Transport>>) {
+        match self.shape {
+            Shape::Speech => {
+                let brain = Brain::Cascaded {
+                    stt: Arc::new(stt),
+                    llm: Arc::new(llm.clone()),
+                    tts: Arc::new(ScriptedTts::new(self.tts.clone())),
+                    compute: Arc::new(compute),
+                };
+                (brain, Some(Box::new(line)))
+            }
+            Shape::Text => {
+                let brain = Brain::Text {
+                    llm: Arc::new(llm.clone()),
+                };
+                (brain, None)
+            }
+        }
     }
 
     fn policies(&self) -> BoxedPolicies {
@@ -444,6 +500,8 @@ impl ToolExecutor for Guarded {
 /// One life of a session, as it looked from outside.
 pub(crate) struct Life {
     pub wire: TransportLog,
+    /// What whoever followed a session of text was told, in order.
+    pub told: Vec<SessionEvent>,
     /// How the life ended: by itself, or because the process died, or not
     /// at all.
     pub ended: Option<Ended>,
@@ -732,14 +790,10 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         });
         let compute = Compute::inline(LoudVad::default(), turns, overlap)
             .map_err(|error| Broken(format!("no listening models: {error:?}")))?;
+        let (brain, transport) = plan.brain(fresh.stt, fresh.transport, &llm, compute);
         let parts = Parts {
-            brain: Brain::Cascaded {
-                stt: Arc::new(fresh.stt),
-                llm: Arc::new(llm.clone()),
-                tts: Arc::new(ScriptedTts::new(plan.tts.clone())),
-                compute: Arc::new(compute),
-            },
-            transport: Some(Box::new(fresh.transport)),
+            brain,
+            transport,
             tools: Arc::new(Guarded {
                 tools: tools.clone(),
                 journal: journal.clone(),
@@ -767,6 +821,12 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         session.tap(Box::new(Watch(Arc::clone(&watched))));
         let (ask, inbox) = mpsc::channel(64);
         session.listen_to(inbox);
+        // What a session of text writes is read by whoever follows it.
+        let (to, mut following) = mpsc::channel(FOLLOWS);
+        if plan.shape == Shape::Text {
+            session.follow(session.view().next_seq(), to);
+        }
+        let mut told = Vec::new();
         if explain {
             log.push(format!(
                 "{began_ms:>7} ms  LIFE {life} BEGINS with {} facts",
@@ -779,7 +839,9 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
                 .peek()
                 .map(|(at, _)| began + Duration::from_millis(*at));
             let until = next.map_or(end, |next| next.min(end));
-            match drive(&mut session, &journal, until).await {
+            let drove = drive(&mut session, &journal, until).await;
+            told.extend(core::iter::from_fn(|| following.try_recv().ok()));
+            match drove {
                 Drove::Ended(ended) => break Some(ended),
                 Drove::Died => break None,
                 Drove::Time => {}
@@ -824,6 +886,7 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         }
         lives.push(Life {
             wire,
+            told,
             ended: ended.clone(),
             died,
             over_ms: since(Instant::now()),
@@ -867,14 +930,10 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         let idle = plan.fresh(lives.len(), plan.until_ms, 0);
         let compute = Compute::inline(LoudVad::default(), Box::new(ScriptedTurns::always()), None)
             .map_err(|error| Broken(format!("no listening models: {error:?}")))?;
+        let (brain, transport) = plan.brain(idle.stt, idle.transport, &llm, compute);
         let parts = Parts {
-            brain: Brain::Cascaded {
-                stt: Arc::new(idle.stt),
-                llm: Arc::new(llm.clone()),
-                tts: Arc::new(ScriptedTts::new(plan.tts.clone())),
-                compute: Arc::new(compute),
-            },
-            transport: Some(Box::new(idle.transport)),
+            brain,
+            transport,
             tools: Arc::new(tools.clone()),
             journal: Arc::new(journal.clone()),
             sink: None,
@@ -921,6 +980,107 @@ fn tail(log: &[String]) -> String {
 
 /// What must hold of a run beyond the kernel's own invariants.
 fn checked(plan: &Plan, outcome: &Outcome, early: &[ToolCallId]) -> Result<(), Broken> {
+    match plan.shape {
+        Shape::Speech => heard_as_played(plan, outcome)?,
+        Shape::Text => read_as_written(outcome)?,
+    }
+
+    if let Some(call) = early.first() {
+        return broken(format!(
+            "the tool call {call:?} was made before the record that allows it was stored"
+        ));
+    }
+    let mut once: Vec<ToolCallId> = Vec::new();
+    for called in &outcome.called {
+        let effect = plan.spec.kernel.tools.get(usize::from(called.tool.get()));
+        if effect.is_some_and(|tool| tool.effect == Effect::SideEffecting) {
+            if once.contains(&called.call) {
+                return broken(format!(
+                    "the tool call {:?}, which changes something, was made twice",
+                    called.call
+                ));
+            }
+            once.push(called.call);
+        }
+    }
+    Ok(())
+}
+
+/// What must hold of a session of text: what is on record of a response
+/// is what whoever followed the session was told of it, and nothing of a
+/// response is told once it is over.
+fn read_as_written(outcome: &Outcome) -> Result<(), Broken> {
+    // What each life told of each response. A number can be told of in
+    // two lives: a response of which nothing had been stored when the
+    // process died leaves its number to another.
+    let mut lives: Vec<BTreeMap<GenId, String>> = Vec::new();
+    for (index, life) in outcome.lives.iter().enumerate() {
+        let mut written: BTreeMap<GenId, String> = BTreeMap::new();
+        let mut over: Vec<GenId> = Vec::new();
+        let mut arena = TextArena::default();
+        for event in &life.told {
+            match event {
+                SessionEvent::Said { generation, text } => {
+                    if over.contains(generation) {
+                        return broken(format!(
+                            "life {index}: {text:?} of response {generation:?} was told after \
+                             the response was over"
+                        ));
+                    }
+                    written.entry(*generation).or_default().push_str(text);
+                }
+                SessionEvent::Fact { record, .. } => {
+                    let stamped = codec::decode(record, &mut arena)
+                        .map_err(|error| Broken(format!("a fact that was told: {error}")))?;
+                    let Fact::UtteranceCommitted { generation, .. } = stamped.fact else {
+                        continue;
+                    };
+                    over.push(generation);
+                    let on_record = stamped.fact.text().map_or("", |text| arena.get(text));
+                    let same = match written.get(&generation) {
+                        Some(told) => on_record == told.trim_end(),
+                        // A response that was being read when the
+                        // process died is closed by the next life as far
+                        // as the journal knew it had been read, which is
+                        // no further than it was.
+                        None => on_record.is_empty() || told_before(&lives, generation, on_record),
+                    };
+                    if !same {
+                        return broken(format!(
+                            "life {index}: the conversation has {on_record:?} of response \
+                             {generation:?}, and whoever followed was told {:?}",
+                            written.get(&generation)
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        lives.push(written);
+    }
+    // The same of what the journal holds in the end.
+    for (generation, text, _) in outcome.utterances() {
+        if !text.is_empty() && !told_before(&lives, generation, text) {
+            return broken(format!(
+                "the journal has {text:?} of response {generation:?}, which nobody who followed \
+                 was told"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether one of `lives` told of `generation` what begins with `text`.
+fn told_before(lives: &[BTreeMap<GenId, String>], generation: GenId, text: &str) -> bool {
+    lives
+        .iter()
+        .filter_map(|life| life.get(&generation))
+        .any(|told| told.starts_with(text))
+}
+
+/// What must hold of a session that speaks: nothing is on record as
+/// heard that the far end did not play.
+fn heard_as_played(plan: &Plan, outcome: &Outcome) -> Result<(), Broken> {
     let reports = plan
         .line
         .caps()
@@ -950,25 +1110,6 @@ fn checked(plan: &Plan, outcome: &Outcome, early: &[ToolCallId]) -> Result<(), B
                 "the conversation has {text:?} of response {generation:?}, which takes {said} ms \
                  to say, and the far end played {heard} ms of it"
             ));
-        }
-    }
-
-    if let Some(call) = early.first() {
-        return broken(format!(
-            "the tool call {call:?} was made before the record that allows it was stored"
-        ));
-    }
-    let mut once: Vec<ToolCallId> = Vec::new();
-    for called in &outcome.called {
-        let effect = plan.spec.kernel.tools.get(usize::from(called.tool.get()));
-        if effect.is_some_and(|tool| tool.effect == Effect::SideEffecting) {
-            if once.contains(&called.call) {
-                return broken(format!(
-                    "the tool call {:?}, which changes something, was made twice",
-                    called.call
-                ));
-            }
-            once.push(called.call);
         }
     }
     Ok(())

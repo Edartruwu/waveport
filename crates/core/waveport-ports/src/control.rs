@@ -7,9 +7,19 @@
 //! Whoever follows a session is told two kinds of thing. Facts are what
 //! the session's journal holds, each with its number, in the form the
 //! journal holds them in. The rest is news that is not kept: who is
-//! speaking, what an agent is doing. A follower that comes back after a
-//! break says the number of the first fact it has not seen, and is given
-//! the facts from there, as far back as they are still held.
+//! speaking, what an agent is doing, the words of a response as they go
+//! out, and the words of a speaker as far as they are known. A follower
+//! that comes back after a break says the number of the first fact it
+//! has not seen, and is given the facts from there, as far back as they
+//! are still held. News it missed is not told again: what came of it is
+//! in the facts.
+//!
+//! A fact is told when the session makes it, which is before its journal
+//! has stored it. A process that dies in between leaves a journal that
+//! never had the fact, and the session that goes on from that journal
+//! gives its number to another. Whoever follows a session across the
+//! death of its process has to be told where the journal stood, and
+//! takes what it was told beyond that as not having happened.
 //!
 //! Starting a session is not here. What a session is made of is decided
 //! where the parts are put together, and a port cannot name that yet.
@@ -21,7 +31,7 @@ use core::task::{Context, Poll};
 use bytes::Bytes;
 use waveport_domain::command::ClientEvent;
 use waveport_domain::event::HandoffContext;
-use waveport_domain::ids::{AgentId, ParticipantId, Seq};
+use waveport_domain::ids::{AgentId, GenId, ParticipantId, Seq};
 
 use crate::journal::SessionId;
 
@@ -66,6 +76,28 @@ pub enum SessionEvent {
     },
     /// News that is not kept.
     Told(ClientEvent),
+    /// News that is not kept: text of a response that has gone out. In a
+    /// session of text it has gone to the reader, and what is told is
+    /// what the response is on record with. In a session that speaks it
+    /// has gone to speech synthesis, ahead of what is heard, and what was
+    /// heard of the response is the fact that ends it.
+    Said {
+        /// The response, by the number its facts carry. A response of
+        /// which no fact was stored before the process died leaves its
+        /// number to another.
+        generation: GenId,
+        /// The text, which follows what was told of the response before.
+        text: String,
+    },
+    /// News that is not kept: what a participant has said of what they
+    /// are saying, as far as the recogniser has it. It may still change.
+    /// The words of a turn are the fact that commits it.
+    Hearing {
+        /// Who.
+        who: ParticipantId,
+        /// The words so far.
+        text: String,
+    },
     /// The facts asked for are no longer all held. What follows begins
     /// with the fact of this number, and the ones before it have to be
     /// had from somewhere else.

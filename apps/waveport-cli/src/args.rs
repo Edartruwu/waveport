@@ -103,6 +103,12 @@ write is spoken aloud, so answer in one or two short sentences of plain speech, 
 no symbols and no formatting. Use get_time when you are asked the time or the date. When the \
 caller says goodbye or asks to end the call, say goodbye and call end_call.";
 
+/// What an agent that writes is told when it is told nothing else.
+pub(crate) const WRITTEN: &str = "You are a friendly assistant in a chat. Answer in one or two \
+short sentences of plain text, with no lists and no formatting. Use get_time when you are asked \
+the time or the date. When the user says goodbye or asks to end the chat, say goodbye and call \
+end_call.";
+
 /// Where calls are kept when the command line says nothing else: in the
 /// folder the command is run in.
 pub(crate) const JOURNAL: &str = ".waveport/journal.redb";
@@ -167,6 +173,20 @@ pub(crate) enum Command {
     /// The caller is whoever sits at this machine, at its microphone and
     /// loudspeaker, or follows a script as with `waveport run`.
     Client(Client),
+    /// Chat with an agent in writing, at this terminal.
+    ///
+    /// The agent neither hears nor speaks: it has a language model and
+    /// its tools, and nothing else. Each line that is typed is said to
+    /// it, and what it writes is shown as it is written. A line typed
+    /// while it writes stops it where it is. The chat ends when the
+    /// agent ends it, at the end of what is typed (Ctrl-D) or at Ctrl-C.
+    ///
+    /// What is typed can come from a file or from another command. Each
+    /// line then waits for the answer to the one before it.
+    ///
+    /// A chat is a call in writing: it is kept, gone on with and told as
+    /// a call is.
+    Chat(Chat),
     /// List the sound devices of this machine.
     Devices,
 }
@@ -175,6 +195,8 @@ pub(crate) enum Command {
 pub(crate) struct Dev {
     #[command(flatten)]
     pub agent: Agent,
+    #[command(flatten)]
+    pub aloud: Aloud,
     /// The microphone, as `waveport devices` names it.
     #[arg(long, value_name = "ID")]
     pub microphone: Option<String>,
@@ -200,6 +222,8 @@ pub(crate) struct Dev {
 pub(crate) struct Run {
     #[command(flatten)]
     pub agent: Agent,
+    #[command(flatten)]
+    pub aloud: Aloud,
     /// The script the caller follows.
     #[arg(long, value_name = "FILE")]
     pub script: PathBuf,
@@ -221,6 +245,8 @@ pub(crate) struct Run {
 pub(crate) struct Serve {
     #[command(flatten)]
     pub agent: Agent,
+    #[command(flatten)]
+    pub aloud: Aloud,
     /// The address calls are taken at. Port 0 is any port that is free.
     #[arg(long, value_name = "ADDRESS", default_value = LISTEN)]
     pub listen: SocketAddr,
@@ -260,7 +286,18 @@ pub(crate) struct Client {
     pub record: Option<PathBuf>,
 }
 
-/// The agent, and the providers it is made of.
+#[derive(Debug, Args)]
+pub(crate) struct Chat {
+    #[command(flatten)]
+    pub agent: Agent,
+    /// Go on with a chat that broke off: `last` for the one that was
+    /// last begun here, or a file that holds the token of another.
+    #[arg(long, value_name = "last|FILE", conflicts_with = "no_journal")]
+    pub resume: Option<Resume>,
+}
+
+/// The agent: what it is told, where its calls are kept, and the model
+/// it thinks with. An agent that only writes is made of nothing else.
 #[derive(Debug, Args)]
 pub(crate) struct Agent {
     /// What the agent is told before the call.
@@ -272,18 +309,6 @@ pub(crate) struct Agent {
     /// Something for the agent to say when the call begins.
     #[arg(long, value_name = "TEXT")]
     pub greeting: Option<String>,
-    /// The language of the call, as a tag such as `en` or `es`.
-    #[arg(long, value_name = "TAG", default_value = "en")]
-    pub language: String,
-    /// Where the models that listen are: what `cargo xtask fetch-assets`
-    /// fetched.
-    #[arg(
-        long,
-        value_name = "DIR",
-        env = "WAVEPORT_ASSETS",
-        default_value = "target/assets"
-    )]
-    pub assets: PathBuf,
 
     /// The file calls are kept in. A call that broke off, with the
     /// command or with the machine, can be gone on with from it. The
@@ -315,6 +340,35 @@ pub(crate) struct Agent {
     #[arg(long, value_name = "URL")]
     pub otlp: Option<String>,
 
+    /// Where the language model is: OpenAI, or any server that speaks
+    /// the chat completions protocol.
+    #[arg(long, value_name = "URL", default_value = LLM_URL)]
+    pub llm_url: String,
+    /// The language model.
+    #[arg(long, value_name = "MODEL", default_value = "gpt-6-luna")]
+    pub llm_model: String,
+    /// The environment variable that holds the key for it.
+    #[arg(long, value_name = "VARIABLE", default_value = "OPENAI_API_KEY")]
+    pub llm_key_env: String,
+}
+
+/// What an agent that hears and speaks is made of besides: the models
+/// that listen, and the providers that recognise and synthesise speech.
+#[derive(Debug, Args)]
+pub(crate) struct Aloud {
+    /// The language of the call, as a tag such as `en` or `es`.
+    #[arg(long, value_name = "TAG", default_value = "en")]
+    pub language: String,
+    /// Where the models that listen are: what `cargo xtask fetch-assets`
+    /// fetched.
+    #[arg(
+        long,
+        value_name = "DIR",
+        env = "WAVEPORT_ASSETS",
+        default_value = "target/assets"
+    )]
+    pub assets: PathBuf,
+
     /// Who recognises speech.
     #[arg(long, value_name = "PROVIDER", value_enum, default_value = "openai")]
     pub stt: Hears,
@@ -338,17 +392,6 @@ pub(crate) struct Agent {
                 DEEPGRAM_API_KEY or ASSEMBLYAI_API_KEY, by the provider]"
     )]
     pub stt_key_env: Option<String>,
-
-    /// Where the language model is: OpenAI, or any server that speaks
-    /// the chat completions protocol.
-    #[arg(long, value_name = "URL", default_value = LLM_URL)]
-    pub llm_url: String,
-    /// The language model.
-    #[arg(long, value_name = "MODEL", default_value = "gpt-6-luna")]
-    pub llm_model: String,
-    /// The environment variable that holds the key for it.
-    #[arg(long, value_name = "VARIABLE", default_value = "OPENAI_API_KEY")]
-    pub llm_key_env: String,
 
     /// Who synthesises speech.
     #[arg(long, value_name = "PROVIDER", value_enum, default_value = "cartesia")]
@@ -417,7 +460,7 @@ impl Chosen {
     }
 }
 
-impl Agent {
+impl Aloud {
     /// The provider that recognises speech.
     pub(crate) fn hears(&self) -> Chosen {
         Chosen::new(
@@ -449,7 +492,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::{Cli, Command, Hears, LLM_URL, Resume, Speaks};
+    use super::{Cli, Command, Hears, LLM_URL, Resume, Speaks, WRITTEN};
 
     #[test]
     fn the_command_line_is_one_clap_can_build() {
@@ -463,7 +506,7 @@ mod tests {
             panic!("dev is dev");
         };
         assert_eq!(dev.agent.llm_url, LLM_URL);
-        assert_eq!(dev.agent.language, "en");
+        assert_eq!(dev.aloud.language, "en");
         assert!(!dev.half_duplex && dev.microphone.is_none());
     }
 
@@ -474,7 +517,7 @@ mod tests {
             let Command::Dev(dev) = Cli::try_parse_from(all).unwrap().command else {
                 panic!("dev is dev");
             };
-            dev.agent
+            dev.aloud
         };
         // Told nothing: the providers of the first voice loop.
         let told_nothing = agent(&[]);
@@ -616,6 +659,39 @@ mod tests {
         // Whoever calls an agent over a WebSocket says which call to go
         // on with, not the agent.
         assert!(Cli::try_parse_from(["waveport", "serve", "--resume", "last"]).is_err());
+    }
+
+    #[test]
+    fn a_chat_is_told_nothing_of_hearing_or_speaking() {
+        let cli = Cli::try_parse_from(["waveport", "chat"]).unwrap();
+        let Command::Chat(chat) = cli.command else {
+            panic!("chat is chat");
+        };
+        assert_eq!(chat.agent.llm_url, LLM_URL);
+        assert!(chat.resume.is_none() && chat.agent.instructions.is_none());
+        // What it is told when it is told nothing says nothing of a
+        // voice.
+        assert!(!WRITTEN.contains("spoken") && !WRITTEN.contains("voice"));
+
+        // It is kept and gone on with as a call is, and takes notes.
+        let kept = [
+            "waveport",
+            "chat",
+            "--resume",
+            "last",
+            "--notes",
+            "notes.txt",
+        ];
+        assert!(Cli::try_parse_from(kept).is_ok());
+        let nowhere = ["waveport", "chat", "--no-journal", "--resume", "last"];
+        assert!(Cli::try_parse_from(nowhere).is_err());
+
+        // There is no recogniser, synthesiser, model that listens or
+        // sound device to say anything about.
+        for flag in ["--stt", "--tts", "--assets", "--language", "--microphone"] {
+            let told = Cli::try_parse_from(["waveport", "chat", flag, "x"]);
+            assert!(told.is_err(), "{flag}");
+        }
     }
 
     #[test]

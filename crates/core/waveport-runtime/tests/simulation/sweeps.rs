@@ -27,7 +27,7 @@ use crate::{SEEDS, told};
 
 /// How the world of a made-up session behaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Profile {
+pub(super) enum Profile {
     /// Every part answers, and the line is clean.
     Calm,
     /// Parts fail, hang and answer late, the line loses and delays
@@ -41,7 +41,7 @@ enum Profile {
     Shutdown,
 }
 
-const WORDS: &[&str] = &[
+pub(super) const WORDS: &[&str] = &[
     "yes", "no", "the", "order", "shipped", "on", "monday", "it", "arrives", "please", "thanks",
     "ok", "refund", "where", "is", "my", "parcel",
 ];
@@ -59,7 +59,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn index(rng: &mut SimRng, len: usize) -> usize {
+pub(super) fn index(rng: &mut SimRng, len: usize) -> usize {
     usize::try_from(rng.range(0..len as u64)).unwrap()
 }
 
@@ -74,7 +74,7 @@ fn sentences(rng: &mut SimRng) -> LlmStep {
 
 /// A session with one agent, a tool that looks something up and a tool
 /// that changes something.
-fn spec() -> SessionSpec {
+pub(super) fn spec() -> SessionSpec {
     let tools = [("look_up", Effect::Pure), ("refund", Effect::SideEffecting)];
     SessionSpec {
         kernel: KernelConfig {
@@ -167,7 +167,7 @@ fn callers(plan: &mut Plan, rng: &mut SimRng) -> u64 {
 }
 
 /// What the model writes, and what the tools answer.
-fn minds(plan: &mut Plan, rng: &SimRng, profile: Profile) {
+pub(super) fn minds(plan: &mut Plan, rng: &SimRng, profile: Profile) {
     let dice = Mutex::new(rng.fork("model"));
     plan.llm = Arc::new(move |asked| {
         let mut rng = lock(&dice);
@@ -230,7 +230,7 @@ fn minds(plan: &mut Plan, rng: &SimRng, profile: Profile) {
 }
 
 /// Parts that fail, and a line that loses what it carries.
-fn trouble(plan: &mut Plan, rng: &mut SimRng, last: u64) {
+pub(super) fn trouble(plan: &mut Plan, rng: &mut SimRng, last: u64) {
     if rng.chance(1, 3) {
         let after = usize::try_from(rng.range(2..25)).unwrap();
         plan.stt.fail_after = Some((after, PortError::transient("reset by peer")));
@@ -264,13 +264,13 @@ fn trouble(plan: &mut Plan, rng: &mut SimRng, last: u64) {
 
 /// How a session that is to end does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum End {
+pub(super) enum End {
     Asked,
     HungUp,
     Taken,
 }
 
-fn ending(seed: u64) -> End {
+pub(super) fn ending(seed: u64) -> End {
     let mut rng = SimRng::new(Seed(seed)).fork("ending");
     *rng.choose(&[End::Asked, End::Asked, End::HungUp, End::Taken])
         .unwrap()
@@ -336,7 +336,7 @@ fn made_up(profile: Profile, seed: u64) -> Plan {
     clippy::unnecessary_wraps,
     reason = "it stands where the checks that can fail stand"
 )]
-fn nothing_more(_: &Plan, _: &Outcome) -> Result<(), String> {
+pub(super) fn nothing_more(_: &Plan, _: &Outcome) -> Result<(), String> {
     Ok(())
 }
 

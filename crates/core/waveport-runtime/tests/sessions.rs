@@ -8,6 +8,7 @@
 #![expect(
     clippy::unwrap_used,
     clippy::indexing_slicing,
+    clippy::panic,
     reason = "a test that cannot be set up, or that finds something missing, fails"
 )]
 
@@ -161,7 +162,9 @@ impl World {
 
 /// How a session in which speech is recognised and synthesised is run.
 fn cascade(session: &Session) -> &CascadePlan {
-    let SessionPlan::Cascaded(plan) = session.plan();
+    let SessionPlan::Cascaded(plan) = session.plan() else {
+        panic!("parts that hear and speak are run as a cascade");
+    };
     plan
 }
 
@@ -976,6 +979,59 @@ async fn what_is_asked_as_a_caller_joins_finds_the_caller_there() {
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].last_user(), Some("hello"));
     assert_eq!(running.utterances(), [("Hello.".to_owned(), false)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn what_is_typed_into_a_call_stops_what_is_being_said() {
+    let speech = [(1_000, 2_200, "tell me a story")];
+    let llm = ScriptedLlm::replies(vec![
+        vec![LlmStep::say(STORY)],
+        vec![LlmStep::say("All right.")],
+    ]);
+    let world = World::new(&speech, llm);
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 12_000, &talks(&speech));
+    let mut running = Running::start(&world, transport).await;
+    let (requests, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+
+    // The agent is in the middle of its story when the caller types.
+    assert_eq!(running.until(4_500).await, None);
+    assert_eq!(running.utterances(), []);
+    let typed = SessionInput::Text {
+        who: CALLER,
+        text: "stop please".to_owned(),
+    };
+    requests.send(Request::Input(typed)).await.unwrap();
+    assert_eq!(running.until(12_000).await, None);
+
+    // The story stopped when the text came, and not when it would have
+    // ended: what is typed takes the floor, as speech does.
+    let stopped = running.watch.first("Stop {").unwrap();
+    assert!((4_500..4_600).contains(&stopped), "stopped at {stopped} ms");
+    let utterances = running.utterances();
+    assert_eq!(utterances.len(), 2, "{utterances:?}");
+    let (heard, cut) = &utterances[0];
+    assert!(*cut, "{heard:?}");
+    assert!(
+        STORY.starts_with(heard.as_str()) && heard.len() < STORY.len(),
+        "{heard:?}"
+    );
+    assert_eq!(utterances[1], ("All right.".to_owned(), false));
+    // The answer is to what was typed, with what was heard of the story
+    // before it.
+    let asked = world.llm.asked();
+    assert_eq!(asked.len(), 2);
+    assert_eq!(asked[1].last_user(), Some("stop please"));
+    assert!(
+        asked[1].messages.contains(&Said::Assistant {
+            text: heard.clone()
+        }),
+        "{:?}",
+        asked[1].messages
+    );
 }
 
 fn kinds(records: &[bytes::Bytes]) -> Vec<String> {
@@ -1878,6 +1934,59 @@ async fn a_follower_is_told_what_happens_and_can_come_back_for_what_it_missed() 
     assert_eq!(running.until(8_100).await, None);
     assert_eq!(facts(&told(&mut back)), [2, 3]);
     assert!(!back.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_follower_is_told_the_words_as_they_are_heard_and_as_they_are_said() {
+    let speech = [(1_000, 2_200, "what time is it please")];
+    let answer = "It is a quarter past nine. Is there anything else?";
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say(answer)]]);
+    let world = World::new(&speech, llm);
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 12_000, &talks(&speech));
+    let mut running = Running::start(&world, transport).await;
+    let (to, mut follower) = tokio::sync::mpsc::channel(256);
+    running.session.follow(Seq(1), to);
+    assert_eq!(running.until(12_000).await, None);
+    let heard = told(&mut follower);
+
+    // What the caller was saying, as far as the recogniser had it, came
+    // before the turn that it became.
+    let committed = heard
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Fact { seq, .. } if seq.get() == 2))
+        .unwrap();
+    let so_far: Vec<(usize, &str)> = heard
+        .iter()
+        .enumerate()
+        .filter_map(|(at, event)| match event {
+            SessionEvent::Hearing { who, text } => {
+                assert_eq!(*who, CALLER);
+                Some((at, text.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_ne!(so_far, []);
+    for (at, text) in &so_far {
+        assert!(*at < committed, "{text:?} came after the turn");
+        assert!("what time is it please".starts_with(text), "{text:?}");
+    }
+
+    // What the agent said was told as it went to be synthesised, a
+    // sentence at a time, and is all of what it said.
+    let said: Vec<&str> = heard
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Said { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert_eq!(said.concat(), answer);
+    assert_eq!(running.utterances(), [(answer.to_owned(), false)]);
 }
 
 #[tokio::test(start_paused = true)]

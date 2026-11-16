@@ -44,6 +44,12 @@ pub enum BrainProfile {
         /// The speech synthesiser.
         speak: TtsCaps,
     },
+    /// A language model alone: a session of text, in which nothing is
+    /// heard and nothing is spoken.
+    Text {
+        /// The language model.
+        think: LlmCaps,
+    },
     /// One speech-to-speech model in all three roles.
     Realtime,
 }
@@ -109,6 +115,8 @@ pub enum SessionPlan {
     /// With a speech recogniser, a language model and a speech
     /// synthesiser.
     Cascaded(CascadePlan),
+    /// With a language model alone: what is typed is answered in text.
+    Text(TextPlan),
 }
 
 impl SessionPlan {
@@ -117,8 +125,17 @@ impl SessionPlan {
     pub fn shortfalls(&self) -> &[Shortfall] {
         match self {
             Self::Cascaded(plan) => &plan.shortfalls,
+            Self::Text(plan) => &plan.shortfalls,
         }
     }
+}
+
+/// How a session of text alone is run. Nothing of it depends on what its
+/// parts can do, beyond whether it can be run at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextPlan {
+    /// What the session does less well than it would with other parts.
+    pub shortfalls: Vec<Shortfall>,
 }
 
 /// How a session with a part for each role is run.
@@ -216,6 +233,9 @@ pub enum Shortfall {
     /// Audio that was sent cannot be taken back. After an interruption
     /// the listener still hears what the far end holds.
     CannotClear,
+    /// The session is of text alone and its transport carries audio.
+    /// Nothing that is said aloud is heard.
+    AudioUnheard,
 }
 
 impl fmt::Display for Shortfall {
@@ -241,6 +261,10 @@ impl fmt::Display for Shortfall {
                 "audio that was sent cannot be taken back: after an interruption the \
                  listener still hears what the far end holds"
             }
+            Self::AudioUnheard => {
+                "the session is of text alone and its transport carries audio: nothing \
+                 that is said aloud is heard"
+            }
         })
     }
 }
@@ -257,8 +281,10 @@ pub fn plan(
     brain: &BrainProfile,
     transport: Option<&TransportCaps>,
 ) -> Result<SessionPlan, PlanError> {
-    let BrainProfile::Cascaded { hear, think, speak } = brain else {
-        return Err(PlanError::Realtime);
+    let (hear, think, speak) = match brain {
+        BrainProfile::Cascaded { hear, think, speak } => (hear, think, speak),
+        BrainProfile::Text { think } => return written(*agent, *think, transport),
+        BrainProfile::Realtime => return Err(PlanError::Realtime),
     };
     if agent.tools > 0 && !think.tools {
         return Err(PlanError::NoTools);
@@ -328,11 +354,27 @@ pub fn plan(
     }))
 }
 
+/// How a session of text alone is run.
+fn written(
+    agent: AgentNeeds,
+    think: LlmCaps,
+    transport: Option<&TransportCaps>,
+) -> Result<SessionPlan, PlanError> {
+    if agent.tools > 0 && !think.tools {
+        return Err(PlanError::NoTools);
+    }
+    let mut shortfalls = Vec::new();
+    if transport.is_some_and(|transport| transport.audio.is_some()) {
+        shortfalls.push(Shortfall::AudioUnheard);
+    }
+    Ok(SessionPlan::Text(TextPlan { shortfalls }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AgentNeeds, BrainProfile, CascadePlan, LISTEN_RATE, Marks, PlanError, Role, SessionPlan,
-        Shortfall, plan,
+        Shortfall, TextPlan, plan,
     };
     use crate::audio::{Codec, Law, Rate, RateSet};
     use crate::llm::LlmCaps;
@@ -389,7 +431,9 @@ mod tests {
     }
 
     fn cascade(agent: AgentNeeds, brain: &BrainProfile, transport: TransportCaps) -> CascadePlan {
-        let SessionPlan::Cascaded(plan) = plan(&agent, brain, Some(&transport)).unwrap();
+        let SessionPlan::Cascaded(plan) = plan(&agent, brain, Some(&transport)).unwrap() else {
+            panic!("parts that hear and speak are run as a cascade");
+        };
         plan
     }
 
@@ -535,6 +579,39 @@ mod tests {
         );
         assert_eq!(plan.shortfalls, [Shortfall::PlaybackEstimated]);
         assert!(plan.playback.clear_on_stop);
+    }
+
+    #[test]
+    fn a_session_of_text_needs_a_language_model_and_nothing_else() {
+        let agent = AgentNeeds::default();
+        let text = BrainProfile::Text { think: THINK };
+        // No transport, or one for text alone, leaves nothing to wish for.
+        let nothing_amiss = Ok(SessionPlan::Text(TextPlan::default()));
+        assert_eq!(plan(&agent, &text, None), nothing_amiss);
+        let written = TransportCaps {
+            audio: None,
+            text: true,
+        };
+        assert_eq!(plan(&agent, &text, Some(&written)), nothing_amiss);
+
+        // On a transport that carries audio nobody is heard, and the plan
+        // says so.
+        let on_a_line = plan(&agent, &text, Some(&LINE)).unwrap();
+        assert_eq!(on_a_line.shortfalls(), [Shortfall::AudioUnheard]);
+        assert!(Shortfall::AudioUnheard.to_string().len() > 40);
+
+        // Tools need a model that can call them, as in every shape.
+        let no_tools = BrainProfile::Text {
+            think: LlmCaps {
+                tools: false,
+                parallel_tools: false,
+            },
+        };
+        assert_eq!(
+            plan(&AgentNeeds { tools: 1 }, &no_tools, None),
+            Err(PlanError::NoTools)
+        );
+        assert!(plan(&agent, &no_tools, None).is_ok());
     }
 
     #[test]

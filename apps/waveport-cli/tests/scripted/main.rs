@@ -20,7 +20,8 @@
 //!
 //! `resumed` kills the command in the middle of such a call, and goes on
 //! with the call in another process. `watched` has such a call traced,
-//! counted and summed up.
+//! counted and summed up. `written` chats with the agent in writing,
+//! which needs the language model alone.
 
 #![expect(
     clippy::unwrap_used,
@@ -32,6 +33,7 @@
 
 mod resumed;
 mod watched;
+mod written;
 
 use core::fmt::Write as _;
 use core::time::Duration;

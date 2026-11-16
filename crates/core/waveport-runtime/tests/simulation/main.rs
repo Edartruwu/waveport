@@ -9,7 +9,10 @@
 //! and when, and at which record of its journal the process dies.
 //!
 //! `stories` tells the six stories of the kernel's scenarios again, each
-//! under many seeds. `sweeps` makes up sessions nobody wrote.
+//! under many seeds. `sweeps` makes up sessions nobody wrote. `written`
+//! does both for sessions of text, which have no audio path and no line:
+//! what is typed is asked of them, and what they write is told to
+//! whoever follows them.
 //!
 //! A failure prints its seed and the last steps of the session.
 //! `WAVEPORT_SIM_SEED=<seed>` runs that session alone and prints all of
@@ -27,6 +30,7 @@
 mod stories;
 mod sweeps;
 mod world;
+mod written;
 
 use waveport_sim::{Seed, SeedPlan};
 

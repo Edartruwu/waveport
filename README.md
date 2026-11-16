@@ -86,6 +86,7 @@ The command prints what it heard, what the agent said and how long the first sou
 | `waveport run --script <file>` | The same agent with a caller who follows a script of recordings and silences. `--record <file>` keeps what the caller was played |
 | `waveport serve` | The same agent for callers who are somewhere else: it takes calls over a WebSocket, at `127.0.0.1:9283` unless `--listen` says otherwise, as many at a time as come. Nothing asks a caller who they are, so it takes calls from other machines only with `--exposed` |
 | `waveport client` | Calls an agent that `waveport serve` runs, from this machine's microphone and loudspeaker or from a script |
+| `waveport chat` | The same agent in writing, at the terminal: it needs the language model alone. What it writes is shown as it is written, and a line typed while it writes stops it there. Lines from a file or another command are said one at a time, each when the one before is answered |
 | `waveport devices` | Lists the sound devices, for `--microphone` and `--loudspeaker` |
 
 `--stt openai|deepgram|assemblyai` and `--tts cartesia|elevenlabs` say who hears and who speaks. Each provider brings its own model, voice and the name of the variable that holds its key (`DEEPGRAM_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`):

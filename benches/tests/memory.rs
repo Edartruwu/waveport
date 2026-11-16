@@ -3,12 +3,14 @@
 //! The real session actor runs whole calls with a stand-in in every
 //! port, on a clock the test controls, under an allocator that counts.
 //! What a session holds when it listens and when it speaks is held to
-//! the numbers in `perf/targets.toml`. What is counted is the Rust heap
-//! of the thread the sessions run on: what libopus keeps for itself is
-//! not in it.
+//! the numbers in `perf/targets.toml`, and so is what a session of text
+//! holds between two messages. What is counted is the Rust heap of the
+//! thread the sessions run on: what libopus keeps for itself is not in
+//! it.
 //!
-//! `soak_a_thousand_sessions` is the long run of many calls. It is left
-//! out of an ordinary test run and made every night:
+//! `soak_a_thousand_sessions` and `soak_a_thousand_chats` are the long
+//! runs of many calls and of many chats. They are left out of an
+//! ordinary test run and made every night:
 //!
 //! ```text
 //! cargo test --release -p waveport-benches --test memory -- --ignored
@@ -22,16 +24,18 @@
 use core::time::Duration;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use waveport_adapter_kit::turns::What;
 use waveport_alloc_counter::{AllocStats, CountingAllocator, snapshot};
-use waveport_benches::calls::{Delays, Script, Shared, Watch};
+use waveport_benches::calls::{CALLER, Delays, QUESTION, Script, Shared, Watch};
 use waveport_benches::targets::Targets;
 use waveport_domain::ids::{GenId, TurnId};
 use waveport_domain::policy::DefaultPolicies;
 use waveport_ports::audio::{Codec, Rate};
+use waveport_ports::control::SessionInput;
 use waveport_ports::journal::SessionId;
-use waveport_runtime::session::{Ended, Session};
+use waveport_runtime::session::{Ended, Request, Session};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator::system();
@@ -51,6 +55,37 @@ fn begin(local: &LocalSet, shared: &Shared, first: u128, sessions: u32, apart: D
                 .unwrap();
             assert_eq!(session.run().await, Ended::Closed);
         });
+    }
+}
+
+/// Begins `sessions` chats on `local`, numbered from `first`. Returns
+/// what each of them is asked through.
+fn begin_chats(
+    local: &LocalSet,
+    shared: &Shared,
+    first: u128,
+    sessions: u32,
+) -> Vec<mpsc::Sender<Request>> {
+    let mut asked = Vec::with_capacity(sessions as usize);
+    for n in 0..sessions {
+        let (spec, parts) = shared.chat(SessionId(first + u128::from(n)));
+        let (ask, inbox) = mpsc::channel(4);
+        asked.push(ask);
+        local.spawn_local(async move {
+            let mut session = Session::open(spec, parts, DefaultPolicies::default())
+                .await
+                .unwrap();
+            session.listen_to(inbox);
+            assert_eq!(session.run().await, Ended::Closed);
+        });
+    }
+    asked
+}
+
+/// Asks every chat of `asked` for `input`.
+fn ask_all(asked: &[mpsc::Sender<Request>], input: &SessionInput) {
+    for ask in asked {
+        ask.try_send(Request::Input(input.clone())).unwrap();
     }
 }
 
@@ -141,6 +176,77 @@ async fn a_session_holds_no_more_than_it_is_held_to() {
     }
 }
 
+/// Has every chat of `asked` asked the question `times` times, five
+/// seconds apart, which is long enough for each to be answered.
+async fn chat_on(local: &LocalSet, asked: &[mpsc::Sender<Request>], times: u32) {
+    let typed = SessionInput::Text {
+        who: CALLER,
+        text: QUESTION.to_owned(),
+    };
+    for _ in 0..times {
+        ask_all(asked, &typed);
+        local
+            .run_until(tokio::time::sleep(Duration::from_secs(5)))
+            .await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_of_text_holds_no_more_than_it_is_held_to() {
+    let targets = Targets::load();
+    // The model answers at length, as it does a caller who speaks over
+    // it. Nobody does here.
+    let script = Script::asking(1, Codec::Opus, Delays::USUAL).interrupting(Duration::ZERO);
+    let watch = Watch::counting();
+    let shared = Shared::new(script, &watch);
+    let local = LocalSet::new();
+    let sessions = 20;
+    let before = snapshot();
+    let asked = begin_chats(&local, &shared, 1, sessions);
+
+    // Five seconds in, nothing has been typed.
+    local
+        .run_until(tokio::time::sleep(Duration::from_secs(5)))
+        .await;
+    let fresh = each_holds(before, sessions);
+    // A chat of ten messages and their answers, between two messages:
+    // the usual one.
+    chat_on(&local, &asked, 10).await;
+    let usual = each_holds(before, sessions);
+    // And one of a hundred, by when a session holds as many of its
+    // records for whoever follows it as it ever does.
+    chat_on(&local, &asked, 90).await;
+    let long = each_holds(before, sessions);
+    // Every message was answered.
+    let answers = u64::from(sessions) * 100;
+    assert_eq!(watch.counted(&What::Thinking(GenId(0))), answers);
+    assert_eq!(watch.closed(), 0);
+
+    for (kind, measured) in [("usual", usual), ("long", long)] {
+        let held = targets.number(&format!("memory.text.held_{kind}_kb"));
+        assert!(
+            measured <= held,
+            "a {kind} chat: a session holds {measured:.1} KB, and perf/targets.toml holds it \
+             to {held} KB"
+        );
+        // A number far under what is held means that the measure is
+        // broken, or that the file should be told the good news.
+        assert!(
+            measured >= held * 0.9,
+            "a {kind} chat: a session holds {measured:.1} KB, far under the {held} KB that \
+             perf/targets.toml holds it to: say so there"
+        );
+    }
+    assert!(
+        fresh <= usual && usual <= long,
+        "{fresh} KB with nothing typed, {usual} KB after ten messages, {long} KB after a hundred"
+    );
+
+    ask_all(&asked, &SessionInput::Close);
+    local.await;
+    assert_eq!(watch.closed(), u64::from(sessions));
+}
+
 #[tokio::test(start_paused = true)]
 async fn nothing_is_left_of_sessions_that_are_over() {
     let script = Script::asking(2, Codec::Opus, Delays::USUAL);
@@ -227,6 +333,51 @@ async fn soak(sessions: u32, questions: u32) {
 #[tokio::test(start_paused = true)]
 async fn soak_in_brief() {
     soak(60, 3).await;
+}
+
+/// Runs `sessions` chats of `messages` messages each and checks all of
+/// them: what each holds half way, that every message was answered, and
+/// that nothing is left of any.
+async fn soak_chats(sessions: u32, messages: u32) {
+    let targets = Targets::load();
+    let script = Script::asking(1, Codec::Opus, Delays::USUAL);
+    warm_up().await;
+    let before = snapshot();
+    {
+        let watch = Watch::counting();
+        let shared = Shared::new(script, &watch);
+        let local = LocalSet::new();
+        let asked = begin_chats(&local, &shared, 1, sessions);
+        chat_on(&local, &asked, messages / 2).await;
+        // Half way through, no chat holds more than a long one may.
+        let held = targets.number("memory.text.held_long_kb");
+        let each = each_holds(before, sessions);
+        assert!(
+            each <= held,
+            "a session of text holds {each:.1} KB, held to {held} KB"
+        );
+        chat_on(&local, &asked, messages - messages / 2).await;
+        let answers = u64::from(sessions) * u64::from(messages);
+        assert_eq!(watch.counted(&What::Thinking(GenId(0))), answers);
+        assert_eq!(watch.closed(), 0);
+
+        ask_all(&asked, &SessionInput::Close);
+        local.await;
+        assert_eq!(watch.closed(), u64::from(sessions));
+        assert_eq!(watch.followed(), 0);
+    }
+    assert_eq!(snapshot().since(before).live_bytes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn soak_chats_in_brief() {
+    soak_chats(60, 6).await;
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "the long run: a thousand chats of sixty messages each, made every night"]
+async fn soak_a_thousand_chats() {
+    soak_chats(1_000, 60).await;
 }
 
 #[tokio::test(start_paused = true)]
