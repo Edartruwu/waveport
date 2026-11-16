@@ -760,6 +760,75 @@ async fn a_synthesiser_given_text_by_the_piece_that_gives_no_times_says_all_of_i
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_synthesiser_that_marks_only_its_words_says_all_of_it() {
+    let story = "Of course. Once upon a time there was a ship. It sailed all the seas of \
+                 the world.";
+    let speech = [(1_000, 2_200, "tell me a story")];
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say(story)]]);
+    let mut world = World::new(&speech, llm);
+    // As providers do it: a word is marked where the word ends. The space
+    // after the last word of a sentence is never marked, and the sentence
+    // after it must not wait for that.
+    world.tts = ScriptedTts::new(TtsScript {
+        bare_words: true,
+        ..TtsScript::default()
+    });
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 12_000, &talks(&speech));
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.session.plan().speak.marks, Marks::Timed);
+    assert_eq!(running.until(12_000).await, None);
+
+    assert_eq!(running.utterances(), [(story.to_owned(), false)]);
+    // It was given a sentence at a time, each when the one before it had
+    // its audio, and none of them late: the story was heard without a
+    // break, in the time its characters take.
+    let given = world.tts.log().spoken;
+    assert_eq!(given.len(), 1);
+    assert!(given[0].len() >= 3, "{given:?}");
+    let log = running.far_end.log();
+    let length = u32::try_from(story.len()).unwrap() * 60;
+    assert_eq!(log.heard(log.frames[0].tag), MediaDur::from_millis(length));
+    let gaps = log
+        .frames
+        .windows(2)
+        .filter(|pair| ms(&pair[1]) - ms(&pair[0]) > 25)
+        .count();
+    assert_eq!(gaps, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_word_that_is_never_marked_does_not_hold_the_rest_back() {
+    let story = "It is 3 o'clock. That is all I know. Goodbye.";
+    let speech = [(1_000, 2_200, "what time is it")];
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say(story)]]);
+    let mut world = World::new(&speech, llm);
+    // The synthesiser says "o'clock" its own way, and marks no such word:
+    // the last word of the first sentence is never said to have been
+    // reached.
+    world.tts = ScriptedTts::new(TtsScript {
+        bare_words: true,
+        unmarked: Some("clock".to_owned()),
+        ..TtsScript::default()
+    });
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 12_000, &talks(&speech));
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(12_000).await, None);
+
+    // The rest is said all the same, once the synthesiser has had nothing
+    // more to give for a moment.
+    assert_eq!(running.utterances(), [(story.to_owned(), false)]);
+    let log = running.far_end.log();
+    let length = u32::try_from(story.len()).unwrap() * 60;
+    assert_eq!(log.heard(log.frames[0].tag), MediaDur::from_millis(length));
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_application_makes_the_agent_speak_stop_and_leave() {
     let world = World::new(&[], ScriptedLlm::replies(vec![]));
     let transport = FakeTransport::sound_card()

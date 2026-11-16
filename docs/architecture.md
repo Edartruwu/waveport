@@ -177,6 +177,7 @@ No priority lanes are needed. Pipecat has them because slow work sits in line; h
 ### 4.6 Spoken-text reconciliation
 
 - Text-to-speech and speech-to-speech adapters attach alignment marks `(text_offset, sample_offset)` to the audio they return. The marks stay with the audio, in the media plane's playout ledger; the kernel stores none. A provider without word timing yields one mark per segment, and the ledger interpolates inside the segment by share of characters. That mark arrives when the segment's audio ends; a response interrupted before then is cut where the segment begins.
+- A provider with word timing marks where each word ends, and nothing else: the space and the full stop that follow a word have no mark of their own. Text is therefore taken to be synthesised to the end of what the synthesiser was given as soon as its last word is marked. A word that is never marked, because the provider reads it otherwise than it was written, holds what follows back only until the provider has given nothing for 400 ms.
 - `Playout` reports how far playback has got: audio handed to the transport, audio acknowledged, and how much of the text has been heard in full, which is the last mark at or before `played_upto − estimated_client_buffer`. It uses transport playout acknowledgements where they exist.
 - The runtime delivers the latest report to the kernel ahead of any other event, so an interruption is decided on what had been heard by then. A final position sent after the stop would carry the tag of a response that is no longer live, and be dropped.
 - On completion or interruption the kernel commits exactly one assistant item: the planned text cut at the heard offset, flagged `truncated` when cut. A response of which nothing was heard commits nothing.
@@ -243,7 +244,7 @@ The principle is: **audio drops, text blocks, control coalesces.**
 | Kernel → adapter commands | No queue. Calls that never wait | Text an adapter has no room for is kept and given when it has. A request for a transcript that is refused is counted |
 | Application → session | 256 requests | The request is refused, and the application is told that the session is behind |
 | Session → a follower | 256 things told | The follower is let go, and follows again from the last fact it saw |
-| LLM → text-to-speech | Credit: release text while synthesized-minus-played is 3 s or less | Hold text; stop reading the LLM stream above 8 KB pending. A model that writes on to twice that is cancelled, and what it wrote is spoken |
+| LLM → text-to-speech | Credit: the next piece of text is released once the one before has come back as audio, and while synthesized-minus-played is 3 s or less | Hold text; stop reading the LLM stream above 8 KB pending. A model that writes on to twice that is cancelled, and what it wrote is spoken |
 | Text-to-speech → playout buffer | 3 s of audio | The driver stops reading the provider socket |
 | Playout → transport | 20 ms frames; 20 ms send-ahead by default, 40 ms at most | Never queue beyond the lead |
 
@@ -443,6 +444,33 @@ pub trait Dispatch {
 - A request is taken or refused at once. A session that has 256 requests waiting refuses the next.
 - Starting a session is a method of the runtime and not of the port. What a session is made of (its transport, its providers, its tools) is decided where the parts are put together, and a port cannot name that yet. It joins the port with the daemon, which starts sessions from a description. `migrate` comes with the fleet.
 
+### 8.5 The adapters of the first voice loop
+
+| Crate | Port | What it is |
+|---|---|---|
+| `waveport-models-onnx` | `VadModel`, `TurnModel` | Silero VAD v6.2.3 and Smart Turn v3.2, run by ONNX Runtime. The library and the models are files, loaded when the program starts from the directory that `cargo xtask fetch-assets` fills; nothing is downloaded by a build |
+| `waveport-stt-openai` | `Stt` | OpenAI's realtime transcription over one WebSocket, at 24 kHz. The provider is told not to judge where a turn ends, and writes a final transcript when it is asked for one. A session lasts an hour, and its end is a failure worth another try |
+| `waveport-llm-openai-compat` | `Llm` | Chat completions read as server-sent events, in two dialects: OpenAI's own, and one for every other server that speaks the protocol, a model on this machine among them |
+| `waveport-tts-cartesia` | `Tts` | One WebSocket, one context per response, audio at 24 kHz with the time each word ends at. A connection is kept from one response to the next. Written from the provider's documentation and not yet held against the provider |
+| `waveport-transport-local-audio` | `Transport` | The microphone and the loudspeaker of this machine, through `cpal`, or a caller who follows a script |
+| `waveport-store-memory` | `Journal` | Keeps the rules of the port and nothing past the end of its process |
+
+The crate documentation of each provider adapter lists what was learnt from the provider, and its tests replay sessions recorded from it.
+
+**The local-audio transport** carries plain samples at 48 kHz both ways, in frames of 20 ms. A sound card asks for audio on a thread of its own that must never wait, so the two sides share nothing that locks: one ring of samples each way, and a few numbers that are read and written whole.
+
+- Each response is a run with a number. Every sample in the ring carries the number of its run, so the device side counts what it plays of each, and the session is told how much of a response was played: the far end says what it played (section 4.6), to the sample.
+- "Played" is counted where a sample is handed to the sound system. The listener hears it a few milliseconds to a few tens of milliseconds later, by a delay the sound system does not tell.
+- At an interruption the session names the run to discard. The device side fades it out over 5 ms and throws the rest away, and audio of that run that is still on its way is dropped when it arrives.
+- A run starts playing only when 25 ms more than the device asked for is in hand, or the run has ended. A device that asks for more than there is plays silence for what is missing; nothing is played twice. A moment in which the sound system itself did not keep time is counted as a stumble, and the count is shown when the call ends.
+- Only devices that work at 48 kHz are taken. Several channels of a microphone are averaged into one, and the agent's voice goes to every channel of a loudspeaker.
+- Nothing takes the agent's voice out of what the microphone hears. With headphones this does not matter. Without them `half_duplex` silences the microphone while the agent speaks and for 300 ms after, which also means the agent cannot be interrupted.
+- In place of the sound card there can be a person who follows a script (`Step`: say this recording, stay silent this long, listen until the agent has finished), moved on by the session's own clock in ticks of 10 ms. What that person is played is kept as a recording. A scripted session takes the same path as a spoken one from the ring onwards, and is the same every time it is run.
+
+**Tools** are registered with the runtime's `Registry`, which is the `ToolExecutor` of a session: each tool is a name, a description and a JSON schema for the model, an effect class and a gate for the kernel (section 4.8), and a function. Arguments are checked by reading them into the function's own type, and a tool that is given what it cannot read answers the model with the reason.
+
+**The `waveport` command** (`apps/waveport-cli`) is where the parts are put together: `waveport dev` runs an agent on the sound devices, `waveport run --script` runs it against a scripted caller, and `waveport devices` lists the devices. A key is never an argument: the command is given the name of the environment variable that holds it. The command has two tools: `get_time`, which changes nothing, and `end_call`, which has an effect and is gated on the agent's own words having been heard, so that the agent says goodbye before the line closes.
+
 ## 9. Durability
 
 Waveport stores a snapshot plus a journal of **domain events**, not inputs. Recovery is `snapshot ⊕ apply(tail)`. Replaying inputs through `decide` is rejected for recovery, because during a rolling deploy the target node runs newer logic. Inputs are still sampled into a flight recorder for replay tests.
@@ -566,6 +594,7 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 | Concurrency checking | What a session and the compute plane hand each other: the frames of a stream, the answers, the wake-up of the session and of the thread that judges frames. `loom` tries every way the threads of small cases can take turns, in every test run, and fails on a frame that arrives in pieces or a wake-up that is missed. The rings themselves are `rtrb`'s and are stood in for there: what is tried is how they are used |
 | Port conformance kit | Functions in `waveport-testkit` that hold any implementation of a port to the port's rules: a model's response ends once and says how, a recogniser's final transcripts are in order and inside the audio it was sent, a synthesiser's audio and marks add up, a journal fences and keeps its numbering, and a stream that is dropped stops. They run in every test run on the fakes, in every combination of what a fake can say it does, and on implementations made to break one rule at a time, to show that each rule is checked. Adapters run them against recorded servers, and nightly against the live provider |
 | Whole sessions on fakes | A fake of every port, on virtual time: a transport whose far end speaks, plays what it is sent and says what it played; a recogniser, a model, a synthesiser and tools that follow a script; a journal in memory. The kernel, the audio path and the session actor are the real ones. Conversations written by hand are run through the ports and nothing else, one for each thing a session has to do or to live through: a question and its answer heard to the end, an interruption answered on the words that were heard, a tool call and its result, parts that can do less, what an application asks, a line that closes, a recogniser that fails, a journal that fails or is taken over, a process that dies, and a follower that comes back. Sessions on real threads are started, driven, followed and ended, one that panics among them |
+| A scripted call | The `waveport` command itself is started, with a caller who follows a script in place of the sound devices and scripted servers in place of the three providers. The models that listen, the adapters, the runtime and the audio path are the real ones. The caller asks a question in recorded synthetic speech; the agent has to call a tool, answer aloud, say goodbye and end the call, and the recording of what the caller was played has to hold the answer and nothing after it. Runs in every test run, on all four platforms |
 | CI gates | Instruction-count benchmarks for `step` and the per-frame media path; a counting allocator that fails on any allocation in the media path; a 1,000-session soak with flat memory; the density and interruption targets; a `kill -9` test that must resume |
 
 ## 15. Workspace and Cargo spec
@@ -599,7 +628,7 @@ waveport/
 └─ docs/ · examples/
 ```
 
-`xtask/`, `benches/`, `crates/core/` (without the adapter kit), `crates/testing/` (without `-evals`), `assets/`, `perf/`, `spikes/` and `docs/` exist today. The rest is added in the phase that needs it.
+`xtask/`, `benches/`, `crates/core/`, `crates/testing/` (without `-evals`), `assets/`, `perf/`, `spikes/` and `docs/` exist today. So do the first adapters (`transport/local-audio`, `stt/openai`, `llm/openai-compat`, `tts/cartesia`, `models/onnx`, which holds both listening models, and `store/memory`) and `apps/waveport-cli`. The rest is added in the phase that needs it.
 
 The root [`Cargo.toml`](../Cargo.toml) is the source of truth for workspace members, lint levels, profiles and dependency versions. What it does not say by itself:
 
@@ -627,6 +656,8 @@ Versions and licences were checked against crates.io on 14 November 2026.
 | Codecs and DSP | `opus` 0.4.0 (libopus), `ezk-g722` 0.1.2, `nnnoiseless` 0.5.2, `rtrb` 0.4.1, `bytes` 1.12.1 | libopus is built from its source by `cmake` and a C compiler, and linked in. G.711 and the change of rate are written in-repo. Audio is at 8, 16, 24 or 48 kHz, so every change is by a small whole ratio, and a fixed filter with whole-number coefficients does it: the same samples on every platform, which `rubato` 5.1.0, in floating point, does not promise. Opus decodes and encodes at the rate wanted, so the main path changes no rate at all. DeepFilterNet is a later candidate (git dependency only) |
 | Local inference | `ort` 2.0.0-rc.15 (ONNX Runtime 1.31) | Chosen over `tract` 0.23.10 by the phase 1 spike ([decision 0001](decisions/0001-density-spike.md)): `tract` cannot load the standard Silero export, and on Smart Turn it is 2.6 times slower and its outputs differ. `ort` inference needs exclusive access to a session, so each compute thread owns one |
 | Bundled models | Silero VAD v6.2.3 (MIT, 2.3 MB); Smart Turn v3.2 (BSD-2, 8.7 MB) | Pinned by address and SHA-256 in `assets/assets.lock.toml` and fetched by `cargo xtask fetch-assets`; never committed. LiveKit's turn detector cannot be used: its licence restricts it to LiveKit Agents |
+| Sound devices | `cpal` 0.18.2 | ALSA on Linux (the headers are needed to build: `libasound2-dev`), CoreAudio on macOS, WASAPI on Windows. Its streams can be held by any thread |
+| Command line | `clap` 4.6.7, `jiff` 0.2.41 | `jiff` gives the `get_time` tool the local time and its zone |
 | Local speech (optional) | `sherpa-onnx` 2.0.1 | Local LLMs run out of process behind the OpenAI-compatible adapter |
 | QUIC and MoQ | `quinn` 0.11.12, `web-transport-quinn` 0.13.6, `moq-net` 0.3.23 | Experimental transport; the drafts are still moving |
 | WebSocket, HTTP, gRPC | `tokio-tungstenite` 0.30.0, `axum` 0.8.9, `hyper` 1.12.0, `reqwest` 0.13.5, `tonic` 0.14.9, `prost` 0.14.6 | A breaking `tonic` release is pending. The WebSocket client does not go through a proxy; the HTTP client uses the proxy the environment names |
@@ -698,7 +729,6 @@ These are not decided and each has an owner phase.
 | Question | Decided in |
 |---|---|
 | Whether per-shard `LocalRuntime` holds its pacing target, or the media loop needs its own thread | Phase 1 |
-| Which speech-to-text and text-to-speech providers ship first | Phase 1 |
 | How a carrier media-stream session moves when its node drains or dies: a thin media edge that holds the socket, or a carrier-side reconnect | Phase 3 |
 | Shared journal store at scale: Postgres alone, or Postgres plus object storage for snapshots | Phase 3 |
 | How much of RTVI the client gateway implements | Phase 2 |

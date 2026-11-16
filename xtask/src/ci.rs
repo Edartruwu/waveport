@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::args::Args;
 use crate::error::{Context, Error, Result};
 use crate::meta::{self, LoadOptions, Workspace};
-use crate::{arch, bench, git, lint_sync, semver, tier};
+use crate::{arch, assets, bench, git, lint_sync, semver, tier};
 
 /// The dated nightly that runs Miri. Change it here and in the workflow together.
 macro_rules! miri_toolchain {
@@ -133,7 +133,10 @@ const GATES: &[Gate] = &[
         name: "test",
         fast: true,
         tool: Some(Tool::Nextest),
-        run: |env| shell(env, TEST),
+        // Some tests run the models that listen, which are files the
+        // repository does not carry. They are fetched first, which takes
+        // no time once they are there.
+        run: |env| Ok(assets::run(&[])? && shell(env, TEST)?),
     },
     Gate {
         name: "doctest",
@@ -407,6 +410,7 @@ mod tests {
                 "cargo xtask lint-sync",
                 "cargo xtask semver --self-test",
                 "cargo xtask bench-ir --base",
+                "cargo xtask fetch-assets",
                 // Settings the local runner applies to its child processes.
                 "CARGO_BUILD_WARNINGS: deny",
                 "RUSTDOCFLAGS: -D warnings",

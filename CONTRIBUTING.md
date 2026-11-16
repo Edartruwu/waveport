@@ -8,6 +8,8 @@ Install [rustup](https://rustup.rs/). The toolchain (Rust 1.100.0 with rustfmt a
 
 Building also needs [CMake](https://cmake.org/) and a C compiler: `waveport-media` uses libopus, which is built from its source and linked in. Nothing has to be installed for it beyond those two.
 
+On Linux it needs the headers of ALSA as well, for the transport that runs on the sound devices of the machine (`sudo apt-get install libasound2-dev` on Debian and Ubuntu). macOS and Windows have what it needs. No sound device is needed to build or to run the tests.
+
 The slower gates use extra tools. `cargo xtask ci` skips a gate whose tool is missing and prints the command that installs it:
 
 ```sh
@@ -23,7 +25,7 @@ The instruction-count benchmarks also need Valgrind and `cargo install --locked 
 
 ### Model files
 
-Model weights are not committed. `assets/assets.lock.toml` pins each file to an address that never changes what it serves, a SHA-256 and a licence:
+Model weights are not committed, and neither is ONNX Runtime, the library that runs them. `assets/assets.lock.toml` pins each file to an address that never changes what it serves, a SHA-256 and a licence. The library is pinned once for each platform, as the file inside the archive its project releases:
 
 ```sh
 cargo xtask fetch-assets           # download into target/assets/ and verify
@@ -31,6 +33,8 @@ cargo xtask fetch-assets --check   # verify only; fails if a file is missing
 ```
 
 A file whose digest does not match is deleted, never left in place. Adding a model is a reviewed change to the lock file.
+
+The tests of `waveport-models-onnx` and of `waveport-cli` run the real models, so they need the files: fetch them once before `cargo xtask ci`. They are looked for in `target/assets/`, or in the directory `WAVEPORT_ASSETS` names.
 
 ## Running the gates
 
@@ -207,6 +211,20 @@ cargo xtask ci --only loom
 ```
 
 If you change what crosses between a session and the compute plane, change it there and add a schedule for it. Check that the schedule fails when the code is wrong: put the wake-up before the answer, or the head of a frame before its samples, and loom has to report a thread that never wakes. Under `--cfg waveport_loom` the rest of the crate is not built, and the rings are stand-ins of which every operation is one step: the real ones are `rtrb`'s.
+
+**Provider adapters.** An adapter is tested against a server that the test starts on the loopback interface and that follows a script (`waveport_testkit::servers`): each line of a script is something the server says, something it waits to be told, a pause, or the way it ends the connection. Where a provider has been listened to, the script is a recording of it, kept under `tests/fixtures/` with the day it was made, and the crate documentation lists what the recording taught. Where it has not, the crate documentation says so in bold, and the messages are made up in the documented shapes. Never edit a recording to make a test pass: what the provider said is the fact, and the adapter is what has to change.
+
+The tests named `live_*` talk to the provider itself. They are ignored in an ordinary run, need the provider's key in the environment (`OPENAI_API_KEY`, `CARTESIA_API_KEY`), cost a few cents, and send speech made by a machine, never a recording of a person:
+
+```sh
+cargo nextest run -p waveport-stt-openai --run-ignored only live_
+```
+
+A key is read from the environment and goes nowhere but to its provider: none is ever an argument, a file in the repository or a line of output. `xtask` has a test that reads every file under a `fixtures` directory and fails on anything with the shape of a key, because a provider repeats a key it does not know.
+
+**Sound devices.** `waveport-transport-local-audio` is tested without a sound card. Everything between the session and the device is in `src/line.rs`, whose tests play both sides, two threads among them. `tests/scripted.rs` puts a person who follows a script where the card would be, on a clock the test controls. Three tests named `live_*` use the devices of the machine and are ignored in an ordinary run; `live_a_tone_is_played_while_the_microphone_listens` makes a sound and opens the microphone.
+
+**A whole call.** `apps/waveport-cli/tests/scripted.rs` starts the `waveport` command itself with a scripted caller and with scripted servers in place of the three providers. The speech recognition server replays a recording of the provider, and the other two are made up. The models, the adapters, the runtime and the audio path are the real ones, and so is the clock: the test takes about four seconds. It checks what the command printed, what each server was sent, and the recording of what the caller was played. When it fails it prints what each server was sent, which is where to start reading.
 
 **Adapter kit.** The WebSocket and HTTP clients are tested against servers that the tests start on the loopback interface; nothing leaves the machine. A test of a connection that is refused has to accept a timeout as well: Windows takes about two seconds to refuse a closed port on the loopback interface.
 

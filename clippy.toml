@@ -6,3 +6,8 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+
+# Names of providers that are written the way they write themselves, and
+# that the documentation lint would otherwise take for code. `..` keeps the
+# names the lint knows already.
+doc-valid-idents = ["OpenAI", "ElevenLabs", "AssemblyAI", ".."]

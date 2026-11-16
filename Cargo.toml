@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["benches", "crates/core/*", "crates/testing/*", "xtask"]
+members = ["apps/*", "benches", "crates/adapters/*/*", "crates/core/*", "crates/testing/*", "xtask"]
 # Throwaway experiments with their own workspace and lockfile. The gates do
 # not see them, so they may use dependencies the product does not.
 exclude = ["spikes"]
@@ -84,16 +84,33 @@ waveport-adapter-kit = { path = "crates/core/waveport-adapter-kit", version = "0
 waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", version = "0.1.0" }
 waveport-domain = { path = "crates/core/waveport-domain", version = "0.1.0" }
 waveport-kernel-sim = { path = "crates/testing/waveport-kernel-sim", version = "0.1.0" }
+waveport-llm-openai-compat = { path = "crates/adapters/llm/openai-compat", version = "0.1.0" }
 waveport-media = { path = "crates/core/waveport-media", version = "0.1.0" }
+waveport-models-onnx = { path = "crates/adapters/models/onnx", version = "0.1.0" }
 waveport-ports = { path = "crates/core/waveport-ports", version = "0.1.0" }
 waveport-protocol = { path = "crates/core/waveport-protocol", version = "0.1.0" }
+waveport-runtime = { path = "crates/core/waveport-runtime", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
+waveport-store-memory = { path = "crates/adapters/store/memory", version = "0.1.0" }
+waveport-stt-openai = { path = "crates/adapters/stt/openai", version = "0.1.0" }
 waveport-testkit = { path = "crates/testing/waveport-testkit", version = "0.1.0" }
+waveport-transport-local-audio = { path = "crates/adapters/transport/local-audio", version = "0.1.0" }
+waveport-tts-cartesia = { path = "crates/adapters/tts/cartesia", version = "0.1.0" }
 
+base64 = "0.23.1"
 bytes = "1.12.1"
+clap = { version = "4.6.7", default-features = false }
+cpal = "0.18.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+# The time where the machine is, for a tool that tells it. The time zones
+# are the system's own, and on Windows, which has none of that kind, they
+# come with the crate.
+jiff = { version = "0.2.41", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
 loom = { version = "0.7.3", features = ["futures"] }
 opus = "0.4.0"
+# ONNX Runtime is loaded from a file when the program starts, not linked in:
+# no library is downloaded while building, and none is built.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["api-31", "load-dynamic", "std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider"] }
 rtrb = "0.4.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -120,6 +137,12 @@ gungraun = "0.20.0"
 opt-level = 2
 
 [profile.dev.package.waveport-testkit]
+opt-level = 2
+
+# What the end-of-turn model is given to look at is worked out here, a
+# transform of 400 samples 800 times over for each answer. Unoptimised it
+# takes three quarters of a second, and a turn waits for it.
+[profile.dev.package.waveport-models-onnx]
 opt-level = 2
 
 [profile.release]

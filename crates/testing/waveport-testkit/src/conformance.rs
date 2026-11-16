@@ -265,6 +265,10 @@ pub async fn stt_utterance(stt: &dyn Stt, talk: Talk<'_>) -> Result<SttSeen, Bro
         at = at.after(piece.length());
         if talk.paced {
             tokio::time::sleep(Duration::from_millis(20)).await;
+        } else {
+            // Whatever else runs beside the check gets its turn: a server
+            // on this machine that the adapter talks to, for one.
+            tokio::task::yield_now().await;
         }
         for event in stt_ready(&mut stream.rx).await? {
             stt_note(event, caps, sent, &mut seen)?;

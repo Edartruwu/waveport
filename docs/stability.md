@@ -65,4 +65,4 @@ Moving a crate to a more stable tier is a reviewed change to its manifest and do
 
 ## Current tiers
 
-All product and testing crates are `experimental`: `waveport-domain`, `waveport-media`, `waveport-ports`, `waveport-runtime`, `waveport-control`, `waveport-protocol`, `waveport-sim`, `waveport-alloc-counter` and `waveport-testkit`. `xtask` and `waveport-benches` are `internal`.
+Every crate under `crates/` and `apps/` is `experimental`: the core crates, the adapters, the testing crates and the `waveport` command. `xtask` and `waveport-benches` are `internal`.

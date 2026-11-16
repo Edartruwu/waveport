@@ -24,4 +24,6 @@ pub mod session;
 #[cfg(not(waveport_loom))]
 pub mod shard;
 #[cfg(not(waveport_loom))]
+pub mod tools;
+#[cfg(not(waveport_loom))]
 mod watch;

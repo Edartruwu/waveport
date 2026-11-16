@@ -1,0 +1,42 @@
+[package]
+name = "waveport-cli"
+description = "The waveport command: an agent to talk to at this machine, or one that takes a scripted call."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "composition"
+stability = "experimental"
+
+[[bin]]
+name = "waveport"
+path = "src/main.rs"
+bench = false
+
+[dependencies]
+waveport-adapter-kit = { workspace = true }
+waveport-domain = { workspace = true }
+waveport-llm-openai-compat = { workspace = true }
+waveport-models-onnx = { workspace = true }
+waveport-ports = { workspace = true }
+waveport-runtime = { workspace = true }
+waveport-store-memory = { workspace = true }
+waveport-stt-openai = { workspace = true }
+waveport-transport-local-audio = { workspace = true }
+waveport-tts-cartesia = { workspace = true }
+
+clap = { workspace = true, features = ["derive", "env", "error-context", "help", "std", "suggestions", "usage"] }
+jiff = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }
+
+[dev-dependencies]
+waveport-testkit = { workspace = true }
+
+[lints]
+workspace = true

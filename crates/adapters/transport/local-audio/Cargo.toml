@@ -1,0 +1,36 @@
+[package]
+name = "waveport-transport-local-audio"
+description = "Waveport adapter: a session on this machine's microphone and loudspeaker, or on audio files in their place."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "adapter"
+stability = "experimental"
+
+[lib]
+bench = false
+
+[dependencies]
+waveport-adapter-kit = { workspace = true }
+waveport-domain = { workspace = true }
+waveport-media = { workspace = true }
+waveport-ports = { workspace = true }
+
+bytes = { workspace = true }
+cpal = { workspace = true }
+rtrb = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+waveport-testkit = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+
+[lints]
+workspace = true

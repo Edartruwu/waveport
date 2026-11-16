@@ -1,0 +1,33 @@
+[package]
+name = "waveport-llm-openai-compat"
+description = "Waveport adapter: language models behind an OpenAI-compatible chat completions API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "adapter"
+stability = "experimental"
+
+[lib]
+bench = false
+
+[dependencies]
+waveport-adapter-kit = { workspace = true }
+waveport-ports = { workspace = true }
+
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+waveport-domain = { workspace = true }
+waveport-testkit = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true
