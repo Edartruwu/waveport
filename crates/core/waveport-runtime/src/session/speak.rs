@@ -282,12 +282,13 @@ impl Voice {
     }
 
     /// The kernel releases a piece of the text of the response `tag`.
-    pub(crate) fn speak(&mut self, tag: OpTag, piece: &str) {
-        if self
+    /// Returns whether it is the first of that response.
+    pub(crate) fn speak(&mut self, tag: OpTag, piece: &str) -> bool {
+        let first = self
             .speaking
             .as_ref()
-            .is_none_or(|speaking| speaking.tag != tag)
-        {
+            .is_none_or(|speaking| speaking.tag != tag);
+        if first {
             let (tts, config) = (Arc::clone(&self.tts), self.config.clone());
             let opening = async move { tts.open(config).await };
             self.speaking = Some(Speaking {
@@ -315,6 +316,7 @@ impl Voice {
                 .saturating_add(u32::try_from(piece.len()).unwrap_or(u32::MAX));
             speaking.unsent.push_back(piece.to_owned());
         }
+        first
     }
 
     /// No more text of the response `tag` follows.

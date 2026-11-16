@@ -559,7 +559,12 @@ async fn a_sink_is_told_every_fact_and_when_each_part_of_a_turn_was_reached() {
     // The parts of the turn, in the order they were reached. The model
     // asked for the time before it said anything, so its first response
     // was never heard, and the second was.
-    let stages = recorder.stages.lock().unwrap().clone();
+    let (kept, stages): (Vec<_>, Vec<_>) = recorder
+        .stages
+        .lock()
+        .unwrap()
+        .iter()
+        .partition(|(_, stage)| matches!(stage, Stage::Stored(_)));
     let called = world.tools.called();
     let call = called[0].call;
     let log = running.far_end.log();
@@ -571,10 +576,13 @@ async fn a_sink_is_told_every_fact_and_when_each_part_of_a_turn_was_reached() {
         [
             Stage::TranscriptFinal(TurnId(1)),
             Stage::TurnEnded(TurnId(1)),
+            Stage::Asked(first),
             Stage::FirstToken(first),
             Stage::ToolSent(call),
             Stage::ToolBack(call),
+            Stage::Asked(second),
             Stage::FirstToken(second),
+            Stage::FirstText(second),
             Stage::FirstAudio(second),
             Stage::FirstFrameOut(second),
         ]
@@ -585,14 +593,32 @@ async fn a_sink_is_told_every_fact_and_when_each_part_of_a_turn_was_reached() {
     let times: Vec<u64> = stages.iter().map(|(at, _)| *at).collect();
     assert!(times.is_sorted(), "{times:?}");
     assert!((2_200..2_700).contains(&times[0]), "{times:?}");
-    assert_eq!(times[7], ms(&log.frames[0]));
+    assert_eq!(times[10], ms(&log.frames[0]));
+    // The model is asked the moment the turn has ended, and again the
+    // moment the tool is back.
+    assert_eq!(times[2], times[1]);
+    assert_eq!(times[6], times[5]);
     // What the caller waited for the answer, and where it went: 200 ms
-    // for each response to begin, 150 ms for the tool, 120 ms for the
+    // for each response to begin, 150 ms for the tool, 20 ms for the
+    // model to write the rest of its first sentence, and 100 ms for the
     // synthesiser.
-    assert_eq!(times[2] - times[1], 200);
-    assert_eq!(times[4] - times[3], 150);
-    assert_eq!(times[5] - times[4], 200);
-    assert_eq!(times[6] - times[5], 120);
+    assert_eq!(times[3] - times[2], 200);
+    assert_eq!(times[5] - times[4], 150);
+    assert_eq!(times[7] - times[6], 200);
+    assert_eq!(times[8] - times[7], 20);
+    assert_eq!(times[9] - times[8], 100);
+
+    // What the journal said it had stored: more each time, and in the
+    // end everything.
+    let upto: Vec<u64> = kept
+        .iter()
+        .map(|(_, stage)| match stage {
+            Stage::Stored(seq) => seq.get(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert!(upto.is_sorted_by(|a, b| a < b), "{upto:?}");
+    assert_eq!(upto.last(), Some(&stored));
 }
 
 #[tokio::test(start_paused = true)]

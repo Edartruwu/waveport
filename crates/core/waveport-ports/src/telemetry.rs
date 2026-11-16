@@ -5,8 +5,10 @@
 //! parts of a turn were reached, and what a sink makes of them (a trace,
 //! a metric, a report) is its own business.
 
+use std::sync::Arc;
+
 use waveport_domain::fact::Stamped;
-use waveport_domain::ids::{GenId, ToolCallId, TurnId};
+use waveport_domain::ids::{GenId, Seq, ToolCallId, TurnId};
 use waveport_domain::text::TextArena;
 use waveport_domain::time::MonoTime;
 
@@ -20,6 +22,21 @@ pub trait EventSink: Send + Sync + 'static {
 
     /// A part of a turn was reached.
     fn stage(&self, session: SessionId, mark: StageMark);
+}
+
+/// Several sinks are one sink: each is told, in order.
+impl EventSink for Vec<Arc<dyn EventSink>> {
+    fn facts(&self, session: SessionId, at: MonoTime, facts: &[Stamped], text: &TextArena) {
+        for sink in self {
+            sink.facts(session, at, facts, text);
+        }
+    }
+
+    fn stage(&self, session: SessionId, mark: StageMark) {
+        for sink in self {
+            sink.stage(session, mark);
+        }
+    }
 }
 
 /// The time at which a part of a turn was reached.
@@ -38,9 +55,13 @@ pub enum Stage {
     TranscriptFinal(TurnId),
     /// It was decided that a turn has ended.
     TurnEnded(TurnId),
+    /// The model was asked for a response.
+    Asked(GenId),
     /// The model wrote the first of a response: text, or a request for
     /// a tool.
     FirstToken(GenId),
+    /// The first text of a response was given to speech synthesis.
+    FirstText(GenId),
     /// Speech synthesis delivered the first audio of a response.
     FirstAudio(GenId),
     /// The first frame of a response was handed to the transport.
@@ -53,4 +74,6 @@ pub enum Stage {
     ToolSent(ToolCallId),
     /// A tool call came back.
     ToolBack(ToolCallId),
+    /// The journal said that every record up to this one is stored.
+    Stored(Seq),
 }
