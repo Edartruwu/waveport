@@ -4,7 +4,7 @@
 
 The roadmap puts a density spike first in phase 1, before any product code, because three choices in the [architecture](../architecture.md) rested on estimates: which library runs the local models, which allocator the binaries use, and how many voice sessions one core carries. This record states what was decided and shows the measurements.
 
-The code is in [`spikes/density/`](../../spikes/density/). It is a throwaway, outside the workspace and its gates. The raw numbers are in [`perf/spike/2026-11-15-core-ultra-7-155h.json`](../../perf/spike/2026-11-15-core-ultra-7-155h.json).
+The code was in `spikes/density/`, a throwaway outside the workspace and its gates. It was deleted at the end of phase 1, when the product could measure itself (`cargo xtask perf`, and section 12 of the architecture for how the two compare); it is in the history of the repository, last in the commit before the one named "delete the density spike". The raw numbers are in [`perf/spike/2026-11-15-core-ultra-7-155h.json`](../../perf/spike/2026-11-15-core-ultra-7-155h.json).
 
 ## Decisions
 
@@ -184,11 +184,13 @@ On this evidence alone the system allocator would do as well as either. mimalloc
 
 - **A fully loaded machine.** Everything here is one shard with three helper threads. The 1,000-session run needs hardware that can keep every core busy without throttling.
 - **Other platforms.** All numbers are x86-64 Linux. Nothing was measured on arm64, macOS or Windows.
-- **Long runs.** The longest run is two minutes. Memory growth over hours is milestone 11's soak test.
+- **Long runs.** The longest run is two minutes. Milestone 11's soak test runs a thousand calls of a minute each on the session actor and checks that every byte is given back; it runs on a clock the test controls, so it is not a run of hours either.
 - **What the model leaves out**, listed above.
 - **Local noise suppression**, whose cost the architecture estimated and nobody has measured.
 
 ## Reproducing
+
+The code has to be taken out of the history first (see the top of this record).
 
 ```sh
 cargo xtask fetch-assets
@@ -204,4 +206,4 @@ cargo build --release --bin density && cp target/release/density bin/density-sys
 ./summarise.py probe.json matrix.jsonl
 ```
 
-The test audio is generated with `ffmpeg`; the commands are in [`spikes/density/README.md`](../../spikes/density/README.md). The CPU numbers in `run_matrix.py` are specific to the machine above.
+The test audio is generated with `ffmpeg`; the commands are in `spikes/density/README.md`, in the history with the rest. The CPU numbers in `run_matrix.py` are specific to the machine above.
