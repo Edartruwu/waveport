@@ -24,13 +24,13 @@ Fifty calls on one shard in real time (`benches/tests/load.rs`), with a stand-in
 | The same, left to the system | 0.24% | 2 in 1,000 |
 | The laptop when it was slow, kept on one performance core | 0.48% | 6 in 1,000 |
 | The same, left to the system | 0.57 to 0.63% | 3 in 100 |
-| GitHub's runners (Xeon 6975P-C and EPYC 9V74), left to the system, nine runs | 0.20 to 0.22% | 3.1 to 3.2 in 10,000 |
+| GitHub's runners (Xeon 6975P-C, EPYC 9V74 and EPYC 7763), left to the system, twelve runs | 0.20 to 0.27%, by the processor | 3 in 10,000 on the first two, 6 on the third |
 
 Three things have to be said about it.
 
 - **No thread was pinned.** `cargo xtask perf --cpu` runs the whole measuring process under `taskset`, on one processor. In that test it comes close to pinning the shard, because the thread that drives the test sleeps and the models are stand-ins that run on the shard's own thread. It says nothing about a process whose other threads work: the two of the compute plane, and the journal's.
 - **The laptop's cores are not alike:** six performance cores, eight efficiency cores and two low-power ones. Left to the system, a thread is moved among them, and that is what `taskset` took away.
-- **On the runners, whose cores are alike, nothing was kept anywhere, and the long runs were as rare as on the laptop's one core.**
+- **On the runners, whose cores are alike, nothing was kept anywhere, and on two of their three processors the long runs were as rare as on the laptop's one core.** On the third and slowest there were twice as many, which is still three times fewer than on the laptop left to the system.
 
 So the gain that was measured is this laptop's. It is not evidence for a server. What pinning is worth where it should matter most, on a machine with every core at work, has not been measured by anybody: section 18 of the architecture already asks for that measurement.
 
