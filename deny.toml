@@ -46,10 +46,19 @@ skip = [
     # `ring` 0.17, the cryptography under `rustls`, still uses the 0.2 line;
     # `tungstenite` 0.30 reaches 0.4 through `rand` 0.10. Neither can be moved.
     { crate = "getrandom@0.2", reason = "ring 0.17 has not moved to a newer getrandom" },
-    # `cpal` reaches the sound system of Windows through `windows` 0.62, and
-    # the macros of that are written with `syn` 2. Build time only, and on
-    # Windows only.
-    { crate = "syn@2", reason = "windows 0.62, under cpal 0.18, has not moved to syn 3" },
+    # The OpenTelemetry SDK makes the numbers of its traces and spans with
+    # `rand` 0.9, one line behind the `rand` 0.10 of `tungstenite`, and each
+    # brings its own `rand_core` and `getrandom`. Only the telemetry adapter
+    # reaches them.
+    { crate = "rand@0.9", reason = "opentelemetry_sdk 0.33 has not moved to rand 0.10" },
+    { crate = "rand_core@0.9", reason = "rand 0.9, under opentelemetry_sdk 0.33" },
+    { crate = "getrandom@0.3", reason = "rand 0.9, under opentelemetry_sdk 0.33" },
+    # Macros that are still written with `syn` 2: those of `windows` 0.62,
+    # through which `cpal` reaches the sound system of Windows, those of
+    # `prost`, which the tests of the telemetry adapter read a collector's
+    # requests with, and those of `zerocopy`, under `rand` 0.9. Build time
+    # only.
+    { crate = "syn@2", reason = "windows 0.62, prost-derive 0.14 and zerocopy-derive 0.8 have not moved to syn 3" },
 ]
 
 [bans.workspace-dependencies]
