@@ -272,7 +272,7 @@ impl Voice {
                 .wait
                 .replace(Duration::from_millis(u64::from(making)))
                 .unwrap_or(self.script.first);
-            tokio::time::sleep(wait).await;
+            super::pause(wait).await;
             // The marks that fall in this piece come before it.
             while let Some((text_end, at)) = marks.next_if(|(_, at)| *at <= done + now) {
                 let mark = TtsMark {

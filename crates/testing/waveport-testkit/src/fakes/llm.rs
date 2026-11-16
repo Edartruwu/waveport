@@ -248,7 +248,7 @@ impl Llm for ScriptedLlm {
                     let finish = match step {
                         LlmStep::Say(text) => {
                             for word in text.split_inclusive(' ') {
-                                tokio::time::sleep(core::mem::replace(&mut wait, each)).await;
+                                super::pause(core::mem::replace(&mut wait, each)).await;
                                 written += 1;
                                 let text = word.to_owned();
                                 events.send(LlmEvent::Delta { text }).await;
@@ -256,13 +256,13 @@ impl Llm for ScriptedLlm {
                             continue;
                         }
                         LlmStep::Delta(text) => {
-                            tokio::time::sleep(core::mem::replace(&mut wait, each)).await;
+                            super::pause(core::mem::replace(&mut wait, each)).await;
                             written += 1;
                             events.send(LlmEvent::Delta { text }).await;
                             continue;
                         }
                         LlmStep::Call { tool, args } => {
-                            tokio::time::sleep(core::mem::replace(&mut wait, each)).await;
+                            super::pause(core::mem::replace(&mut wait, each)).await;
                             called = true;
                             events.send(LlmEvent::ToolCall { tool, args }).await;
                             continue;
@@ -277,7 +277,7 @@ impl Llm for ScriptedLlm {
                     events.send(done(finish, written)).await;
                     return Ok(());
                 }
-                tokio::time::sleep(wait).await;
+                super::pause(wait).await;
                 let finish = if called {
                     Finish::ToolCalls
                 } else {

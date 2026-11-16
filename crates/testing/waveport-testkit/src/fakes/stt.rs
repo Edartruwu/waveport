@@ -385,7 +385,12 @@ impl Hearing {
         {
             return Err(error.clone());
         }
-        tokio::time::sleep_until(self.since + self.script.latency).await;
+        // Not a timer when the time has come already: one that is due
+        // still ends on the next millisecond of a clock that runs.
+        let due = self.since + self.script.latency;
+        if Instant::now() < due {
+            tokio::time::sleep_until(due).await;
+        }
         let words = self.words.get(self.finalized..self.heard).unwrap_or(&[]);
         let text = words
             .iter()
