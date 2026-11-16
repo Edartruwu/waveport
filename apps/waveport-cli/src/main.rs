@@ -24,6 +24,7 @@ mod kept;
 mod report;
 mod script;
 mod serve;
+mod summary;
 mod tools;
 
 use core::fmt;
@@ -98,14 +99,21 @@ async fn at_the_desk(dev: Dev) -> Result<Outcome, Failure> {
     } else {
         println!("note: wear headphones, or the agent hears itself and stops speaking");
     }
-    call::run(&dev.agent, transport, dev.resume.as_ref()).await
+    call::run(
+        &dev.agent,
+        transport,
+        dev.resume.as_ref(),
+        dev.report.as_deref(),
+    )
+    .await
 }
 
 /// A call whose caller follows a script.
 async fn scripted(run: Run) -> Result<Outcome, Failure> {
     let steps = script::read(&run.script).map_err(Failure)?;
     let (transport, recording) = LocalAudio::scripted(steps, Options::default());
-    let outcome = call::run(&run.agent, transport, run.resume.as_ref()).await?;
+    let report = run.report.as_deref();
+    let outcome = call::run(&run.agent, transport, run.resume.as_ref(), report).await?;
     if let Some(file) = &run.record {
         std::fs::write(file, recording.wav())
             .with(|| format!("the recording cannot be written to {}", file.display()))?;

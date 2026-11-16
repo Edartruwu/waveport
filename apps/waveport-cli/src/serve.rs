@@ -87,10 +87,12 @@ pub(crate) async fn serve(args: Serve) -> Result<Outcome, Failure> {
             }
             () = call::last_words(ending) => {
                 eprintln!("waveport: the calls were stopped where they were");
+                calls.stack.finish().await;
                 return Ok(Outcome::Broken);
             }
         }
     }
+    calls.stack.finish().await;
     Ok(went)
 }
 
@@ -125,7 +127,7 @@ async fn one(calls: Arc<Calls>, knock: Knock) -> Option<Outcome> {
     });
     let call = match calls
         .stack
-        .start(id, Box::new(transport), tell, false)
+        .start(id, Box::new(transport), tell, false, None)
         .await
     {
         Ok(call) => call,

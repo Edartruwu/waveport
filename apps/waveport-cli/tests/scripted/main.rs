@@ -19,7 +19,8 @@
 //! `cargo xtask fetch-assets`.
 //!
 //! `resumed` kills the command in the middle of such a call, and goes on
-//! with the call in another process.
+//! with the call in another process. `watched` has such a call traced,
+//! counted and summed up.
 
 #![expect(
     clippy::unwrap_used,
@@ -30,6 +31,7 @@
 )]
 
 mod resumed;
+mod watched;
 
 use core::fmt::Write as _;
 use core::time::Duration;

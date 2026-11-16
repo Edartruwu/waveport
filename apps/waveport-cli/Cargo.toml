@@ -30,6 +30,7 @@ waveport-store-memory = { workspace = true }
 waveport-stt-assemblyai = { workspace = true }
 waveport-stt-deepgram = { workspace = true }
 waveport-stt-openai = { workspace = true }
+waveport-telemetry-otel = { workspace = true }
 waveport-transport-local-audio = { workspace = true }
 waveport-transport-websocket = { workspace = true }
 waveport-tts-cartesia = { workspace = true }
