@@ -490,8 +490,10 @@ fn an_answer_that_is_spoken_over_ends_the_trace_where_it_was_cut() {
     told.turn(1_000, 1, true);
     told.spoken(1_000, 1);
     told.mark(3_000, Stage::Lowered(GenId(1)));
-    told.mark(3_240, Stage::Stopped(GenId(1)));
+    // As a session tells it: what was heard of the answer is recorded,
+    // and the answer is marked as stopped after that, in the same step.
     told.uttered(3_240, 1, true);
+    told.mark(3_240, Stage::Stopped(GenId(1)));
     // The words that cut it off are the next turn, with a trace of its
     // own, which is still open when the adapter stops.
     told.turn(4_000, 2, true);

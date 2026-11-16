@@ -604,7 +604,7 @@ impl Otel {
             } => {
                 let cut = KeyValue::new(names::TRUNCATED, truncated);
                 self.measures.utterances.add(1, &[cut]);
-                self.uttered(session, watched, generation, truncated, now);
+                self.uttered(session, watched, generation, truncated, at);
             }
             Fact::ToolProposed {
                 call,
@@ -686,8 +686,9 @@ impl Otel {
         watched: &mut Watched,
         generation: GenId,
         truncated: bool,
-        now: SystemTime,
+        at: MonoTime,
     ) {
+        let now = watched.time(at);
         let Some(mut open) = watched.open.take() else {
             return;
         };
@@ -696,7 +697,14 @@ impl Otel {
             .iter()
             .position(|it| it.generation == generation);
         if let Some(found) = found {
-            let response = open.responses.remove(found);
+            let mut response = open.responses.remove(found);
+            // A session records the utterance of a response that was cut
+            // off before it marks the response as stopped, in the same
+            // step. The mark then finds no response, so the event is
+            // made here.
+            if truncated && response.events.len() < EVENTS {
+                response.events.push((names::EVENT_STOPPED, at));
+            }
             self.responded(session, watched, &open.cx, &response, now, Some(truncated));
         }
         let waiting = watched

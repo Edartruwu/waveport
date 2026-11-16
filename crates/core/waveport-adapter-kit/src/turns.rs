@@ -9,6 +9,12 @@
 //! It keeps a small, fixed amount about a session, so it can be called
 //! on the session's own thread: nothing here waits, and nothing is
 //! allocated once a tracker exists.
+//!
+//! A session tells the facts of a step before the marks of what the step
+//! then did. So a response that a caller cut off has its utterance
+//! recorded before it is marked as stopped, and a tracker does not take
+//! a response to be over because its utterance is recorded: the newest
+//! responses are followed, and the oldest make room.
 
 use core::time::Duration;
 
@@ -277,10 +283,6 @@ impl Tracker {
                     self.keep_call(call);
                 }
                 Fact::ToolFinished { call: id, .. } => self.calls.retain(|call| call.id != id),
-                Fact::UtteranceCommitted { generation, .. } => {
-                    self.responses
-                        .retain(|response| response.generation != generation);
-                }
                 Fact::LifecycleChanged {
                     to: Lifecycle::Closed,
                     ..
@@ -570,9 +572,14 @@ mod tests {
         told.mark(300, Stage::ToolBack(ToolCallId(99)));
         assert_eq!(told.took(), [("thinking", 201), ("calling", 201)]);
 
-        // A response whose utterance is recorded is over.
+        // A response that is cut off has its utterance recorded first
+        // and is marked as stopped after that, in the same step. It is
+        // timed all the same.
+        told.mark(350, Stage::Lowered(GenId(99)));
         told.fact(400, utterance(99));
-        assert_eq!(told.tracker.responses.len(), super::RESPONSES - 1);
+        told.mark(400, Stage::Stopped(GenId(99)));
+        assert_eq!(told.took().last(), Some(&("yielding", 50)));
+        assert_eq!(told.tracker.responses.len(), super::RESPONSES);
 
         // And a session that is closed is followed no more.
         told.mark(500, Stage::TurnEnded(TurnId(9)));

@@ -480,8 +480,9 @@ mod tests {
 
         // The caller speaks over the answer, and is answered again.
         told.mark(4_000, Stage::Lowered(GenId(3)));
-        told.mark(4_240, Stage::Stopped(GenId(3)));
+        // As a session tells it: the utterance first, then the stop.
         told.uttered(4_240, 3, true);
+        told.mark(4_240, Stage::Stopped(GenId(3)));
         told.turn(5_000, 2);
         told.spoken(5_000, 4);
         told.uttered(7_000, 4, false);
