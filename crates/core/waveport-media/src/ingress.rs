@@ -7,7 +7,10 @@
 //!
 //! What it hands on goes three ways: to the caller, frame by frame; into a
 //! window of the most recent audio, for the models that want to look back;
-//! and into a queue for speech recognition.
+//! and to speech recognition, which takes it in its own time. What waits
+//! for speech recognition is the end of the window, and is not held a
+//! second time: the path keeps count of how much of the end is not taken
+//! yet.
 //!
 //! # Waiting, and not waiting
 //!
@@ -70,7 +73,8 @@ pub struct IngressConfig {
     pub max_fill: MediaDur,
     /// How much of the most recent audio is kept to look back on.
     pub window: MediaDur,
-    /// How much audio waits for speech recognition at most.
+    /// How much audio waits for speech recognition at most. It waits in
+    /// the window, so this is no more than the window holds.
     pub queue: MediaDur,
 }
 
@@ -209,7 +213,10 @@ pub struct Ingress {
     /// One packet's samples.
     pcm: Box<[i16]>,
     window: Ring,
-    queue: Ring,
+    /// How many samples can wait for speech recognition.
+    queue: usize,
+    /// How many do: the end of the window that it has not taken yet.
+    unread: usize,
     stats: IngressStats,
 }
 
@@ -229,6 +236,8 @@ impl Ingress {
             len: 0,
             payload: vec![0; config.codec.max_packet()].into_boxed_slice(),
         };
+        let window = Ring::new(config.rate.samples_in(config.window));
+        let queue = config.rate.samples_in(config.queue).min(window.capacity());
         Ok(Self {
             slots: vec![slot; config.held.max(1)].into_boxed_slice(),
             expected: None,
@@ -242,8 +251,9 @@ impl Ingress {
             calm_since: config.origin,
             behind: 0,
             pcm: vec![0; decoder.max_samples()].into_boxed_slice(),
-            window: Ring::new(config.rate.samples_in(config.window)),
-            queue: Ring::new(config.rate.samples_in(config.queue)),
+            window,
+            queue,
+            unread: 0,
             stats: IngressStats::default(),
             decoder,
             config,
@@ -285,16 +295,20 @@ impl Ingress {
     /// How much audio waits for speech recognition.
     #[must_use]
     pub const fn queued(&self) -> usize {
-        self.queue.len()
+        self.unread
     }
 
-    /// Takes audio out of the queue for speech recognition into the start
-    /// of `out`, oldest first, and returns where it begins on the media
-    /// clock and how many samples there are. What is queued has no gaps.
+    /// Takes audio that waits for speech recognition into the start of
+    /// `out`, oldest first, and returns where it begins on the media clock
+    /// and how many samples there are. What waits has no gaps.
     pub fn take_queued(&mut self, out: &mut [i16]) -> (MediaTime, usize) {
-        let behind = self.config.rate.length_of(self.queue.len());
+        let behind = self.config.rate.length_of(self.unread);
         let at = MediaTime::from_ticks(self.end.ticks().saturating_sub(u64::from(behind.ticks())));
-        (at, self.queue.pop(out))
+        // No more is counted as waiting than the window holds, so what is
+        // taken is never more than what waits.
+        let taken = self.window.behind(self.unread, out);
+        self.unread -= taken;
+        (at, taken)
     }
 
     /// The place on the media clock of a reading of the clock.
@@ -545,8 +559,8 @@ impl Ingress {
         self.made_up = MediaDur::ZERO;
         // What was heard before does not join on to what follows.
         self.window.clear();
-        self.stats.queue_dropped += self.queue.len() as u64;
-        self.queue.clear();
+        self.stats.queue_dropped += self.unread as u64;
+        self.unread = 0;
         self.end = self.end.max(self.media_time(arrived));
     }
 
@@ -570,7 +584,12 @@ impl Ingress {
             return;
         };
         self.window.push(pcm);
-        self.stats.queue_dropped += self.queue.push(pcm) as u64;
+        // Speech recognition is that much further behind the end of the
+        // window. What is over the most that may wait for it is lost to
+        // it, oldest first.
+        let waiting = self.unread + samples;
+        self.unread = waiting.min(self.queue);
+        self.stats.queue_dropped += (waiting - self.unread) as u64;
         sink(Heard {
             at: self.end,
             pcm,
@@ -1156,6 +1175,27 @@ mod tests {
         let (at, samples) = line.ingress.take_queued(&mut queued);
         assert_eq!((at, samples), (MediaTime::from_millis(260), 640));
         assert_eq!(line.ingress.take_queued(&mut queued).1, 0);
+    }
+
+    #[test]
+    fn no_more_waits_for_speech_recognition_than_the_window_holds() {
+        let config = IngressConfig {
+            window: MediaDur::from_millis(60),
+            queue: MediaDur::from_millis(100),
+            ..IngressConfig::new(Codec::Pcm(Rate::Hz16000))
+        };
+        let mut line = Line::with(config);
+        for n in 0..10 {
+            line.on_time(n);
+        }
+        // What waits is the end of the window, and the window is 60 ms.
+        assert_eq!(line.ingress.queued(), 960);
+        assert_eq!(line.stats().queue_dropped, 3_200 - 960);
+        let mut queued = vec![0; 2_000];
+        let (at, samples) = line.ingress.take_queued(&mut queued);
+        assert_eq!((at, samples), (MediaTime::from_millis(240), 960));
+        assert_eq!(queued[..960], line.pcm[2_240..]);
+        assert_eq!(line.ingress.queued(), 0);
     }
 
     #[test]

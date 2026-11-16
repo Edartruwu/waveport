@@ -122,6 +122,14 @@ mod tests {
                     "memory.{kind}: {held} KB is held, {limit} KB asked"
                 );
             }
+            // The line that carries Opus is the usual one, so it is held
+            // to what is asked of the usual session too.
+            let held = targets.number(&format!("memory.{kind}.held_opus_kb"));
+            let usual = targets.number(&format!("memory.{kind}.target_p50_kb"));
+            assert!(
+                held <= usual,
+                "memory.{kind}: {held} KB is held on the usual line, {usual} KB asked of it"
+            );
         }
     }
 }
