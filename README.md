@@ -32,6 +32,7 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/core/waveport-control` | Application layer: runs the fleet |
 | `crates/core/waveport-protocol` | Wire formats: client protocol, control API, journal records. Depends on no other crate |
 | `crates/testing/waveport-sim` | Deterministic simulation: seeded runs with a virtual clock |
+| `crates/testing/waveport-kernel-sim` | Kernel scenarios: a simulated world around the session kernel, explored along every path |
 | `crates/testing/waveport-alloc-counter` | Counting allocator, to prove a code path does not allocate |
 | `crates/testing/waveport-testkit` | Shared test helpers |
 | `benches/` | Wall-clock and instruction-count benchmarks |

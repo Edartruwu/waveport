@@ -2,7 +2,7 @@
 
 Waveport is an open-source platform for real-time voice and multimodal AI agents, written in Rust. One runtime is both the agent framework and the system that operates it: it runs conversations, terminates media, dispatches work across a fleet, journals every session, and ships the models, console and connectors needed to run all of it on your own servers.
 
-**Status (15 November 2026):** phase 0 (foundations) is complete: its gates pass in CI on Linux (x86-64 and arm64), macOS and Windows. Phase 1 has started. Its first item, the density spike, is done, and what it decided is in [decision 0001](docs/decisions/0001-density-spike.md). No product code exists yet.
+**Status (15 November 2026):** phase 0 (foundations) is complete: its gates pass in CI on Linux (x86-64 and arm64), macOS and Windows. Phase 1 has started. Its first item, the density spike, is done, and what it decided is in [decision 0001](docs/decisions/0001-density-spike.md). The kernel's public types and its six scenarios are written. The kernel itself does nothing yet, so every scenario still fails at its first check.
 
 Companion documents:
 
@@ -94,13 +94,13 @@ Gaps closed: Windows as a second-class platform; API churn (the stability policy
 Build, in this order:
 
 1. **Density spike** (done; see [decision 0001](docs/decisions/0001-density-spike.md)). Synthetic sessions with real Opus, batched voice-activity detection and end-of-turn inference. It chose `ort` over `tract` and `mimalloc` over jemalloc, and replaced the estimate of 100 sessions per core with a measured planning figure of 60. The 1,000-session run it was meant to include needs a machine that can keep every core busy; it moves to the density gate at the end of this phase.
-2. **Six kernel scenarios** as executable tests, written before any real adapter: the four Pipecat race classes, a hybrid front/back agent, and a three-party conversation with speaker attribution. A scenario that needs a kernel edit instead of a policy is a redesign signal.
+2. **Six kernel scenarios** as executable tests (written; in `crates/core/waveport-domain/tests/scenarios/`), written before any real adapter: the four Pipecat race classes, a hybrid front/back agent, and a three-party conversation with speaker attribution. A scenario that needs a kernel edit instead of a policy is a redesign signal.
 3. `waveport-domain`: identities, events, commands, the session kernel and its policies.
 4. `waveport-media`: inbound and outbound audio paths, reorder buffer, pacer, playout ledger, G.711, frame pool.
 5. `waveport-ports`: every port trait, the capability types and the session planner.
 6. `waveport-runtime`: shards, session actor, cascaded driver, compute plane with cross-session batching, supervision and shutdown.
 7. Local models: voice-activity detection and Smart Turn v3.2 end-of-turn detection, one instance shared by all sessions.
-8. One speech-to-text, one LLM (OpenAI-compatible) and one text-to-speech adapter.
+8. Provider adapters: speech-to-text for OpenAI, Deepgram and AssemblyAI; one LLM adapter for OpenAI-compatible APIs; text-to-speech for Cartesia and ElevenLabs.
 9. Local-audio and WebSocket transports.
 10. Tools with effect classes and gates.
 11. A local journal with snapshots and crash resume.

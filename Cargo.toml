@@ -75,6 +75,8 @@ allowed = ["waveport-alloc-counter"]
 # each member opt in, which also works on the minimum supported Cargo.
 [workspace.dependencies]
 waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", version = "0.1.0" }
+waveport-domain = { path = "crates/core/waveport-domain", version = "0.1.0" }
+waveport-kernel-sim = { path = "crates/testing/waveport-kernel-sim", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
 
 serde = { version = "1.0.229", default-features = false }
