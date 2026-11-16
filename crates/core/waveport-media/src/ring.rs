@@ -9,6 +9,10 @@
 /// with [`push_some`](Self::push_some), which takes only what fits, and
 /// read with [`pop`](Self::pop).
 ///
+/// A window can be a queue as well, for a reader that keeps count of how
+/// far behind the end it is and reads on with [`behind`](Self::behind):
+/// the audio is then held once, and not once more for the reader.
+///
 /// Its memory is reserved once, when it is made.
 #[derive(Clone, Debug)]
 pub struct Ring {
@@ -174,19 +178,35 @@ impl Ring {
     /// Copies the newest samples into the start of `out`, oldest first:
     /// `out.len()` of them, or as many as are held. Returns how many.
     pub fn latest(&self, out: &mut [i16]) -> usize {
-        let count = self.len.min(out.len());
+        self.behind(out.len(), out)
+    }
+
+    /// Copies into the start of `out` the samples that begin `behind`
+    /// places before the end of what is held, oldest first: `out.len()` of
+    /// them, or as many as there are from there on. Returns how many. A
+    /// place before the oldest sample counts as the oldest.
+    ///
+    /// A reader that is `behind` samples behind the stream reads on with
+    /// this, and is then behind by what it was given less.
+    pub fn behind(&self, behind: usize, out: &mut [i16]) -> usize {
+        let behind = behind.min(self.len);
+        let count = behind.min(out.len());
         let (first, second) = self.as_slices();
         // What is skipped comes off the older part first.
-        let skip = self.len - count;
+        let skip = self.len - behind;
         let first = first.get(skip.min(first.len())..).unwrap_or(&[]);
         let second = second
             .get(skip.saturating_sub(self.len - second.len())..)
             .unwrap_or(&[]);
-        if let Some(room) = out.get_mut(..first.len()) {
-            room.copy_from_slice(first);
+        let from_first = first.len().min(count);
+        let from_second = count - from_first;
+        if let (Some(room), Some(held)) = (out.get_mut(..from_first), first.get(..from_first)) {
+            room.copy_from_slice(held);
         }
-        if let Some(room) = out.get_mut(first.len()..first.len() + second.len()) {
-            room.copy_from_slice(second);
+        if let (Some(room), Some(held)) =
+            (out.get_mut(from_first..count), second.get(..from_second))
+        {
+            room.copy_from_slice(held);
         }
         count
     }
@@ -276,6 +296,12 @@ mod tests {
                 assert_eq!(out[..got], model[model.len() - got..]);
                 let got = ring.peek(&mut out);
                 assert_eq!(out[..got], model[..got]);
+                for behind in 0..9 {
+                    let from = model.len().saturating_sub(behind);
+                    let got = ring.behind(behind, &mut out);
+                    assert_eq!(got, wanted.min(model.len() - from));
+                    assert_eq!(out[..got], model[from..from + got]);
+                }
             }
 
             let taken = usize::try_from(round % 3).unwrap();
@@ -287,12 +313,37 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_behind_a_window_reads_on_from_where_it_is() {
+        let mut ring = Ring::new(6);
+        ring.push(&[1, 2, 3, 4]);
+        // Three behind: it is given two of them, and is then one behind.
+        let mut out = [0; 2];
+        assert_eq!(ring.behind(3, &mut out), 2);
+        assert_eq!(out, [2, 3]);
+        assert_eq!(ring.behind(1, &mut out), 1);
+        assert_eq!(out[..1], [4]);
+        assert_eq!(ring.behind(0, &mut out), 0);
+
+        // The window moves on under it, round the end of the buffer.
+        ring.push(&[5, 6, 7, 8]);
+        assert_eq!(held(&ring), [3, 4, 5, 6, 7, 8]);
+        let mut out = [0; 8];
+        assert_eq!(ring.behind(4, &mut out), 4);
+        assert_eq!(out[..4], [5, 6, 7, 8]);
+        // Nothing is further behind than the oldest sample.
+        assert_eq!(ring.behind(9, &mut out), 6);
+        assert_eq!(out[..6], [3, 4, 5, 6, 7, 8]);
+        assert_eq!(ring.len(), 6, "reading takes nothing out");
+    }
+
+    #[test]
     fn a_ring_of_nothing_holds_nothing() {
         let mut ring = Ring::new(0);
         assert_eq!(ring.push(&[1, 2]), 2);
         assert_eq!(ring.push_some(&[1, 2]), 0);
         assert_eq!(ring.pop(&mut [0; 2]), 0);
         assert_eq!(ring.latest(&mut [0; 2]), 0);
+        assert_eq!(ring.behind(2, &mut [0; 2]), 0);
         assert!(ring.is_empty());
         ring.clear();
     }
