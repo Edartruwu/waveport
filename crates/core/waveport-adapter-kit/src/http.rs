@@ -198,9 +198,22 @@ mod tests {
     use crate::secret::Secret;
     use crate::sse::SseParser;
 
+    /// A client that waits as long as any client does. A machine that
+    /// runs many tests at once can stand still for longer than a test
+    /// would think to wait.
     fn client() -> HttpClient {
         HttpClient::new(HttpSettings {
-            read_timeout: Duration::from_millis(300),
+            direct: true,
+            ..HttpSettings::default()
+        })
+        .unwrap()
+    }
+
+    /// A client that gives up on silence after a second, for the test
+    /// that waits for it to.
+    fn impatient() -> HttpClient {
+        HttpClient::new(HttpSettings {
+            read_timeout: Duration::from_secs(1),
             direct: true,
             ..HttpSettings::default()
         })
@@ -396,7 +409,7 @@ mod tests {
         })
         .await;
 
-        let client = client();
+        let client = impatient();
         for (body, class) in [
             (&b"{\"then\":\"gone\"}"[..], RetryClass::Transient),
             (&b"{\"then\":\"silent\"}"[..], RetryClass::Timeout),
