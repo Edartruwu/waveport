@@ -27,7 +27,7 @@ use waveport_domain::text::TextArena;
 use waveport_domain::time::{MediaDur, MonoTime};
 use waveport_ports::audio::{Codec, Law, PcmBytes, Rate};
 use waveport_ports::error::PortError;
-use waveport_ports::journal::{Journal, SessionId};
+use waveport_ports::journal::{Batch, Journal, SessionId, Snapshot};
 use waveport_ports::plan::{Marks, Shortfall};
 use waveport_ports::stt::{SttFinalize, SttTiming};
 use waveport_ports::telemetry::{EventSink, Stage, StageMark};
@@ -37,7 +37,8 @@ use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::compute::Compute;
 use waveport_runtime::context::ToolDef;
 use waveport_runtime::session::{
-    Ended, Parts, Request, Session, SessionEvent, SessionInput, SessionSpec, StoreBroken, Tap,
+    Ended, Parts, Rebuilt, Request, Session, SessionEvent, SessionInput, SessionSpec, StartError,
+    StateRule, StateStats, StoreBroken, Tap,
 };
 use waveport_testkit::fakes::{
     FakeTransport, FakeTransportBuilder, LlmStep, LoudVad, MemoryJournal, Said, ScriptedLlm,
@@ -1324,6 +1325,27 @@ fn resumes_at(records: &[bytes::Bytes]) -> u64 {
 
 #[tokio::test(start_paused = true)]
 async fn a_session_whose_process_died_is_taken_up_again() {
+    // From all its records: no state is stored in so short a session.
+    taken_up_again(StateRule::default(), None).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_whose_process_died_is_taken_up_again_from_its_stored_state() {
+    // A state is due after every other record, and is taken when the
+    // caller's turn ends, which is record 2. What follows is only how
+    // far the story was heard, and that is nothing to take a state at.
+    let rule = StateRule {
+        records: 2,
+        after: Duration::MAX,
+    };
+    taken_up_again(rule, Some(2)).await;
+}
+
+/// A session dies in the middle of the agent's answer and is taken up by
+/// another process. `stored` is the record its journal holds a state as
+/// of when it dies, if `states` makes it store one by then.
+async fn taken_up_again(states: StateRule, stored: Option<u64>) {
+    let spec = || SessionSpec { states, ..spec() };
     let speech = [(1_000, 2_200, "tell me a story")];
     let llm = ScriptedLlm::replies(vec![
         vec![LlmStep::say(STORY)],
@@ -1335,12 +1357,21 @@ async fn a_session_whose_process_died_is_taken_up_again() {
         FakeTransport::sound_card()
             .join(0, CALLER)
             .microphone(CALLER, 0, 12_000, &talks(&speech));
-    let mut running = Running::start(&world, transport).await;
+    let mut running = Running::start_as(spec(), &world, transport).await;
+    assert_eq!(running.session.rebuilt(), None);
     // The process dies in the middle of the story.
     assert_eq!(running.until(5_000).await, None);
     let before = running.far_end.log();
     let heard_before = before.heard(before.frames[0].tag).as_millis();
+    let fared = running.session.stats().states;
     drop(running);
+    // What the next process is given: the state, if one was stored, and
+    // the records after it.
+    let (kept, after) = world.journal.kept(SESSION);
+    assert_eq!(kept.map(|kept| kept.upto.get()), stored);
+    assert_eq!(after as u64, 4 - stored.unwrap_or(0));
+    assert_eq!(fared.stored, u32::from(stored.is_some()));
+    assert_eq!(fared.dropped, 0);
     // What the journal has of the story is how far it had been heard
     // when that was last written down, which is done every second.
     let records = world.journal.records(SESSION);
@@ -1367,7 +1398,15 @@ async fn a_session_whose_process_died_is_taken_up_again() {
         FakeTransport::sound_card()
             .join(0, CALLER)
             .microphone(CALLER, 0, 12_000, &talks(&speech));
-    let mut running = Running::start(&world, transport).await;
+    let mut running = Running::start_as(spec(), &world, transport).await;
+    // It says what it was rebuilt from.
+    assert_eq!(
+        running.session.rebuilt(),
+        Some(Rebuilt {
+            state: stored.map(Seq),
+            records: 4 - stored.unwrap_or(0),
+        })
+    );
     assert_eq!(running.until(12_000).await, None);
 
     // The conversation has the story as far as it is known to have been
@@ -1474,6 +1513,223 @@ async fn a_tool_that_was_running_when_the_process_died_is_not_run_twice() {
 }
 
 /// Everything a follower has been told and not yet taken.
+/// A journal that holds `records` of the session and nothing else: what
+/// a journal that never stored a state would hold of it.
+async fn of_records(records: &[bytes::Bytes]) -> MemoryJournal {
+    let journal = MemoryJournal::new();
+    let lease = journal.acquire(SESSION).await.unwrap().lease;
+    let batch = Batch {
+        first: Seq(1),
+        records: records.to_vec(),
+    };
+    journal.append(SESSION, lease, batch).await.unwrap();
+    journal
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_has_its_journal_keep_its_state_as_the_conversation_goes() {
+    let speech = [
+        (1_000, 2_200, "what time is it"),
+        (6_000, 7_000, "thank you"),
+        (10_000, 11_000, "goodbye"),
+    ];
+    let llm = ScriptedLlm::replies(vec![
+        vec![LlmStep::say("It is a quarter past nine.")],
+        vec![LlmStep::say("You are welcome.")],
+        vec![LlmStep::say("Goodbye!")],
+    ]);
+    let world = World::new(&speech, llm);
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 16_000, &talks(&speech));
+    // A state is due after every third record.
+    let spec = || SessionSpec {
+        states: StateRule {
+            records: 3,
+            after: Duration::MAX,
+        },
+        ..spec()
+    };
+    let mut running = Running::start_as(spec(), &world, transport).await;
+    assert_eq!(running.until(16_000).await, None);
+
+    // The states were taken as a turn or an answer entered the
+    // conversation, and the newest is as of such a record.
+    let records = world.journal.records(SESSION);
+    let kinds = kinds(&records);
+    let fared = running.session.stats().states;
+    assert!(fared.stored >= 2, "{fared:?} {kinds:?}");
+    assert_eq!(fared.dropped, 0);
+    let (kept, after) = world.journal.kept(SESSION);
+    let upto = usize::try_from(kept.unwrap().upto.get()).unwrap();
+    assert!(
+        ["turn_committed", "utterance_committed"].contains(&kinds[upto - 1].as_str()),
+        "a state as of record {upto} of {kinds:?}"
+    );
+    assert_eq!(upto + after, records.len());
+    // No more records wait for a state than make one due, and those that
+    // do are after the last time one could be taken.
+    assert!(after < 3, "{after} records after the state, of {kinds:?}");
+
+    // Rebuilt from the state and what follows it, the session holds what
+    // it holds now, and what it would hold rebuilt from every record.
+    let held = running.session.snapshot();
+    drop(running);
+    let transport = || {
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 1_000, &[])
+    };
+    let from_state = Running::start_as(spec(), &world.again(&[]), transport()).await;
+    assert_eq!(from_state.session.snapshot(), held);
+    let mut plain = world.again(&[]);
+    plain.journal = of_records(&records).await;
+    let from_records = Running::start_as(spec(), &plain, transport()).await;
+    assert_eq!(from_records.session.snapshot(), held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_state_is_due_after_a_time_as_well() {
+    let speech = [
+        (1_000, 2_200, "what time is it"),
+        (70_000, 71_000, "thank you"),
+    ];
+    let llm = ScriptedLlm::replies(vec![
+        vec![LlmStep::say("It is a quarter past nine.")],
+        vec![LlmStep::say("You are welcome.")],
+    ]);
+    let world = World::new(&speech, llm);
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 80_000, &talks(&speech));
+    // As a session is told nothing else: after 256 records or a minute.
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(60_000).await, None);
+    assert_eq!(world.journal.kept(SESSION).0, None);
+    assert_eq!(running.session.stats().states, StateStats::default());
+
+    // The first turn to end after the minute is the time for one.
+    assert_eq!(running.until(80_000).await, None);
+    let kinds = kinds(&world.journal.records(SESSION));
+    let (state, _) = world.journal.kept(SESSION);
+    let upto = usize::try_from(state.unwrap().upto.get()).unwrap();
+    assert_eq!(kinds[upto - 1], "turn_committed", "{kinds:?}");
+    assert_eq!(
+        kinds[..upto]
+            .iter()
+            .filter(|kind| *kind == "turn_committed")
+            .count(),
+        2
+    );
+    assert_eq!(running.session.stats().states.stored, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_that_never_settles_stores_its_state_all_the_same() {
+    // The caller says one thing, and the agent tells a story that is
+    // heard for a long time: a record a second, and nothing enters the
+    // conversation.
+    let speech = [(1_000, 2_200, "tell me a story")];
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say(&STORY.repeat(4))]]);
+    let world = World::new(&speech, llm);
+    let transport =
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 30_000, &talks(&speech));
+    let spec = SessionSpec {
+        states: StateRule {
+            records: 4,
+            after: Duration::MAX,
+        },
+        ..spec()
+    };
+    let mut running = Running::start_as(spec, &world, transport).await;
+    assert_eq!(running.until(20_000).await, None);
+    let kinds = kinds(&world.journal.records(SESSION));
+    assert!(kinds.len() >= 12, "{kinds:?}");
+    // Not at the fourth record, at which nothing had settled, but at
+    // the eighth, when twice as many waited.
+    let (state, _) = world.journal.kept(SESSION);
+    let upto = state.unwrap().upto.get();
+    assert_eq!(upto % 8, 0, "a state as of record {upto} of {kinds:?}");
+    assert!(running.session.stats().states.stored >= 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_state_that_cannot_be_read_is_not_guessed_at() {
+    let open = async |journal: MemoryJournal| {
+        let mut world = World::new(&[], ScriptedLlm::replies(vec![]));
+        world.journal = journal;
+        let (transport, _far_end) = FakeTransport::sound_card().build();
+        Session::open(spec(), world.parts(transport), DefaultPolicies::default())
+            .await
+            .map(|_| ())
+    };
+    let joined = bytes::Bytes::from_static(
+        br#"{"v":1,"seq":1,"fact":{"kind":"participant_joined","who":1}}"#,
+    );
+    let with_state = async |state: &'static [u8]| {
+        let journal = of_records(core::slice::from_ref(&joined)).await;
+        let lease = journal.acquire(SESSION).await.unwrap().lease;
+        let state = Snapshot {
+            upto: Seq(1),
+            state: bytes::Bytes::from_static(state),
+        };
+        journal.snapshot(SESSION, lease, state).await.unwrap();
+        journal
+    };
+
+    let refused = open(with_state(b"not a state").await).await.unwrap_err();
+    assert!(matches!(refused, StartError::State(_)), "{refused}");
+    assert!(
+        refused.to_string().contains("could not be read"),
+        "{refused}"
+    );
+
+    // A state from a build that is not written yet.
+    let refused = open(with_state(br#"{"v":9,"upto":1}"#).await)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("version 9"), "{refused}");
+
+    // A state that is as of another record than the journal says: one
+    // of the two is wrong, and nothing says which.
+    let moved = br#"{"v":1,"upto":4,"heard_until":0,"epoch":0,"lifecycle":"running","front":0,"turn_floor":1,"gen_floor":1,"next_call":1,"next_batch":1,"participants":[1],"calls":[],"batches":[],"items":[],"answered":0}"#;
+    let refused = open(with_state(moved).await).await.unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        "the journal holds a state as of record 1, which says it is as of record 4"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_journal_is_asked_to_hurry_only_while_something_waits_for_it() {
+    let speech = [(1_000, 2_200, "book it")];
+    let transport = || {
+        FakeTransport::sound_card()
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 8_000, &talks(&speech))
+    };
+    // A tool that changes nothing waits for nothing, and nor does
+    // anything else in a conversation.
+    let world = World::new(&speech, calls_a_tool());
+    let mut running = Running::start(&world, transport()).await;
+    assert_eq!(running.until(8_000).await, None);
+    assert_eq!(world.tools.called().len(), 1);
+    assert_eq!(world.journal.hurried(SESSION), 0);
+
+    // A tool that may change the world waits for the record that allows
+    // it, and the journal is told so once.
+    let mut world = World::new(&speech, calls_a_tool());
+    world.journal.latency = Duration::from_millis(30);
+    let mut running = Running::start_as(spec_with_effect(), &world, transport()).await;
+    assert_eq!(running.until(8_000).await, None);
+    assert_eq!(world.tools.called().len(), 1);
+    assert_eq!(world.journal.hurried(SESSION), 1);
+}
+
 fn told(following: &mut tokio::sync::mpsc::Receiver<SessionEvent>) -> Vec<SessionEvent> {
     core::iter::from_fn(|| following.try_recv().ok()).collect()
 }

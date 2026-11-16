@@ -664,6 +664,189 @@ impl Snapshot {
     pub const fn next_seq(&self) -> Seq {
         self.next_seq
     }
+
+    /// Everything the snapshot holds, in plain sight: what it is written
+    /// to a journal from. The text is borrowed from the snapshot.
+    #[must_use]
+    pub fn parts(&self) -> SnapshotParts<'_> {
+        SnapshotParts {
+            epoch: self.epoch,
+            lifecycle: self.lifecycle,
+            closed_for: self.closed_for,
+            front: self.front,
+            handoff: self.handoff,
+            next_seq: self.next_seq,
+            turn_floor: self.turn_floor,
+            gen_floor: self.gen_floor,
+            next_call: self.next_call,
+            next_batch: self.next_batch,
+            participants: self.participants.clone(),
+            calls: self
+                .calls
+                .iter()
+                .map(|open| CallView {
+                    call: open.id,
+                    tool: open.tool,
+                    batch: open.batch,
+                    by: open.by,
+                    state: open.state,
+                    attempt: open.attempt,
+                })
+                .collect(),
+            batches: self
+                .batches
+                .iter()
+                .map(|open| BatchView {
+                    batch: open.id,
+                    by: open.by,
+                    pending: usize::from(open.pending),
+                    ran: open.ran,
+                })
+                .collect(),
+            items: self.conversation.iter().collect(),
+            owed: self.owed,
+            answered: self.answered,
+            speech: self.speech.map(|(generation, agent)| SpeechHeard {
+                generation,
+                agent,
+                text: &self.speech_text,
+            }),
+        }
+    }
+
+    /// The snapshot that holds what `parts` says: what a snapshot read
+    /// back from a journal is made of.
+    ///
+    /// Nothing is checked here. A snapshot is believed as a fact is: what
+    /// it says was decided before it was written. Whether the session's
+    /// configuration has room for it is found out by
+    /// [`Kernel::restore`].
+    #[must_use]
+    pub fn from_parts(parts: &SnapshotParts<'_>) -> Self {
+        let mut conversation = Conversation::default();
+        for item in &parts.items {
+            match *item {
+                ItemView::UserTurn {
+                    turn,
+                    who,
+                    text,
+                    addressed,
+                } => conversation.push_user_turn(turn, who, text, addressed),
+                ItemView::Utterance {
+                    generation,
+                    agent,
+                    text,
+                    truncated,
+                } => conversation.push_utterance(generation, agent, text, truncated),
+                ItemView::ToolCall {
+                    call,
+                    tool,
+                    generation,
+                    args,
+                } => conversation.push_tool_call(call, tool, generation, args),
+                ItemView::ToolResult {
+                    call,
+                    outcome,
+                    text,
+                } => conversation.push_tool_result(call, outcome, text),
+                ItemView::Notice { kind, text } => conversation.push_notice(kind, text),
+            }
+        }
+        let call = |open: &CallView| {
+            let mut call = Call::proposed(open.call, open.tool, open.batch, open.by);
+            call.state = open.state;
+            call.attempt = open.attempt;
+            // A journal knows nothing of a call that is being stopped.
+            call.journaled()
+        };
+        let batch = |open: &BatchView| {
+            let mut batch = Batch::begin(open.batch, open.by);
+            batch.pending = u16::try_from(open.pending).unwrap_or(u16::MAX);
+            batch.ran = open.ran;
+            batch
+        };
+        Self {
+            epoch: parts.epoch,
+            lifecycle: parts.lifecycle,
+            closed_for: parts.closed_for,
+            front: parts.front,
+            handoff: parts.handoff,
+            next_seq: parts.next_seq,
+            turn_floor: parts.turn_floor,
+            gen_floor: parts.gen_floor,
+            next_call: parts.next_call,
+            next_batch: parts.next_batch,
+            participants: parts.participants.clone(),
+            calls: parts.calls.iter().map(call).collect(),
+            batches: parts.batches.iter().map(batch).collect(),
+            conversation,
+            owed: parts.owed,
+            answered: parts.answered,
+            speech: parts.speech.map(|heard| (heard.generation, heard.agent)),
+            speech_text: parts
+                .speech
+                .map_or_else(String::new, |heard| String::from(heard.text)),
+        }
+    }
+}
+
+/// A [`Snapshot`] taken apart: every value it holds.
+///
+/// A snapshot keeps its values to itself, so that only facts can change
+/// what a session's journal adds up to. This is the one way round that:
+/// for whoever stores a snapshot, and has to write every value of it
+/// somewhere and read it back. Whoever builds one of these by hand
+/// decides what a session remembers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotParts<'a> {
+    /// The epoch.
+    pub epoch: Epoch,
+    /// The stage of the session's life.
+    pub lifecycle: Lifecycle,
+    /// Why the session is closing, once it is.
+    pub closed_for: Option<CloseReason>,
+    /// The agent that holds the floor.
+    pub front: AgentId,
+    /// The agent that was asked to take the floor and has not yet.
+    pub handoff: Option<AgentId>,
+    /// The sequence number of the first fact that is not in the snapshot.
+    pub next_seq: Seq,
+    /// The lowest turn number no fact has named.
+    pub turn_floor: TurnId,
+    /// The lowest response number no fact has named.
+    pub gen_floor: GenId,
+    /// The number the next tool call gets.
+    pub next_call: ToolCallId,
+    /// The number the next batch of tool calls gets.
+    pub next_batch: BatchId,
+    /// The humans in the session.
+    pub participants: Vec<ParticipantId>,
+    /// The tool calls that have not ended.
+    pub calls: Vec<CallView>,
+    /// The batches of tool calls that are not resolved.
+    pub batches: Vec<BatchView>,
+    /// The conversation, oldest item first.
+    pub items: Vec<ItemView<'a>>,
+    /// The newest item of the conversation that is owed a response, as
+    /// the version of the conversation that holds it, and what the
+    /// response is for.
+    pub owed: Option<(ContextVersion, LlmCause)>,
+    /// The conversation that has had its response.
+    pub answered: ContextVersion,
+    /// The speech that was being heard, as far as that was recorded.
+    pub speech: Option<SpeechHeard<'a>>,
+}
+
+/// An agent's speech that was being heard when a snapshot was taken, as
+/// far as facts had recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpeechHeard<'a> {
+    /// The response being spoken.
+    pub generation: GenId,
+    /// Its agent.
+    pub agent: AgentId,
+    /// What had been recorded as heard of it.
+    pub text: &'a str,
 }
 
 /// Why a session could not be rebuilt.
@@ -708,15 +891,21 @@ impl core::error::Error for RestoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kernel, RestoreError};
+    use alloc::vec::Vec;
+
+    use super::{CallState, ItemView, Kernel, RestoreError, Snapshot, SpeechHeard};
+    use crate::command::LlmCause;
     use crate::config::{ConfigError, KernelConfig};
-    use crate::event::{ControlInput, Event};
-    use crate::fact::{Fact, Lifecycle, Stamped};
-    use crate::ids::{AgentId, Epoch, GenId, OpTag, ParticipantId, Seq};
+    use crate::event::{CloseReason, ControlInput, Event};
+    use crate::fact::{Dismissal, EpochCause, Fact, Lifecycle, NoticeKind, Stamped, ToolOutcome};
+    use crate::ids::{
+        AgentId, BatchId, ContextVersion, Epoch, GenId, OpTag, ParticipantId, Seq, ToolCallId,
+        ToolId, TurnId,
+    };
     use crate::out::Out;
     use crate::policy::{BoxedPolicies, DefaultPolicies};
     use crate::text::TextArena;
-    use crate::time::MonoTime;
+    use crate::time::{MediaSpan, MediaTime, MonoTime};
 
     fn joined(seq: u64) -> Stamped {
         Stamped {
@@ -783,6 +972,195 @@ mod tests {
         .unwrap();
         assert_eq!(restored.snapshot(), snapshot);
         assert_eq!(restored.view().next_seq(), Seq(1));
+    }
+
+    /// A session that has been through a bit of everything: a turn, a
+    /// response that asked for two tools of which one has ended, a note,
+    /// a handoff that was asked for, and speech that is being heard.
+    fn busy() -> (Vec<Stamped>, TextArena) {
+        let mut text = TextArena::default();
+        let facts = [
+            Fact::ParticipantJoined {
+                who: ParticipantId(1),
+            },
+            Fact::ParticipantJoined {
+                who: ParticipantId(2),
+            },
+            Fact::TurnCommitted {
+                turn: TurnId(1),
+                who: ParticipantId(1),
+                span: MediaSpan::new(MediaTime::from_ticks(48_000), MediaTime::from_ticks(96_000)),
+                text: text.push("what time is it, and note that I asked"),
+                addressed: true,
+            },
+            Fact::ToolProposed {
+                call: ToolCallId(1),
+                batch: BatchId(1),
+                generation: GenId(1),
+                tool: ToolId(0),
+                args: text.push("{}"),
+            },
+            Fact::ToolProposed {
+                call: ToolCallId(2),
+                batch: BatchId(1),
+                generation: GenId(1),
+                tool: ToolId(0),
+                args: text.push(""),
+            },
+            Fact::ToolAuthorized {
+                call: ToolCallId(1),
+            },
+            Fact::ToolAuthorized {
+                call: ToolCallId(2),
+            },
+            Fact::ToolDispatched {
+                call: ToolCallId(1),
+                attempt: 0,
+            },
+            Fact::ToolDispatched {
+                call: ToolCallId(2),
+                attempt: 1,
+            },
+            Fact::ToolFinished {
+                call: ToolCallId(1),
+                outcome: ToolOutcome::Completed,
+                result: text.push("ten past three"),
+            },
+            Fact::EpochAdvanced {
+                to: Epoch(3),
+                cause: EpochCause::BargeIn,
+            },
+            Fact::UtteranceCommitted {
+                generation: GenId(2),
+                agent: AgentId(0),
+                answers: Some(ContextVersion(1)),
+                text: text.push("It is ten"),
+                truncated: true,
+            },
+            Fact::NoticeAppended {
+                kind: NoticeKind::Recovered,
+                text: text.push("Some work was lost."),
+            },
+            Fact::TurnDismissed {
+                turn: TurnId(4),
+                who: ParticipantId(2),
+                reason: Dismissal::Backchannel,
+            },
+            Fact::HandoffRequested { to: AgentId(0) },
+            Fact::LifecycleChanged {
+                to: Lifecycle::Draining,
+                reason: Some(CloseReason::Requested),
+            },
+            Fact::UtteranceProgress {
+                generation: GenId(6),
+                agent: AgentId(0),
+                heard: text.push("Goodbye, and "),
+            },
+        ];
+        let stamped = facts
+            .into_iter()
+            .zip(1..)
+            .map(|(fact, seq)| Stamped {
+                seq: Seq(seq),
+                fact,
+            })
+            .collect();
+        (stamped, text)
+    }
+
+    fn restored(snapshot: &Snapshot, tail: &[Stamped], text: &TextArena) -> Kernel {
+        Kernel::restore(
+            KernelConfig::default(),
+            DefaultPolicies::default(),
+            snapshot,
+            tail,
+            text,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_taken_apart_and_put_together_is_the_same_snapshot() {
+        let blank = Kernel::<DefaultPolicies>::default().snapshot();
+        assert_eq!(Snapshot::from_parts(&blank.parts()), blank);
+
+        let (facts, text) = busy();
+        // After every fact, so that every stage of the session is one
+        // the snapshot is taken at.
+        for upto in 1..=facts.len() {
+            let snapshot = restored(&blank, &facts[..upto], &text).snapshot();
+            let parts = snapshot.parts();
+            let again = Snapshot::from_parts(&parts);
+            assert_eq!(again, snapshot, "after fact {upto}");
+            assert_eq!(again.parts(), parts, "after fact {upto}");
+            // And a session goes on from it as from the facts.
+            let from_parts = restored(&again, &facts[upto..], &text);
+            let from_facts = restored(&blank, &facts, &text);
+            assert_eq!(from_parts.snapshot(), from_facts.snapshot());
+            assert_eq!(from_parts.fingerprint(), from_facts.fingerprint());
+        }
+    }
+
+    #[test]
+    fn the_parts_of_a_snapshot_say_what_the_session_remembers() {
+        let blank = Kernel::<DefaultPolicies>::default().snapshot();
+        let (facts, text) = busy();
+        let snapshot = restored(&blank, &facts, &text).snapshot();
+        let parts = snapshot.parts();
+        assert_eq!(parts.next_seq, Seq(18));
+        assert_eq!(parts.epoch, Epoch(3));
+        assert_eq!(parts.lifecycle, Lifecycle::Draining);
+        assert_eq!(parts.closed_for, Some(CloseReason::Requested));
+        assert_eq!(parts.handoff, Some(AgentId(0)));
+        assert_eq!(parts.participants, [ParticipantId(1), ParticipantId(2)]);
+        assert_eq!((parts.turn_floor, parts.gen_floor), (TurnId(5), GenId(7)));
+        assert_eq!(
+            (parts.next_call, parts.next_batch),
+            (ToolCallId(3), BatchId(2))
+        );
+        // The call that has not ended, and its batch.
+        assert_eq!(parts.calls.len(), 1);
+        assert_eq!(
+            (
+                parts.calls[0].call,
+                parts.calls[0].state,
+                parts.calls[0].attempt
+            ),
+            (ToolCallId(2), CallState::Dispatched, 1)
+        );
+        assert_eq!(parts.batches.len(), 1);
+        assert_eq!((parts.batches[0].pending, parts.batches[0].ran), (1, true));
+        assert_eq!(parts.items.len(), 6);
+        assert_eq!(
+            parts.items[5],
+            ItemView::Notice {
+                kind: NoticeKind::Recovered,
+                text: "Some work was lost.",
+            }
+        );
+        assert_eq!(
+            parts.owed,
+            Some((ContextVersion(1), LlmCause::Reply { turn: TurnId(1) }))
+        );
+        assert_eq!(parts.answered, ContextVersion(1));
+        assert_eq!(
+            parts.speech,
+            Some(SpeechHeard {
+                generation: GenId(6),
+                agent: AgentId(0),
+                text: "Goodbye, and ",
+            })
+        );
+    }
+
+    #[test]
+    fn a_call_that_is_being_stopped_is_put_together_as_one_that_was_sent() {
+        let blank = Kernel::<DefaultPolicies>::default().snapshot();
+        let (facts, text) = busy();
+        let snapshot = restored(&blank, &facts, &text).snapshot();
+        let mut parts = snapshot.parts();
+        parts.calls[0].state = CallState::Cancelling;
+        assert_eq!(Snapshot::from_parts(&parts), snapshot);
     }
 
     #[test]

@@ -1,9 +1,15 @@
-//! The two tools an agent of this command has.
+//! The tools an agent of this command has.
 //!
-//! One only looks: it tells the time. The other acts, and once: it ends
+//! One only looks: it tells the time. Another acts, and once: it ends
 //! the call. Between them they are the two kinds of tool a session has to
 //! get right, and something to ask an agent for that it cannot make up.
+//!
+//! An agent that is given a file for notes has a third, which acts where
+//! it can be seen afterwards: it adds a line to the file. What a call
+//! did to the world, and how often, can be counted there.
 
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Weak;
 
 use waveport_domain::config::{Effect, Gate, ToolSpec};
@@ -17,9 +23,26 @@ use waveport_runtime::tools::{Call, Registry, Tool};
 /// A tool that takes no arguments, as the model is told.
 const NOTHING: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 
-/// Adds the two tools to `registry`. `sessions` is where the session that
-/// asks for its call to be ended is found.
-pub(crate) fn add(registry: &mut Registry, sessions: Weak<dyn SessionControl>) {
+/// A tool that takes a text, as the model is told.
+const A_TEXT: &str = r#"{"type":"object","properties":{"text":{"type":"string","description":"What to write down, in one line."}},"required":["text"],"additionalProperties":false}"#;
+
+/// The tool that takes notes: where it writes them, and whether it is to
+/// stop once it has written, for the test that kills the command there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Notes {
+    pub file: PathBuf,
+    pub halt: bool,
+}
+
+/// Adds the tools to `registry`. `sessions` is where the session that
+/// asks for its call to be ended is found, and `notes` is the tool that
+/// takes notes, if the agent has one. The order is the order the tools
+/// have in a call's journal: a new tool goes last.
+pub(crate) fn add(
+    registry: &mut Registry,
+    sessions: Weak<dyn SessionControl>,
+    notes: Option<Notes>,
+) {
     registry.add(
         ToolDef {
             name: "get_time".to_owned(),
@@ -44,6 +67,19 @@ pub(crate) fn add(registry: &mut Registry, sessions: Weak<dyn SessionControl>) {
         },
         EndCall { sessions },
     );
+    if let Some(notes) = notes {
+        registry.add(
+            ToolDef {
+                name: "take_note".to_owned(),
+                description: "Writes a note down where the caller finds it after the call."
+                    .to_owned(),
+                parameters: A_TEXT.to_owned(),
+            },
+            // It is not taken back, and a second one is a second note.
+            ToolSpec::new(Effect::SideEffecting),
+            TakeNote(notes),
+        );
+    }
 }
 
 /// Tells the time.
@@ -100,6 +136,64 @@ impl Tool for EndCall {
     }
 }
 
+/// Writes a note down.
+struct TakeNote(Notes);
+
+/// The text of the note that the arguments of a call ask for, in one
+/// line.
+fn note(args: &str) -> Result<String, String> {
+    let asked: serde_json::Value = serde_json::from_str(args)
+        .map_err(|error| format!("The arguments are not what the tool takes: {error}."))?;
+    let text = asked
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(String::new, |text| {
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        });
+    if text.is_empty() {
+        return Err("There is nothing to write down: the tool takes a text.".to_owned());
+    }
+    Ok(text)
+}
+
+/// Adds `line` to the end of the file at `file`.
+fn add_line(file: &Path, line: &str) -> std::io::Result<()> {
+    let mut notes = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(file)?;
+    // In one write, so that two notes at once are two lines.
+    notes.write_all(format!("{line}\n").as_bytes())?;
+    notes.sync_all()
+}
+
+impl Tool for TakeNote {
+    fn call<'a>(&'a self, call: Call<'a>) -> BoxFuture<'a, ToolReply> {
+        Box::pin(async move {
+            let text = match note(call.args) {
+                Ok(text) => text,
+                Err(message) => {
+                    return ToolReply::Failed {
+                        class: RetryClass::Permanent,
+                        message,
+                    };
+                }
+            };
+            if let Err(error) = add_line(&self.0.file, &text) {
+                return ToolReply::Failed {
+                    class: RetryClass::Permanent,
+                    message: format!("The note could not be written down: {error}."),
+                };
+            }
+            if self.0.halt {
+                crate::halt::say("tool");
+                core::future::pending::<()>().await;
+            }
+            ToolReply::Completed("It is written down.".to_owned())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex, Weak};
@@ -111,7 +205,7 @@ mod tests {
     use waveport_ports::tool::{ToolExecutor, ToolReply, ToolRequest};
     use waveport_runtime::tools::Registry;
 
-    use super::{add, now};
+    use super::{Notes, add, note, now};
 
     /// Sessions that note what is asked of them.
     #[derive(Default)]
@@ -150,7 +244,7 @@ mod tests {
     fn tools(sessions: &Arc<Sessions>) -> Registry {
         let mut registry = Registry::new();
         let sessions: Arc<dyn SessionControl> = Arc::clone(sessions) as _;
-        add(&mut registry, Arc::downgrade(&sessions));
+        add(&mut registry, Arc::downgrade(&sessions), None);
         registry
     }
 
@@ -203,8 +297,64 @@ mod tests {
         let reply = registry.call(request(404, 1)).await;
         assert!(matches!(reply, ToolReply::Failed { .. }), "{reply:?}");
         let mut alone = Registry::new();
-        add(&mut alone, Weak::<Sessions>::new());
+        add(&mut alone, Weak::<Sessions>::new(), None);
         let reply = alone.call(request(7, 1)).await;
         assert!(matches!(reply, ToolReply::Failed { .. }), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn a_note_is_a_line_in_the_file_and_two_are_two() {
+        let folder = std::env::temp_dir().join(format!("waveport-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("notes.txt");
+        let _ = std::fs::remove_file(&file);
+        let mut registry = Registry::new();
+        let notes = Notes {
+            file: file.clone(),
+            halt: false,
+        };
+        add(&mut registry, Weak::<Sessions>::new(), Some(notes));
+        // It is the last of the tools, and one that acts.
+        let (defs, specs) = (registry.defs(), registry.specs());
+        assert_eq!(defs.len(), 3);
+        assert_eq!(defs[2].name, "take_note");
+        assert_eq!(
+            (specs[2].effect, specs[2].gate),
+            (Effect::SideEffecting, Gate::None)
+        );
+        let schema: serde_json::Value = serde_json::from_str(&defs[2].parameters).unwrap();
+        assert_eq!(schema["required"][0], "text");
+
+        let asks = |args: &'static str| ToolRequest {
+            args,
+            ..request(1, 2)
+        };
+        let reply = registry
+            .call(asks(r#"{"text":"The door\n is open."}"#))
+            .await;
+        assert_eq!(
+            reply,
+            ToolReply::Completed("It is written down.".to_owned())
+        );
+        let reply = registry.call(asks(r#"{"text":"So is the window."}"#)).await;
+        assert_eq!(
+            reply,
+            ToolReply::Completed("It is written down.".to_owned())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "The door is open.\nSo is the window.\n"
+        );
+
+        // What is not a note is not written.
+        for args in ["{}", r#"{"text":"  "}"#, r#"{"text":7}"#, "not json"] {
+            let reply = registry.call(asks(args)).await;
+            assert!(
+                matches!(reply, ToolReply::Failed { .. }),
+                "{args}: {reply:?}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 2);
+        assert_eq!(note(r#"{"text":" a  b "}"#), Ok("a b".to_owned()));
     }
 }

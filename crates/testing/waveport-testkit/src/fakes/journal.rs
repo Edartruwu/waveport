@@ -16,14 +16,30 @@ use waveport_ports::journal::{
 struct Stored {
     lease: Lease,
     snapshot: Option<Snapshot>,
-    /// The number of the first record in `records`.
-    first: u64,
+    /// Every record, from the one numbered 1. A journal would let go of
+    /// those a snapshot covers. This one keeps them for a test to look
+    /// at, and gives a new owner only the ones after the snapshot.
     records: Vec<Bytes>,
+    /// How many times the session asked not to be kept waiting.
+    hurried: u64,
 }
 
 impl Stored {
     fn next(&self) -> Seq {
-        Seq(self.first + u64::try_from(self.records.len()).unwrap_or(u64::MAX))
+        Seq(1 + u64::try_from(self.records.len()).unwrap_or(u64::MAX))
+    }
+
+    /// How many records the snapshot covers.
+    fn covered(&self) -> usize {
+        let upto = self.snapshot.as_ref().map_or(0, |snapshot| snapshot.upto.0);
+        usize::try_from(upto)
+            .unwrap_or(usize::MAX)
+            .min(self.records.len())
+    }
+
+    /// The records after the snapshot.
+    fn tail(&self) -> Vec<Bytes> {
+        self.records.iter().skip(self.covered()).cloned().collect()
     }
 }
 
@@ -98,8 +114,9 @@ impl MemoryJournal {
             .unwrap_or_else(PoisonError::into_inner) = Some(error);
     }
 
-    /// Every record stored of `session` that a snapshot has not replaced,
-    /// in order.
+    /// Every record ever stored of `session`, in order: also the ones a
+    /// snapshot has replaced since, which a journal that is not for tests
+    /// would have let go of.
     #[must_use]
     pub fn records(&self, session: SessionId) -> Vec<Bytes> {
         self.sessions
@@ -107,6 +124,29 @@ impl MemoryJournal {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&session)
             .map_or_default(|stored| stored.records.clone())
+    }
+
+    /// The newest snapshot stored of `session`, and how many records
+    /// follow it: what a new owner of the session is given.
+    #[must_use]
+    pub fn kept(&self, session: SessionId) -> (Option<Snapshot>, usize) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&session)
+            .map_or((None, 0), |stored| {
+                (stored.snapshot.clone(), stored.tail().len())
+            })
+    }
+
+    /// How many times `session` asked not to be kept waiting.
+    #[must_use]
+    pub fn hurried(&self, session: SessionId) -> u64 {
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&session)
+            .map_or(0, |stored| stored.hurried)
     }
 
     fn with<R>(
@@ -129,15 +169,12 @@ impl Journal for MemoryJournal {
         Box::pin(async move {
             tokio::time::sleep(self.latency).await;
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-            let stored = sessions.entry(session).or_insert_with(|| Stored {
-                first: 1,
-                ..Stored::default()
-            });
+            let stored = sessions.entry(session).or_default();
             stored.lease = Lease(stored.lease.0 + 1);
             Ok(Recovered {
                 lease: stored.lease,
                 snapshot: stored.snapshot.clone(),
-                tail: stored.records.clone(),
+                tail: stored.tail(),
                 next: stored.next(),
             })
         })
@@ -197,19 +234,22 @@ impl Journal for MemoryJournal {
             tokio::time::sleep(self.latency).await;
             self.with(session, lease, |stored| {
                 let next = stored.next();
-                if snapshot.upto >= next || snapshot.upto.0 + 1 < stored.first {
+                let held = stored.snapshot.as_ref().map_or(0, |held| held.upto.0);
+                if snapshot.upto >= next || snapshot.upto.0 < held {
                     // A state as of a record that is not stored, or that
                     // an earlier snapshot has already replaced.
                     return Err(JournalError::OutOfOrder { expected: next });
                 }
-                let covered = usize::try_from(snapshot.upto.0 + 1 - stored.first)
-                    .unwrap_or(usize::MAX)
-                    .min(stored.records.len());
-                stored.records.drain(..covered);
-                stored.first = snapshot.upto.0 + 1;
                 stored.snapshot = Some(snapshot);
                 Ok(())
             })
         })
+    }
+
+    fn hurry(&self, session: SessionId) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(stored) = sessions.get_mut(&session) {
+            stored.hurried += 1;
+        }
     }
 }

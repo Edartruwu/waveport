@@ -12,6 +12,7 @@
 //!
 //! This library holds the workloads, so that both kinds measure the same code.
 
+pub mod journal;
 pub mod kernel;
 pub mod media;
 

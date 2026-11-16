@@ -19,7 +19,13 @@ bench = false
 [dependencies]
 waveport-domain = { workspace = true }
 waveport-media = { workspace = true }
+waveport-ports = { workspace = true }
+waveport-runtime = { workspace = true }
 waveport-sim = { workspace = true }
+waveport-store-journal = { workspace = true }
+
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -31,6 +37,11 @@ gungraun = { workspace = true }
 [[bench]]
 name = "wall_smoke"
 path = "wall/smoke.rs"
+harness = false
+
+[[bench]]
+name = "wall_journal"
+path = "wall/journal.rs"
 harness = false
 
 # `cargo xtask bench-ir` runs every benchmark whose name begins with `ir_`.
@@ -47,6 +58,11 @@ harness = false
 [[bench]]
 name = "ir_media"
 path = "ir/media.rs"
+harness = false
+
+[[bench]]
+name = "ir_journal"
+path = "ir/journal.rs"
 harness = false
 
 [lints]

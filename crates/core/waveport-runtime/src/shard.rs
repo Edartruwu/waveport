@@ -30,7 +30,7 @@ use waveport_ports::control::{ControlError, EventRx, SessionControl, SessionEven
 use waveport_ports::journal::SessionId;
 use waveport_ports::plan::CascadePlan;
 
-use crate::session::{Ended, Parts, Request, Session, SessionSpec, StartError};
+use crate::session::{Ended, Parts, Rebuilt, Request, Session, SessionSpec, StartError};
 pub use crate::watch::ShardStats;
 use crate::watch::{Counters, Watched};
 
@@ -126,6 +126,8 @@ pub struct Started {
     pub id: SessionId,
     /// How it is run with the parts it has.
     pub plan: CascadePlan,
+    /// What it was rebuilt from, if it goes on after an earlier life.
+    pub rebuilt: Option<Rebuilt>,
     exit: oneshot::Receiver<Exit>,
 }
 
@@ -228,7 +230,7 @@ impl Runtime {
                     }
                 };
                 session.listen_to(inbox);
-                let _ = ready.send(Ok(session.plan().clone()));
+                let _ = ready.send(Ok((session.plan().clone(), session.rebuilt())));
                 Some(session.run().await)
             };
             let watched = Watched::new(run, Arc::clone(&counters), budget);
@@ -256,7 +258,12 @@ impl Runtime {
         }
 
         match started.await {
-            Ok(Ok(plan)) => Ok(Started { id, plan, exit }),
+            Ok(Ok((plan, rebuilt))) => Ok(Started {
+                id,
+                plan,
+                rebuilt,
+                exit,
+            }),
             Ok(Err(error)) => Err(SpawnError::Start(error)),
             // Nobody said how the start went: it panicked, or the shard
             // stopped under it.

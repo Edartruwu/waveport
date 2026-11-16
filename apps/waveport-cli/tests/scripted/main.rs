@@ -17,6 +17,9 @@
 //!
 //! The models that listen have to have been fetched:
 //! `cargo xtask fetch-assets`.
+//!
+//! `resumed` kills the command in the middle of such a call, and goes on
+//! with the call in another process.
 
 #![expect(
     clippy::unwrap_used,
@@ -26,11 +29,14 @@
     reason = "a test that cannot be set up, or that finds something missing, fails"
 )]
 
+mod resumed;
+
 use core::fmt::Write as _;
 use core::time::Duration;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -41,7 +47,8 @@ use waveport_testkit::servers::{HttpAnswer, HttpServer, WsHeard, WsSeen, WsServe
 use waveport_testkit::speech;
 
 /// What the recogniser said when it was sent this question.
-const HEARD: &str = include_str!("../../../crates/adapters/stt/openai/tests/fixtures/question.ws");
+const HEARD: &str =
+    include_str!("../../../../crates/adapters/stt/openai/tests/fixtures/question.ws");
 
 /// What a stand-in for Deepgram says in a call with one question:
 /// nothing until it is asked what it has heard, and then the question
@@ -216,19 +223,38 @@ fn assets() -> PathBuf {
     )
 }
 
-/// Starts the command.
+/// A folder for the command to be run in, which nothing else is run in:
+/// a command that is told nothing else keeps its calls where it is run.
+fn desk() -> PathBuf {
+    static DESKS: AtomicU32 = AtomicU32::new(0);
+    let number = DESKS.fetch_add(1, Ordering::Relaxed);
+    folder(&format!("desks/{}-{number}", std::process::id()))
+}
+
+/// Starts the command in a folder of its own.
 fn started(arguments: &[&str]) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_waveport"))
+    started_at(&desk(), arguments, None)
+}
+
+/// Starts the command in the folder `desk`. `halt` is where it is told
+/// to stop, if anywhere.
+fn started_at(desk: &Path, arguments: &[&str], halt: Option<&str>) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_waveport"));
+    command
         .args(arguments)
+        .current_dir(desk)
         // No key of anyone's is needed for servers on this machine, and
         // none is to reach them.
         .env_remove("OPENAI_API_KEY")
         .env_remove("CARTESIA_API_KEY")
+        .env_remove("WAVEPORT_TEST_HALT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the command, started")
+        .stderr(Stdio::piped());
+    if let Some(place) = halt {
+        command.env("WAVEPORT_TEST_HALT", place);
+    }
+    command.spawn().expect("the command, started")
 }
 
 /// Waits for the command to end, for a minute and a half at most, while
@@ -246,7 +272,12 @@ async fn ended(child: &mut Child) {
 
 /// Runs the command to its end.
 async fn waveport(arguments: &[&str]) -> Output {
-    let mut child = started(arguments);
+    waveport_at(&desk(), arguments).await
+}
+
+/// Runs the command to its end, in the folder `desk`.
+async fn waveport_at(desk: &Path, arguments: &[&str]) -> Output {
+    let mut child = started_at(desk, arguments, None);
     ended(&mut child).await;
     child.wait_with_output().unwrap()
 }
@@ -612,7 +643,7 @@ async fn a_caller_asks_the_time_of(hears: Hears, speaks: Speaks, name: &str) {
     ];
     arguments.extend(providers.arguments());
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
-    let output = waveport(&arguments).await;
+    let output = waveport_at(&folder, &arguments).await;
     let told = String::from_utf8_lossy(&output.stdout).into_owned();
     let all = everything(&output, &providers.stt, &providers.llm, &providers.tts);
     assert!(output.status.success(), "{all}");
@@ -620,6 +651,20 @@ async fn a_caller_asks_the_time_of(hears: Hears, speaks: Speaks, name: &str) {
     tells_the_call(&told, "", &all);
     providers.were_asked_as_one_question_asks(&all);
     holds_the_answer(&recording, &all);
+
+    // The command was told nothing about where to keep its calls, and
+    // kept them where it was run, in a folder that is its owner's alone.
+    // The call is over, so there is none to go on with.
+    let kept = folder.join(".waveport");
+    assert!(kept.join("journal.redb").is_file(), "{all}");
+    assert!(!kept.join("journal.last").exists(), "{all}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&kept), 0o700, "{all}");
+        assert_eq!(mode(&kept.join("journal.redb")), 0o600, "{all}");
+    }
 }
 
 #[tokio::test]

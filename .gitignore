@@ -2,3 +2,7 @@
 /spikes/*/target/
 /reports/
 /research_notes/
+# Where the `waveport` command keeps the calls of whoever runs it, and
+# where keys are sometimes put. Neither is the repository's.
+.waveport/
+.env

@@ -177,7 +177,7 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-domain --test simulat
 WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay
 ```
 
-**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile and 1,000 of the runtime per story and profile (see below), other ones each night, and the larger sessions of `tests/model.rs`. The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
+**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile, 1,000 of the runtime per story and profile and 20,000 power cuts in the middle of a commit of the journal (see below), other ones each night, and the larger sessions of `tests/model.rs`. The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
 
 **Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps and of rebuilding a session from its journal, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
 
@@ -204,6 +204,14 @@ WAVEPORT_SIM_SEED=12 cargo test --release -p waveport-runtime --test simulation 
 
 With `-- --nocapture` each test prints what its sessions did, counted: turns, interruptions, tool calls and how they ended, processes that died. A sweep in which something stopped happening passes while it tests nothing, so look at the counts when you change what a profile makes up.
 
+**Journal.** `waveport-store-journal` is held to what every journal is held to (`waveport_testkit::conformance`), and `tests/journal.rs` adds what only a journal in a file can be held to. `tests/power.rs` puts the file on a disk in memory that the test can break: a write or a sync that fails, and the power going at a write that a seed picks, in the middle of a commit, with every write that was not yet synced kept, lost or torn. After each cut the file is opened again, and nothing the journal acknowledged may be gone, a commit has to be there whole or not at all, and the sessions have to go on. An ordinary run makes 60 cuts; when you change how the journal writes, make more once. A release build makes 2,000 in under two minutes:
+
+```sh
+WAVEPORT_SIM_SEEDS=2000 cargo test --release -p waveport-store-journal --test power -- --nocapture
+```
+
+The test prints how often the commit that was cut was found whole and how often not at all. Both have to happen, or it tests nothing: a cut that always lands before the commit proves only that an empty file opens.
+
 **Threads.** A session never leaves its thread, and the listening models run on others. Everything the two sides share is in `src/handoff.rs` of the runtime, and its tests try every way the threads of a small case can take turns, with [loom](https://docs.rs/loom). They are in a build of their own, which the gate `loom` makes:
 
 ```sh
@@ -228,7 +236,11 @@ A key is read from the environment and goes nowhere but to its provider: none is
 
 **Sound devices.** `waveport-transport-local-audio` is tested without a sound card. Everything between the session and the device is in `src/line.rs`, whose tests play both sides, two threads among them. `tests/scripted.rs` puts a person who follows a script where the card would be, on a clock the test controls. Three tests named `live_*` use the devices of the machine and are ignored in an ordinary run; `live_a_tone_is_played_while_the_microphone_listens` makes a sound and opens the microphone.
 
-**A whole call.** `apps/waveport-cli/tests/scripted.rs` starts the `waveport` command itself with a scripted caller and with scripted servers in place of the three providers. The server that stands in for OpenAI's speech recognition replays a recording of it, and the others are made up. The models, the adapters, the runtime and the audio path are the real ones, and so is the clock: a call takes about four seconds. The same call is run with OpenAI and Cartesia, with Deepgram and ElevenLabs, and with AssemblyAI, and once with the agent in `waveport serve` and the caller in `waveport client`, two processes with a WebSocket between them. Each run checks what the command printed, what each server was sent, and the recording of what the caller was played. When one fails it prints what each server was sent, which is where to start reading. An adapter for a new provider gets a stand-in and a run here.
+**A whole call.** `apps/waveport-cli/tests/scripted/` starts the `waveport` command itself with a scripted caller and with scripted servers in place of the three providers. The server that stands in for OpenAI's speech recognition replays a recording of it, and the others are made up. The models, the adapters, the runtime and the audio path are the real ones, and so is the clock: a call takes about four seconds. The same call is run with OpenAI and Cartesia, with Deepgram and ElevenLabs, and with AssemblyAI, and once with the agent in `waveport serve` and the caller in `waveport client`, two processes with a WebSocket between them. Each run checks what the command printed, what each server was sent, and the recording of what the caller was played. When one fails it prints what each server was sent, which is where to start reading. An adapter for a new provider gets a stand-in and a run here.
+
+**A call that is killed.** `resumed.rs` in the same folder runs such a call with its journal in a file, kills the process as `kill -9` does, starts the command again with `--resume last`, and has the caller ask once more. It does so at six places: while the model answers, while the agent speaks, once a tool has acted and before it has answered, while the record that allows a tool waits to be stored, and before and after the commit that stores all the call has come to. Each run checks that the second process goes on with the call, that the model is shown the conversation as the journal had it, that the tool that acts (`take_note`, which adds a line to a file) acted at most once in both processes together, that the caller's next question is answered aloud, and that a call that is over is not there to go on with.
+
+Some of those places last less than a millisecond, so the command is told where to stop: `WAVEPORT_TEST_HALT` names a place, the command says `halted: <place>` when it is there, and the test kills it then. A place in the journal (`before:<kind>` or `after:<kind>` of a record, or of `state`) stops the thread that writes the journal at that commit, while the rest of the call runs on; `tool` stops the tool that takes notes once it has written. `apps/waveport-cli/src/halt.rs` is all of it, and nothing else reads the variable. A new place a call can die in gets a case there. Check that a case can fail: make the kernel send a call with an effect again after a restart, and the case with the tool has to find two notes.
 
 **The WebSocket transport.** `crates/adapters/transport/websocket/tests/loopback.rs` runs the server side and the client against each other over real sockets on the loopback interface, and a client that breaks the protocol against the server.
 
@@ -246,6 +258,12 @@ cargo xtask bench-ir --base main
 ```
 
 Only instruction counts gate a pull request: they repeat to within a fraction of a percent, where wall-clock time on a shared runner does not.
+
+The journal has one of each. `ir_journal` counts what a record costs the session that makes it: a fact written as a record, and the records of a step handed to the journal, with the thread that writes the journal held in a commit so that nothing it does is counted. `wall_journal` measures how long the records then take to be stored, which is what a tool with an effect waits for: for one session and for 64 at once, in one phase and in two, in a file under the target directory and in memory. That number is the disk's more than the journal's, so read it on the machine that matters:
+
+```sh
+cargo bench -p waveport-benches --bench wall_journal
+```
 
 ## Spikes
 

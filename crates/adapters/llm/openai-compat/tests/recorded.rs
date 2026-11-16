@@ -55,13 +55,25 @@ fn request(tools: &'static [ToolDecl<'static>]) -> LlmRequest<'static> {
     }
 }
 
-/// An adapter that talks to `server`, and gives up on silence quickly.
+/// An adapter that talks to `server`, and waits for it as long as any
+/// adapter does. A machine that runs many tests at once can stand still
+/// for longer than a test would think to wait.
 fn adapter(server: &HttpServer) -> OpenAiCompat {
+    with(server, HttpSettings::default().read_timeout)
+}
+
+/// An adapter that gives up on silence after a second, for the test
+/// that waits for it to.
+fn impatient(server: &HttpServer) -> OpenAiCompat {
+    with(server, Duration::from_secs(1))
+}
+
+fn with(server: &HttpServer, read_timeout: Duration) -> OpenAiCompat {
     let config = Config {
         base_url: server.url("/v1"),
         key: Some(Secret::new("sk-test-not-a-key")),
         http: HttpSettings {
-            read_timeout: Duration::from_millis(300),
+            read_timeout,
             direct: true,
             ..HttpSettings::default()
         },
@@ -168,7 +180,7 @@ async fn the_first_tool_call_is_given_before_the_model_has_finished() {
         end: End::Hang,
     };
     let server = HttpServer::start(vec![begun]).await;
-    let adapter = adapter(&server);
+    let adapter = impatient(&server);
     let mut rx = adapter.start(request(&TOOLS)).await.unwrap();
     let first = next_llm(&mut rx).await.unwrap().unwrap();
     assert_eq!(

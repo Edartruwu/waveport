@@ -103,6 +103,30 @@ write is spoken aloud, so answer in one or two short sentences of plain speech, 
 no symbols and no formatting. Use get_time when you are asked the time or the date. When the \
 caller says goodbye or asks to end the call, say goodbye and call end_call.";
 
+/// Where calls are kept when the command line says nothing else: in the
+/// folder the command is run in.
+pub(crate) const JOURNAL: &str = ".waveport/journal.redb";
+
+/// The call to go on with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Resume {
+    /// The one that was last begun with the journal.
+    Last,
+    /// The one whose token this file holds.
+    File(PathBuf),
+}
+
+impl core::str::FromStr for Resume {
+    type Err = core::convert::Infallible;
+
+    fn from_str(said: &str) -> Result<Self, Self::Err> {
+        Ok(match said {
+            "last" => Self::Last,
+            file => Self::File(PathBuf::from(file)),
+        })
+    }
+}
+
 /// Voice agents on this machine.
 #[derive(Debug, Parser)]
 #[command(name = "waveport", version, about, long_about = None)]
@@ -161,6 +185,10 @@ pub(crate) struct Dev {
     /// with no headphones. The agent can then not be spoken over.
     #[arg(long)]
     pub half_duplex: bool,
+    /// Go on with a call that broke off: `last` for the one that was
+    /// last begun here, or a file that holds the token of another.
+    #[arg(long, value_name = "last|FILE", conflicts_with = "no_journal")]
+    pub resume: Option<Resume>,
 }
 
 #[derive(Debug, Args)]
@@ -173,6 +201,10 @@ pub(crate) struct Run {
     /// Where to write what the caller was played, as a WAV file.
     #[arg(long, value_name = "FILE")]
     pub record: Option<PathBuf>,
+    /// Go on with a call that broke off: `last` for the one that was
+    /// last begun here, or a file that holds the token of another.
+    #[arg(long, value_name = "last|FILE", conflicts_with = "no_journal")]
+    pub resume: Option<Resume>,
 }
 
 #[derive(Debug, Args)]
@@ -242,6 +274,29 @@ pub(crate) struct Agent {
         default_value = "target/assets"
     )]
     pub assets: PathBuf,
+
+    /// The file calls are kept in. A call that broke off, with the
+    /// command or with the machine, can be gone on with from it. The
+    /// file holds what was said, and is made its owner's alone.
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "The file calls are kept in, from which one that broke off can be gone on with \
+                [default: .waveport/journal.redb]"
+    )]
+    pub journal: Option<PathBuf>,
+    /// Keep calls in memory only: one that broke off is gone.
+    #[arg(long, conflicts_with = "journal")]
+    pub no_journal: bool,
+    /// How many records of a call are written before all that the call
+    /// has come to is stored in one piece, so that going on with it
+    /// need not read every record.
+    #[arg(long, value_name = "RECORDS", default_value_t = 256)]
+    pub state_every: u64,
+    /// A file for the agent to write notes in. With it the agent has a
+    /// tool that adds a line to the file.
+    #[arg(long, value_name = "FILE")]
+    pub notes: Option<PathBuf>,
 
     /// Who recognises speech.
     #[arg(long, value_name = "PROVIDER", value_enum, default_value = "openai")]
@@ -375,7 +430,9 @@ impl Agent {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, Hears, LLM_URL, Speaks};
+    use std::path::PathBuf;
+
+    use super::{Cli, Command, Hears, LLM_URL, Resume, Speaks};
 
     #[test]
     fn the_command_line_is_one_clap_can_build() {
@@ -505,6 +562,43 @@ mod tests {
             "waveport", "client", "--script", "a.call", "--record", "a.wav",
         ];
         assert!(Cli::try_parse_from(scripted).is_ok());
+    }
+
+    #[test]
+    fn a_call_is_kept_in_a_file_unless_told_otherwise() {
+        let dev = |arguments: &[&str]| {
+            let all = ["waveport", "dev"].iter().chain(arguments).copied();
+            Cli::try_parse_from(all).map(|cli| match cli.command {
+                Command::Dev(dev) => dev,
+                _ => panic!("dev is dev"),
+            })
+        };
+        let told_nothing = dev(&[]).unwrap();
+        assert!(told_nothing.agent.journal.is_none() && !told_nothing.agent.no_journal);
+        assert_eq!(told_nothing.agent.state_every, 256);
+        assert!(told_nothing.resume.is_none() && told_nothing.agent.notes.is_none());
+
+        // The call that was last begun, or the one a file has the token
+        // of. There is nowhere to write a token itself.
+        assert_eq!(
+            dev(&["--resume", "last"]).unwrap().resume,
+            Some(Resume::Last)
+        );
+        assert_eq!(
+            dev(&["--resume", "calls/monday.token"]).unwrap().resume,
+            Some(Resume::File(PathBuf::from("calls/monday.token")))
+        );
+
+        // A call that is kept nowhere cannot be gone on with, and is not
+        // kept in a file as well.
+        assert!(dev(&["--no-journal"]).unwrap().agent.no_journal);
+        assert!(dev(&["--no-journal", "--resume", "last"]).is_err());
+        assert!(dev(&["--no-journal", "--journal", "calls.redb"]).is_err());
+        let run = ["waveport", "run", "--script", "a.call", "--resume", "last"];
+        assert!(Cli::try_parse_from(run).is_ok());
+        // Whoever calls an agent over a WebSocket says which call to go
+        // on with, not the agent.
+        assert!(Cli::try_parse_from(["waveport", "serve", "--resume", "last"]).is_err());
     }
 
     #[test]

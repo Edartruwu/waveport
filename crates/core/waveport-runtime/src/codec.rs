@@ -1,21 +1,28 @@
-//! Kernel facts as journal records, and back.
+//! Kernel facts as journal records, and back; and a kernel's snapshot as
+//! the state a journal stores, and back.
 //!
 //! The kernel knows nothing of how a fact is stored, and the record format
 //! in `waveport-protocol` knows nothing of the kernel. This module is where
 //! the two meet. Every `match` here is exhaustive on purpose: a fact added
 //! to the kernel does not compile until it has a record, and a record
-//! added to the format does not compile until it has a fact.
+//! added to the format does not compile until it has a fact. A snapshot is
+//! taken apart and put together with every one of its values named, for
+//! the same reason.
 
 use core::fmt;
 use std::borrow::Cow;
 
 use bytes::Bytes;
+use waveport_domain::command::LlmCause;
 use waveport_domain::event::CloseReason;
 use waveport_domain::fact::{
     Dismissal, EpochCause, Fact, Lifecycle, NoticeKind, Stamped, ToolOutcome,
 };
 use waveport_domain::ids::{
     AgentId, BatchId, ContextVersion, Epoch, GenId, ParticipantId, Seq, ToolCallId, ToolId, TurnId,
+};
+use waveport_domain::kernel::{
+    BatchView, CallState, CallView, ItemView, Snapshot, SnapshotParts, SpeechHeard,
 };
 use waveport_domain::text::TextArena;
 use waveport_domain::time::{MediaSpan, MediaTime};
@@ -76,22 +83,358 @@ pub fn encode(stamped: &Stamped, text: &TextArena) -> Result<Bytes, CodecError> 
 /// The bytes are not a record, or the record is from a later version of
 /// the format.
 pub fn decode(record: &[u8], text: &mut TextArena) -> Result<Stamped, CodecError> {
-    // The version is looked at first, and alone: a record of a later
-    // version may hold facts this build cannot read at all.
-    #[derive(serde::Deserialize)]
-    struct Versioned {
-        v: u32,
-    }
-    let malformed = |error: serde_json::Error| CodecError::Malformed(error.to_string());
-    let Versioned { v } = serde_json::from_slice(record).map_err(malformed)?;
-    if v > wire::VERSION {
-        return Err(CodecError::Newer { version: v });
-    }
-    let record: wire::Record<'_> = serde_json::from_slice(record).map_err(malformed)?;
+    version_of(record)?;
+    let record: wire::Record<'_> =
+        serde_json::from_slice(record).map_err(|error| CodecError::Malformed(error.to_string()))?;
     Ok(Stamped {
         seq: Seq(record.seq),
         fact: from_wire(&record.fact, text)?,
     })
+}
+
+/// The version a record or a state says it was written in. It is looked
+/// at first, and alone: what a later version wrote may hold what this
+/// build cannot read at all.
+fn version_of(written: &[u8]) -> Result<u32, CodecError> {
+    #[derive(serde::Deserialize)]
+    struct Versioned {
+        v: u32,
+    }
+    let Versioned { v } = serde_json::from_slice(written)
+        .map_err(|error| CodecError::Malformed(error.to_string()))?;
+    if v > wire::VERSION {
+        return Err(CodecError::Newer { version: v });
+    }
+    Ok(v)
+}
+
+/// Writes what a session's facts add up to as the state a journal stores
+/// in their place. `heard_until` is where the last audio ends that a turn
+/// among those facts was spoken in.
+///
+/// # Errors
+///
+/// The state could not be written. That is a fault of this module and not
+/// of the snapshot.
+pub fn encode_state(snapshot: &Snapshot, heard_until: MediaTime) -> Result<Bytes, CodecError> {
+    let state = state_out(&snapshot.parts(), heard_until);
+    serde_json::to_vec(&state)
+        .map(Bytes::from)
+        .map_err(|error| CodecError::Malformed(error.to_string()))
+}
+
+/// Reads a stored state back: the snapshot, and where the last audio ends
+/// that a turn it includes was spoken in.
+///
+/// # Errors
+///
+/// The bytes are not a state, or the state is from a later version of the
+/// format.
+pub fn decode_state(state: &[u8]) -> Result<(Snapshot, MediaTime), CodecError> {
+    version_of(state)?;
+    let state: wire::State<'_> =
+        serde_json::from_slice(state).map_err(|error| CodecError::Malformed(error.to_string()))?;
+    let heard_until = MediaTime::from_ticks(state.heard_until);
+    Ok((Snapshot::from_parts(&state_in(&state)), heard_until))
+}
+
+fn state_out<'a>(parts: &SnapshotParts<'a>, heard_until: MediaTime) -> wire::State<'a> {
+    // Every value by its name, so that one added to a snapshot does not
+    // compile until it is written.
+    let SnapshotParts {
+        epoch,
+        lifecycle,
+        closed_for,
+        front,
+        handoff,
+        next_seq,
+        turn_floor,
+        gen_floor,
+        next_call,
+        next_batch,
+        ref participants,
+        ref calls,
+        ref batches,
+        ref items,
+        owed,
+        answered,
+        speech,
+    } = *parts;
+    wire::State {
+        v: wire::VERSION,
+        upto: next_seq.get().saturating_sub(1),
+        heard_until: heard_until.ticks(),
+        epoch: epoch.get(),
+        lifecycle: lifecycle_out(lifecycle),
+        closed_for: closed_for.map(close_out),
+        front: front.get(),
+        handoff: handoff.map(AgentId::get),
+        turn_floor: turn_floor.get(),
+        gen_floor: gen_floor.get(),
+        next_call: next_call.get(),
+        next_batch: next_batch.get(),
+        participants: participants.iter().map(|who| who.get()).collect(),
+        calls: calls.iter().map(call_out).collect(),
+        batches: batches.iter().map(batch_out).collect(),
+        items: items.iter().map(item_out).collect(),
+        owed: owed.map(|(version, cause)| wire::Owed {
+            version: version.get(),
+            cause: owed_out(cause),
+        }),
+        answered: answered.get(),
+        speech: speech.map(|heard| wire::Speech {
+            generation: heard.generation.get(),
+            agent: heard.agent.get(),
+            heard: Cow::Borrowed(heard.text),
+        }),
+    }
+}
+
+fn state_in<'a>(state: &'a wire::State<'_>) -> SnapshotParts<'a> {
+    let wire::State {
+        v: _,
+        upto,
+        heard_until: _,
+        epoch,
+        lifecycle,
+        closed_for,
+        front,
+        handoff,
+        turn_floor,
+        gen_floor,
+        next_call,
+        next_batch,
+        ref participants,
+        ref calls,
+        ref batches,
+        ref items,
+        owed,
+        answered,
+        ref speech,
+    } = *state;
+    SnapshotParts {
+        epoch: Epoch(epoch),
+        lifecycle: lifecycle_in(lifecycle),
+        closed_for: closed_for.map(close_in),
+        front: AgentId(front),
+        handoff: handoff.map(AgentId),
+        next_seq: Seq(upto.saturating_add(1)),
+        turn_floor: TurnId(turn_floor),
+        gen_floor: GenId(gen_floor),
+        next_call: ToolCallId(next_call),
+        next_batch: BatchId(next_batch),
+        participants: participants.iter().copied().map(ParticipantId).collect(),
+        calls: calls.iter().map(call_in).collect(),
+        batches: batches.iter().map(batch_in).collect(),
+        items: items.iter().map(item_in).collect(),
+        owed: owed.map(|owed| (ContextVersion(owed.version), owed_in(owed.cause))),
+        answered: ContextVersion(answered),
+        speech: speech.as_ref().map(|speech| SpeechHeard {
+            generation: GenId(speech.generation),
+            agent: AgentId(speech.agent),
+            text: &speech.heard,
+        }),
+    }
+}
+
+fn call_out(open: &CallView) -> wire::OpenCall {
+    let CallView {
+        call,
+        tool,
+        batch,
+        by,
+        state,
+        attempt,
+    } = *open;
+    wire::OpenCall {
+        call: call.get(),
+        tool: tool.get(),
+        batch: batch.get(),
+        by: by.get(),
+        state: match state {
+            CallState::Proposed => wire::CallState::Proposed,
+            CallState::Authorized => wire::CallState::Authorized,
+            // A call that is being stopped was sent, and that is all a
+            // journal knows of it.
+            CallState::Dispatched | CallState::Cancelling => wire::CallState::Dispatched,
+        },
+        attempt,
+    }
+}
+
+const fn call_in(open: &wire::OpenCall) -> CallView {
+    let wire::OpenCall {
+        call,
+        tool,
+        batch,
+        by,
+        state,
+        attempt,
+    } = *open;
+    CallView {
+        call: ToolCallId(call),
+        tool: ToolId(tool),
+        batch: BatchId(batch),
+        by: GenId(by),
+        state: match state {
+            wire::CallState::Proposed => CallState::Proposed,
+            wire::CallState::Authorized => CallState::Authorized,
+            wire::CallState::Dispatched => CallState::Dispatched,
+        },
+        attempt,
+    }
+}
+
+fn batch_out(open: &BatchView) -> wire::OpenBatch {
+    let BatchView {
+        batch,
+        by,
+        pending,
+        ran,
+    } = *open;
+    wire::OpenBatch {
+        batch: batch.get(),
+        by: by.get(),
+        pending: u32::try_from(pending).unwrap_or(u32::MAX),
+        ran,
+    }
+}
+
+fn batch_in(open: &wire::OpenBatch) -> BatchView {
+    let wire::OpenBatch {
+        batch,
+        by,
+        pending,
+        ran,
+    } = *open;
+    BatchView {
+        batch: BatchId(batch),
+        by: GenId(by),
+        pending: usize::try_from(pending).unwrap_or(usize::MAX),
+        ran,
+    }
+}
+
+fn item_out<'a>(item: &ItemView<'a>) -> wire::Item<'a> {
+    match *item {
+        ItemView::UserTurn {
+            turn,
+            who,
+            text,
+            addressed,
+        } => wire::Item::UserTurn {
+            turn: turn.get(),
+            who: who.get(),
+            text: Cow::Borrowed(text),
+            addressed,
+        },
+        ItemView::Utterance {
+            generation,
+            agent,
+            text,
+            truncated,
+        } => wire::Item::Utterance {
+            generation: generation.get(),
+            agent: agent.get(),
+            text: Cow::Borrowed(text),
+            truncated,
+        },
+        ItemView::ToolCall {
+            call,
+            tool,
+            generation,
+            args,
+        } => wire::Item::ToolCall {
+            call: call.get(),
+            tool: tool.get(),
+            generation: generation.get(),
+            args: Cow::Borrowed(args),
+        },
+        ItemView::ToolResult {
+            call,
+            outcome,
+            text,
+        } => wire::Item::ToolResult {
+            call: call.get(),
+            outcome: outcome_out(outcome),
+            text: Cow::Borrowed(text),
+        },
+        ItemView::Notice { kind, text } => wire::Item::Notice {
+            about: notice_out(kind),
+            text: Cow::Borrowed(text),
+        },
+    }
+}
+
+fn item_in<'a>(item: &'a wire::Item<'_>) -> ItemView<'a> {
+    match *item {
+        wire::Item::UserTurn {
+            turn,
+            who,
+            ref text,
+            addressed,
+        } => ItemView::UserTurn {
+            turn: TurnId(turn),
+            who: ParticipantId(who),
+            text,
+            addressed,
+        },
+        wire::Item::Utterance {
+            generation,
+            agent,
+            ref text,
+            truncated,
+        } => ItemView::Utterance {
+            generation: GenId(generation),
+            agent: AgentId(agent),
+            text,
+            truncated,
+        },
+        wire::Item::ToolCall {
+            call,
+            tool,
+            generation,
+            ref args,
+        } => ItemView::ToolCall {
+            call: ToolCallId(call),
+            tool: ToolId(tool),
+            generation: GenId(generation),
+            args,
+        },
+        wire::Item::ToolResult {
+            call,
+            outcome,
+            ref text,
+        } => ItemView::ToolResult {
+            call: ToolCallId(call),
+            outcome: outcome_in(outcome),
+            text,
+        },
+        wire::Item::Notice { about, ref text } => ItemView::Notice {
+            kind: notice_in(about),
+            text,
+        },
+    }
+}
+
+const fn owed_out(cause: LlmCause) -> wire::Cause {
+    match cause {
+        LlmCause::Reply { turn } => wire::Cause::Reply { turn: turn.get() },
+        LlmCause::Continuation { batch } => wire::Cause::Continuation { batch: batch.get() },
+        LlmCause::Delegated { call } => wire::Cause::Delegated { call: call.get() },
+    }
+}
+
+const fn owed_in(cause: wire::Cause) -> LlmCause {
+    match cause {
+        wire::Cause::Reply { turn } => LlmCause::Reply { turn: TurnId(turn) },
+        wire::Cause::Continuation { batch } => LlmCause::Continuation {
+            batch: BatchId(batch),
+        },
+        wire::Cause::Delegated { call } => LlmCause::Delegated {
+            call: ToolCallId(call),
+        },
+    }
 }
 
 fn to_wire<'a>(fact: &Fact, text: &'a TextArena) -> wire::Fact<'a> {
@@ -415,7 +758,11 @@ mod tests {
     use waveport_domain::text::TextArena;
     use waveport_domain::time::{MediaSpan, MediaTime};
 
-    use super::{CodecError, decode, encode};
+    use waveport_domain::config::KernelConfig;
+    use waveport_domain::kernel::{CallState, CallView, ItemView, Kernel, Snapshot, SnapshotParts};
+    use waveport_domain::policy::DefaultPolicies;
+
+    use super::{CodecError, decode, decode_state, encode, encode_state};
 
     /// Text that an encoding could get wrong.
     const AWKWARD: &str = "She said \"wait\" \u{2014} then:\n\t¿qué hora es? 🙂 \\ \u{0}";
@@ -628,6 +975,124 @@ mod tests {
             assert_eq!(moved, *fact);
         }
         assert_eq!(seen, [true; KINDS], "a kind of fact is not tried");
+    }
+
+    /// What a session holds after each of `facts` in turn, the first
+    /// being what it holds before any.
+    fn stages(facts: &[Fact], text: &TextArena) -> Vec<Snapshot> {
+        let config = KernelConfig::default();
+        let blank = Kernel::new(config.clone(), DefaultPolicies::default())
+            .unwrap()
+            .snapshot();
+        let stamped: Vec<Stamped> = facts
+            .iter()
+            .zip(1..)
+            .map(|(fact, seq)| Stamped {
+                seq: Seq(seq),
+                fact: *fact,
+            })
+            .collect();
+        (0..=stamped.len())
+            .map(|upto| {
+                Kernel::restore(
+                    config.clone(),
+                    DefaultPolicies::default(),
+                    &blank,
+                    &stamped[..upto],
+                    text,
+                )
+                .unwrap()
+                .snapshot()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_state_comes_back_as_the_snapshot_it_was_written_from() {
+        let mut text = TextArena::default();
+        let facts = every_kind(&mut text);
+        let stages = stages(&facts, &text);
+        assert_eq!(stages.len(), facts.len() + 1);
+        let mut heard = MediaTime::from_ticks(0);
+        for (upto, snapshot) in stages.iter().enumerate() {
+            heard = MediaTime::from_ticks(heard.ticks() + 48_000);
+            let state = encode_state(snapshot, heard).unwrap();
+            // Whatever stores a state may keep it as a line, as a record.
+            let line = core::str::from_utf8(&state).unwrap();
+            assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+            assert!(
+                line.starts_with(&format!("{{\"v\":1,\"upto\":{upto},")),
+                "{line}"
+            );
+
+            let (back, heard_back) = decode_state(&state).unwrap();
+            assert_eq!(&back, snapshot, "after fact {upto}");
+            assert_eq!(heard_back, heard);
+        }
+        // Between them the stages hold something of everything a
+        // snapshot can hold.
+        let some = |holds: fn(&SnapshotParts<'_>) -> bool| {
+            stages.iter().any(|snapshot| holds(&snapshot.parts()))
+        };
+        assert!(some(|parts| !parts.calls.is_empty()));
+        assert!(some(|parts| !parts.batches.is_empty()));
+        assert!(some(|parts| parts.speech.is_some()));
+        assert!(some(|parts| parts.owed.is_some()));
+        assert!(some(|parts| parts.handoff.is_some()));
+        assert!(some(|parts| !parts.participants.is_empty()));
+        assert!(some(|parts| parts.items.len() >= 5));
+    }
+
+    #[test]
+    fn a_state_of_a_later_version_is_refused_by_its_version() {
+        // A later version, with something this build has never heard of
+        // where this build needs something else.
+        let later = br#"{"v":2,"upto":4,"mood":"cheerful"}"#;
+        assert_eq!(
+            decode_state(later).unwrap_err(),
+            CodecError::Newer { version: 2 }
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_state_is_refused() {
+        let mut text = TextArena::default();
+        let facts = every_kind(&mut text);
+        // A session with a call that was sent and a note in its
+        // conversation.
+        let stages = stages(&facts, &text);
+        let busy = stages
+            .iter()
+            .find(|snapshot| {
+                let parts = snapshot.parts();
+                let sent = |call: &CallView| call.state == CallState::Dispatched;
+                let note = |item: &ItemView<'_>| matches!(item, ItemView::Notice { .. });
+                parts.calls.iter().any(sent) && parts.items.iter().any(note)
+            })
+            .unwrap();
+        let whole = encode_state(busy, MediaTime::from_ticks(9)).unwrap();
+        let whole = core::str::from_utf8(&whole).unwrap();
+        let cases = [
+            String::new(),
+            "not json".to_owned(),
+            // No version, and a record where a state belongs.
+            whole.replacen("\"v\":1,", "", 1),
+            r#"{"v":1,"seq":4,"fact":{"kind":"tool_authorized","call":9}}"#.to_owned(),
+            // Cut short.
+            whole[..whole.len() / 2].to_owned(),
+            // An item of a kind nobody knows.
+            whole.replacen("\"kind\":\"notice\"", "\"kind\":\"aside\"", 1),
+            // A call in a state a journal never holds.
+            whole.replacen("\"state\":\"dispatched\"", "\"state\":\"cancelling\"", 1),
+        ];
+        for case in cases {
+            assert_ne!(case, whole, "the case changes nothing");
+            let refused = decode_state(case.as_bytes());
+            assert!(
+                matches!(refused, Err(CodecError::Malformed(_))),
+                "{case}: {refused:?}"
+            );
+        }
     }
 
     #[test]

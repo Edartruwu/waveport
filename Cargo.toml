@@ -91,6 +91,7 @@ waveport-ports = { path = "crates/core/waveport-ports", version = "0.1.0" }
 waveport-protocol = { path = "crates/core/waveport-protocol", version = "0.1.0" }
 waveport-runtime = { path = "crates/core/waveport-runtime", version = "0.1.0" }
 waveport-sim = { path = "crates/testing/waveport-sim", version = "0.1.0" }
+waveport-store-journal = { path = "crates/adapters/store/journal", version = "0.1.0" }
 waveport-store-memory = { path = "crates/adapters/store/memory", version = "0.1.0" }
 waveport-stt-assemblyai = { path = "crates/adapters/stt/assemblyai", version = "0.1.0" }
 waveport-stt-deepgram = { path = "crates/adapters/stt/deepgram", version = "0.1.0" }
@@ -106,6 +107,8 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", default-features = false }
 cpal = "0.18.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+# The entropy of the operating system, for a token nobody can guess.
+getrandom = "0.4.3"
 # The time where the machine is, for a tool that tells it. The time zones
 # are the system's own, and on Windows, which has none of that kind, they
 # come with the crate.
@@ -115,6 +118,11 @@ opus = "0.4.0"
 # ONNX Runtime is loaded from a file when the program starts, not linked in:
 # no library is downloaded while building, and none is built.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["api-31", "load-dynamic", "std"] }
+# The journal's file: a store that commits a whole group of records with
+# one sync, and comes back whole after a crash. 4.6.0 mends a repair that
+# could open a damaged file as an empty one. It was published on 13
+# November 2026, and is to be moved to when it is a week old.
+redb = { version = "4.5.0", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider"] }
 rtrb = "0.4.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

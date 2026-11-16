@@ -40,7 +40,10 @@ impl Calls {
 /// Takes calls until it is told to stop, or has taken as many as it was
 /// told to.
 pub(crate) async fn serve(args: Serve) -> Result<Outcome, Failure> {
-    let stack = Stack::build(&args.agent).await?;
+    let stack = Stack::build(&args.agent, false).await?;
+    for note in &stack.notes {
+        println!("note: {note}");
+    }
     let listener = Listener::bind(args.listen, args.exposed)
         .await
         .map_err(|error| Failure(format!("{error} (--exposed allows it)")))?;
@@ -120,7 +123,11 @@ async fn one(calls: Arc<Calls>, knock: Knock) -> Option<Outcome> {
         far_end.say(line.clone());
         let _ = lines.send(line);
     });
-    let call = match calls.stack.start(id, Box::new(transport), tell).await {
+    let call = match calls
+        .stack
+        .start(id, Box::new(transport), tell, false)
+        .await
+    {
         Ok(call) => call,
         Err(Failure(failure)) => {
             eprintln!("waveport: {failure}");
@@ -144,5 +151,6 @@ async fn one(calls: Arc<Calls>, knock: Knock) -> Option<Outcome> {
         println!("[{number}] {line}");
     }
     calls.live().retain(|live| *live != id);
+    calls.stack.settle(id, &exit, None).await;
     Some(call::outcome(&exit))
 }
