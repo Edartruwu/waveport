@@ -293,6 +293,8 @@ cargo xtask perf check             # measures the same way, and holds the machin
 
 `--cpu` keeps the measurement on one processor, with `taskset`, and is worth using on a machine whose cores are not alike: the numbers then repeat to about 1%. A check that fails measures again, up to three times, because whatever else a machine does can only make a measurement worse.
 
+The runtime does not pin the threads of its shards ([decision 0003](docs/decisions/0003-shard-pinning.md) says when it will). On a machine whose cores are not alike, the `waveport` command is kept on the fast ones the same way, from outside: `taskset -c 0-11 waveport dev` on a processor whose performance cores are numbered 0 to 11. An Intel processor of that kind lists them in `/sys/devices/cpu_core/cpus`.
+
 The same machine is not always the same machine. A laptop takes nearly twice as long over the same work when it is on its battery, warm, or busy, and then over a session too. So a record says how long the reference work took, and a check refuses a machine that takes a tenth longer or shorter over it now: bring the machine back to that state, or make a new record. Record with the machine as it is when it is left alone. The record is named after the machine's processor and says nothing else of the machine. Make a new record in the pull request that changes what a session costs, and say why it changed.
 
 The share of every night is measured three times, on three runners, and each measurement says in its summary which processor it ran on and what it measured. Runners are not alike, so when a measurement fails, read the three together before anything is changed:
