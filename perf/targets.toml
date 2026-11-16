@@ -1,0 +1,94 @@
+# What the performance gates hold the code to.
+#
+# A `target` is what the design asks for: the table in section 12 of
+# docs/architecture.md. A number that is `held` is what the code does
+# today, and the gate fails a change that does worse. So a change that is
+# meant to cost something says so here, in the same pull request, where a
+# reviewer sees the line. A number that is held is never looser than its
+# target; a test checks that.
+#
+# Who reads this file:
+#   benches/tests/latency.rs   [latency], on every pull request
+#   benches/tests/memory.rs    [memory] and [soak], on every pull request
+#   benches/tests/load.rs      [density], every night
+#   cargo xtask perf           [local], by hand, on one machine
+
+# How long the parts of a turn take in the session's own time, in
+# milliseconds, when every provider answers at once: what is left is this
+# project's share. It is measured on a clock the test controls, so it is
+# the same on every machine and every run, and it counts waiting, not
+# work: a part that waits for a tick shows here, and one that computes for
+# longer shows in the instruction counts.
+[latency]
+# End of the turn to the first frame of the answer handed to the transport.
+answering = { target_p50_ms = 5.0, target_p99_ms = 15.0, held_p50_ms = 0.0, held_p99_ms = 0.0 }
+# The model's first word to the first text given to speech synthesis.
+phrasing = { target_p50_ms = 0.2, target_p99_ms = 1.0, held_p50_ms = 0.0, held_p99_ms = 0.0 }
+# The first audio from speech synthesis to the first frame handed over.
+sending = { target_p50_ms = 2.0, target_p99_ms = 10.0, held_p50_ms = 0.0, held_p99_ms = 0.0 }
+# A caller begins to speak over the agent, to the agent being lowered.
+ducking = { target_p50_ms = 100.0, target_p99_ms = 150.0, held_p50_ms = 60.0, held_p99_ms = 60.0 }
+# The agent is stopped, to the last frame of it handed to the transport.
+stopping = { target_p50_ms = 10.0, target_p99_ms = 30.0, held_p50_ms = 0.0, held_p99_ms = 0.0 }
+
+# What one session holds on the Rust heap, in kilobytes, on a line that
+# carries plain samples at 48 kHz and on one that carries Opus. What
+# libopus keeps for itself is not in it.
+[memory]
+idle = { target_p50_kb = 300, target_p99_kb = 600, held_pcm_kb = 600, held_opus_kb = 540 }
+active = { target_p50_kb = 1500, target_p99_kb = 4000, held_pcm_kb = 612, held_opus_kb = 552 }
+
+# How much of one thread a session takes: fifty calls at once on one shard
+# of the runtime, in real time, on lines that carry Opus, with an agent
+# that speaks a little under half the time. The models that listen are
+# stand-ins here; what the real ones cost is in
+# docs/decisions/0001-density-spike.md.
+[density]
+# The session's share of its shard's thread, divided by what encoding and
+# decoding a second of Opus takes on the same machine in the same run.
+# That takes the speed of the processor out of the number, and not
+# everything else about a machine: it was 0.73 on a runner of GitHub's
+# and 0.92 on one core of a laptop, where work that comes in short bursts
+# is slower than work that runs on. So the number held here is the
+# runner's own, and it holds the runner. It is from two runs so far,
+# which gave 0.73 and 0.75.
+held_ratio = 0.73
+# How much over what is held a run may be, as a share of it: runners
+# differ, and the same runner differs from night to night.
+tolerance = 0.25
+
+# What `cargo xtask perf check` holds a machine to, against its own
+# record in perf/baselines.
+[local]
+# How much worse than its record a number may be, as a share of it. On
+# one processor of the machine this was written on (`perf record --cpu`)
+# the share of a thread moves by about 1% from run to run.
+#
+# It is also how much longer or shorter the reference work may take than
+# it took when the record was made. Past that the machine is not in the
+# state it was recorded in, and a check refuses to compare: the same
+# laptop took 1.8 times as long over everything earlier on the day of
+# its record.
+tolerance = 0.10
+# The numbers that are held to their record. Less is better for each.
+# How long a session takes to start is not among them: it is a fraction
+# of a millisecond and moves by a third from one run to the next. It is
+# held to its target below, which is ten times what is measured.
+held = ["density.share_percent", "density.ratio"]
+
+# The numbers that are held to a target of the design, whatever the
+# record says. A session starts in 2 ms, and 99 in a hundred in 10 ms.
+# And the parts of a turn, in real time and by the marks the sessions
+# make, while fifty sessions share a shard and the providers answer at
+# once: the same three parts that [latency] holds on a clock the test
+# controls. There they are a wait that is not there; here they are the
+# time a session takes to be run.
+[local.targets]
+"start.p50_ms" = 2.0
+"start.p99_ms" = 10.0
+"turn.answering.p50_ms" = 5.0
+"turn.answering.p99_ms" = 15.0
+"turn.phrasing.p50_ms" = 0.2
+"turn.phrasing.p99_ms" = 1.0
+"turn.sending.p50_ms" = 2.0
+"turn.sending.p99_ms" = 10.0

@@ -13,6 +13,7 @@ use waveport_models_onnx::{Runtime as Models, SileroVad, SmartTurn, TURN_MODEL, 
 use waveport_ports::control::{SessionControl, SessionInput};
 use waveport_ports::journal::SessionId;
 use waveport_ports::stt::Stt;
+use waveport_ports::telemetry::EventSink;
 use waveport_ports::transport::Transport;
 use waveport_ports::tts::Tts;
 use waveport_runtime::compute::Compute;
@@ -22,6 +23,7 @@ use waveport_runtime::tools::Registry;
 use waveport_stt_assemblyai::AssemblyAiStt;
 use waveport_stt_deepgram::DeepgramStt;
 use waveport_stt_openai::OpenAiStt;
+use waveport_telemetry_otel::{Config as OtelConfig, Otel};
 use waveport_transport_local_audio::{Health, LocalAudio};
 use waveport_tts_cartesia::CartesiaTts;
 use waveport_tts_elevenlabs::ElevenLabsTts;
@@ -30,6 +32,7 @@ use crate::args::{Agent, Chosen, Hears, INSTRUCTIONS, LLM_URL, Resume, Speaks};
 use crate::halt::Halt;
 use crate::kept::Kept;
 use crate::report::{Reporter, Tell};
+use crate::summary::Summary;
 use crate::tools::Notes;
 use crate::{Context, Failure, tools};
 
@@ -175,6 +178,11 @@ pub(crate) struct Stack {
     language: String,
     greeting: Option<String>,
     states: StateRule,
+    /// What the tools are called, in the kernel's order.
+    names: Vec<String>,
+    /// What sends traces and metrics to a collector, and where the
+    /// collector is.
+    otel: Option<(Arc<Otel>, String)>,
 }
 
 /// A call that has begun.
@@ -260,6 +268,20 @@ impl Stack {
             halt: halt.in_tool(),
         });
         tools::add(&mut registry, sessions, takes_notes);
+        let names: Vec<String> = registry.defs().into_iter().map(|def| def.name).collect();
+        let otel = match &agent.otlp {
+            Some(url) => {
+                let config = OtelConfig {
+                    tools: names.clone(),
+                    ..OtelConfig::new(url)
+                };
+                let otel = Otel::new(config)
+                    .with(|| "traces and metrics cannot be sent as --otlp says".to_owned())?;
+                notes.push(format!("traces and metrics of the calls go to {url}"));
+                Some((Arc::new(otel), url.clone()))
+            }
+            None => None,
+        };
         Ok(Self {
             runtime,
             stt,
@@ -276,7 +298,39 @@ impl Stack {
                 records: agent.state_every.max(1),
                 ..StateRule::default()
             },
+            names,
+            otel,
         })
+    }
+
+    /// Something to follow one call with, and say afterwards what it
+    /// came to.
+    pub(crate) fn summary(&self) -> Arc<Summary> {
+        Arc::new(Summary::new(self.names.clone()))
+    }
+
+    /// Sends what is still to be sent of the traces and the metrics, and
+    /// says so if any of them did not reach the collector. For the end
+    /// of the command.
+    pub(crate) async fn finish(&self) {
+        let Some((otel, url)) = &self.otel else {
+            return;
+        };
+        let stopping = Arc::clone(otel);
+        // It waits for the collector, which a thread that runs calls
+        // does not do.
+        let sent = tokio::task::spawn_blocking(move || stopping.shutdown()).await;
+        let Ok(sent) = sent else {
+            eprintln!("waveport: the traces and the metrics could not be sent to {url}");
+            return;
+        };
+        if sent.lost_any() {
+            let why = sent.error.as_deref().unwrap_or("nobody said why");
+            eprintln!(
+                "waveport: {} spans and the metrics, {} times, did not reach {url}: {why}",
+                sent.spans_lost, sent.metrics_lost
+            );
+        }
     }
 
     /// Begins a call called `id` over `transport`, or goes on with it if
@@ -288,12 +342,22 @@ impl Stack {
         transport: Box<dyn Transport>,
         tell: Tell,
         resumed: bool,
+        summary: Option<Arc<Summary>>,
     ) -> Result<Call, Failure> {
         let mut spec = SessionSpec::new(id, &self.instructions);
         spec.language = Some(self.language.clone());
         spec.states = self.states;
         self.tools.offer(&mut spec);
         let names = spec.tools.iter().map(|tool| tool.name.clone()).collect();
+        // The call is told on the terminal, and to whoever else was
+        // asked for.
+        let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(Reporter::new(tell, names))];
+        if let Some((otel, _)) = &self.otel {
+            sinks.push(Arc::clone(otel) as Arc<dyn EventSink>);
+        }
+        if let Some(summary) = summary {
+            sinks.push(summary);
+        }
         let parts = Parts {
             transport,
             stt: self.stt.clone(),
@@ -302,7 +366,7 @@ impl Stack {
             tools: self.tools.clone(),
             journal: self.kept.journal(),
             compute: Arc::clone(&self.compute),
-            sink: Some(Arc::new(Reporter::new(tell, names))),
+            sink: Some(Arc::new(sinks)),
         };
         let started = self
             .runtime
@@ -388,6 +452,7 @@ pub(crate) async fn run(
     agent: &Agent,
     transport: LocalAudio,
     resume: Option<&Resume>,
+    report: Option<&Path>,
 ) -> Result<Outcome, Failure> {
     let health = transport.health();
     let stack = Stack::build(agent, resume.is_some()).await?;
@@ -400,15 +465,17 @@ pub(crate) async fn run(
         // Nobody reads any more when the command is on its way out.
         let _ = lines.send(line);
     });
+    let summary = report.map(|_| stack.summary());
+    let resumed = resume.is_some();
     let call = stack
-        .start(id, Box::new(transport), tell, resume.is_some())
+        .start(id, Box::new(transport), tell, resumed, summary.clone())
         .await?;
     for note in &call.notes {
         println!("note: {note}");
     }
     println!("{}", call.begins());
 
-    let id = call.id;
+    let (id, rebuilt) = (call.id, call.rebuilt);
     let exit = call.exit();
     tokio::pin!(exit);
     let mut asked_to_end = false;
@@ -429,6 +496,14 @@ pub(crate) async fn run(
     }
     tell_health(&health);
     stack.settle(id, &exit, Some("--resume last")).await;
+    if let (Some(file), Some(summary)) = (report, summary) {
+        let mut written = summary.report(id, rebuilt, &exit).to_string();
+        written.push('\n');
+        std::fs::write(file, written)
+            .with(|| format!("the report cannot be written to {}", file.display()))?;
+        println!("the report of the call is in {}", file.display());
+    }
+    stack.finish().await;
     Ok(outcome(&exit))
 }
 

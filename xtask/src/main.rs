@@ -15,6 +15,7 @@ mod error;
 mod git;
 mod lint_sync;
 mod meta;
+mod perf;
 mod report;
 #[cfg(test)]
 mod secrets;
@@ -37,6 +38,16 @@ Gates:
   semver         Check for breaking API changes:
                  --self-test | --baseline-rev <rev> [--title <title> | --title-env <VARIABLE>]
   bench-ir       Run instruction-count benchmarks: [--base <rev>]
+
+Measurements of this machine:
+  perf record    Measure what a session takes of a thread, how long one
+                 takes to start and how long the parts of a turn take, and
+                 record it in perf/baselines:
+                 [--host <name>] names the machine, otherwise its processor does
+                 [--cpu <n>] keeps the measurement on one processor (Linux)
+  perf check     Measure again, the way the record was made, and hold the
+                 machine to its record and to the targets in
+                 perf/targets.toml: [--host <name>]
 
 Setup:
   fetch-assets   Download the model files pinned in assets/assets.lock.toml
@@ -72,6 +83,7 @@ fn run(args: &[String]) -> Result<bool> {
         "check-title" => title::run(rest),
         "semver" => semver::run(rest),
         "bench-ir" => bench::run(rest),
+        "perf" => perf::run(rest),
         "fetch-assets" => assets::run(rest),
         "ci" => ci::run(rest),
         "help" | "--help" | "-h" => {

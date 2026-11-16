@@ -189,6 +189,11 @@ pub(crate) struct Dev {
     /// last begun here, or a file that holds the token of another.
     #[arg(long, value_name = "last|FILE", conflicts_with = "no_journal")]
     pub resume: Option<Resume>,
+    /// Write what the call came to, in numbers, to this file when it is
+    /// over: each turn, and how long each part of the answer to it
+    /// took. No word of the call is in it.
+    #[arg(long, value_name = "FILE")]
+    pub report: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -205,6 +210,11 @@ pub(crate) struct Run {
     /// last begun here, or a file that holds the token of another.
     #[arg(long, value_name = "last|FILE", conflicts_with = "no_journal")]
     pub resume: Option<Resume>,
+    /// Write what the call came to, in numbers, to this file when it is
+    /// over: each turn, and how long each part of the answer to it
+    /// took. No word of the call is in it.
+    #[arg(long, value_name = "FILE")]
+    pub report: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -297,6 +307,13 @@ pub(crate) struct Agent {
     /// tool that adds a line to the file.
     #[arg(long, value_name = "FILE")]
     pub notes: Option<PathBuf>,
+    /// Send traces and metrics of the calls to the OpenTelemetry
+    /// collector at this address, as OTLP over HTTP:
+    /// `http://localhost:4318` for one on this machine. No word of a
+    /// call is sent. The headers a collector wants, a key among them,
+    /// are read from `OTEL_EXPORTER_OTLP_HEADERS`.
+    #[arg(long, value_name = "URL")]
+    pub otlp: Option<String>,
 
     /// Who recognises speech.
     #[arg(long, value_name = "PROVIDER", value_enum, default_value = "openai")]

@@ -96,6 +96,7 @@ waveport-store-memory = { path = "crates/adapters/store/memory", version = "0.1.
 waveport-stt-assemblyai = { path = "crates/adapters/stt/assemblyai", version = "0.1.0" }
 waveport-stt-deepgram = { path = "crates/adapters/stt/deepgram", version = "0.1.0" }
 waveport-stt-openai = { path = "crates/adapters/stt/openai", version = "0.1.0" }
+waveport-telemetry-otel = { path = "crates/adapters/telemetry/otel", version = "0.1.0" }
 waveport-testkit = { path = "crates/testing/waveport-testkit", version = "0.1.0" }
 waveport-transport-local-audio = { path = "crates/adapters/transport/local-audio", version = "0.1.0" }
 waveport-transport-websocket = { path = "crates/adapters/transport/websocket", version = "0.1.0" }
@@ -114,10 +115,19 @@ getrandom = "0.4.3"
 # come with the crate.
 jiff = { version = "0.2.41", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
 loom = { version = "0.7.3", features = ["futures"] }
+# Traces and metrics, sent as OTLP over HTTP: no gRPC, and nothing to
+# generate while building. The exporter has a thread of its own, which is
+# why it wants an HTTP client that blocks.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "metrics", "reqwest-blocking-client", "trace"] }
+# What a collector is sent, for the tests that stand in for one.
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "metrics", "trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "trace"] }
 opus = "0.4.0"
 # ONNX Runtime is loaded from a file when the program starts, not linked in:
 # no library is downloaded while building, and none is built.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["api-31", "load-dynamic", "std"] }
+prost = { version = "0.14.4", default-features = false }
 # The journal's file: a store that commits a whole group of records with
 # one sync, and comes back whole after a crash. 4.6.0 mends a repair that
 # could open a damaged file as an empty one. It was published on 13

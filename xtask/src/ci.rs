@@ -434,6 +434,11 @@ mod tests {
                 "cargo test --release --locked -p waveport-store-journal --test power",
                 "WAVEPORT_SIM_SEEDS=",
                 "cargo test --release --locked -p waveport-domain --test model -- --include-ignored",
+                "cargo test --release --locked -p waveport-benches --test memory -- --ignored",
+                "cargo test --release --locked -p waveport-benches --test load -- --ignored --nocapture --test-threads 1",
+                // Without this the measurement is printed and held to
+                // nothing.
+                "WAVEPORT_PERF_GATE:",
             ],
         );
     }

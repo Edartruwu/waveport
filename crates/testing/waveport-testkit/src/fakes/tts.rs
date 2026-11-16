@@ -41,6 +41,9 @@ pub struct TtsScript {
     pub fail_open: Option<PortError>,
     /// After this many pieces of audio a stream fails with this.
     pub fail_after: Option<(usize, PortError)>,
+    /// Whether it keeps no record of what it was given to say: for a run
+    /// so long that the record would be most of what the run holds.
+    pub forgets: bool,
 }
 
 impl Default for TtsScript {
@@ -59,6 +62,7 @@ impl Default for TtsScript {
             unmarked: None,
             fail_open: None,
             fail_after: None,
+            forgets: false,
         }
     }
 }
@@ -115,11 +119,11 @@ impl Tts for ScriptedTts {
                     config.rate.hz()
                 )));
             }
-            let stream = {
+            let stream = (!self.script.forgets).then(|| {
                 let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
                 log.spoken.push(Vec::new());
                 log.spoken.len() - 1
-            };
+            });
             let script = Arc::clone(&self.script);
             let log = Arc::clone(&self.log);
             let (tx, rx) = stream::pair(64, |mut commands, events| async move {
@@ -135,11 +139,12 @@ impl Tts for ScriptedTts {
                 while let Some(command) = commands.next().await {
                     match command {
                         Command::Speak(text) => {
-                            if let Some(pieces) = log
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .spoken
-                                .get_mut(stream)
+                            if let Some(stream) = stream
+                                && let Some(pieces) = log
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .spoken
+                                    .get_mut(stream)
                             {
                                 pieces.push(text.clone());
                             }
@@ -267,7 +272,7 @@ impl Voice {
                 .wait
                 .replace(Duration::from_millis(u64::from(making)))
                 .unwrap_or(self.script.first);
-            tokio::time::sleep(wait).await;
+            super::pause(wait).await;
             // The marks that fall in this piece come before it.
             while let Some((text_end, at)) = marks.next_if(|(_, at)| *at <= done + now) {
                 let mark = TtsMark {

@@ -970,6 +970,9 @@ impl<P: Policies> Session<P> {
                 Stage::TranscriptFinal(turn.turn),
             );
         }
+        if let Event::Durable(upto) = event {
+            mark(self.sink.as_ref(), self.id, now, Stage::Stored(*upto));
+        }
 
         let mut out = core::mem::take(&mut self.out);
         self.kernel.step(now, event, &mut out);
@@ -1019,6 +1022,12 @@ impl<P: Policies> Session<P> {
                 let mind = Mind::start(tag, asking, Arc::clone(&self.llm), Arc::clone(&self.defs));
                 self.minds.retain(|mind| mind.tag != tag);
                 self.minds.push(mind);
+                mark(
+                    self.sink.as_ref(),
+                    self.id,
+                    now,
+                    Stage::Asked(tag.generation),
+                );
             }
             Command::Llm(tag, LlmCmd::Pause) => {
                 if let Some(mind) = self.minds.iter_mut().find(|mind| mind.tag == tag) {
@@ -1033,7 +1042,10 @@ impl<P: Policies> Session<P> {
             // Dropping the stream is all there is to cancelling it.
             Command::Llm(tag, LlmCmd::Cancel) => self.minds.retain(|mind| mind.tag != tag),
             Command::Tts(tag, TtsCmd::Speak { text: piece }) => {
-                self.voice.speak(tag, text.get(piece));
+                if self.voice.speak(tag, text.get(piece)) {
+                    let stage = Stage::FirstText(tag.generation);
+                    mark(self.sink.as_ref(), self.id, now, stage);
+                }
             }
             Command::Tts(tag, TtsCmd::Finish) => self.voice.finish(tag),
             Command::Tts(tag, TtsCmd::Cancel) => self.voice.cancel(tag),

@@ -150,6 +150,9 @@ pub struct ScriptedLlm {
     pub first: Duration,
     /// How long it takes over each piece after the first.
     pub each: Duration,
+    /// Whether it keeps no record of what it was asked: for a run so
+    /// long that the record would be most of what the run holds.
+    pub forgets: bool,
     respond: Arc<Respond>,
     asked: Arc<Mutex<Vec<Asked>>>,
 }
@@ -173,6 +176,7 @@ impl ScriptedLlm {
             },
             first: Duration::from_millis(200),
             each: Duration::from_millis(20),
+            forgets: false,
             respond: Arc::new(respond),
             asked: Arc::default(),
         }
@@ -228,10 +232,12 @@ impl Llm for ScriptedLlm {
             max_output_tokens: request.max_output_tokens,
         };
         let steps = (self.respond)(&asked);
-        self.asked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(asked);
+        if !self.forgets {
+            self.asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(asked);
+        }
         let (first, each) = (self.first, self.each);
         Box::pin(async move {
             let rx = stream::events(move |mut events| async move {
@@ -242,7 +248,7 @@ impl Llm for ScriptedLlm {
                     let finish = match step {
                         LlmStep::Say(text) => {
                             for word in text.split_inclusive(' ') {
-                                tokio::time::sleep(core::mem::replace(&mut wait, each)).await;
+                                super::pause(core::mem::replace(&mut wait, each)).await;
                                 written += 1;
                                 let text = word.to_owned();
                                 events.send(LlmEvent::Delta { text }).await;
@@ -250,13 +256,13 @@ impl Llm for ScriptedLlm {
                             continue;
                         }
                         LlmStep::Delta(text) => {
-                            tokio::time::sleep(core::mem::replace(&mut wait, each)).await;
+                            super::pause(core::mem::replace(&mut wait, each)).await;
                             written += 1;
                             events.send(LlmEvent::Delta { text }).await;
                             continue;
                         }
                         LlmStep::Call { tool, args } => {
-                            tokio::time::sleep(core::mem::replace(&mut wait, each)).await;
+                            super::pause(core::mem::replace(&mut wait, each)).await;
                             called = true;
                             events.send(LlmEvent::ToolCall { tool, args }).await;
                             continue;
@@ -271,7 +277,7 @@ impl Llm for ScriptedLlm {
                     events.send(done(finish, written)).await;
                     return Ok(());
                 }
-                tokio::time::sleep(wait).await;
+                super::pause(wait).await;
                 let finish = if called {
                     Finish::ToolCalls
                 } else {

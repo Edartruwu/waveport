@@ -177,7 +177,7 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-domain --test simulat
 WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay
 ```
 
-**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile, 1,000 of the runtime per story and profile and 20,000 power cuts in the middle of a commit of the journal (see below), other ones each night, and the larger sessions of `tests/model.rs`. The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
+**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile, 1,000 of the runtime per story and profile and 20,000 power cuts in the middle of a commit of the journal (see below), other ones each night, and the larger sessions of `tests/model.rs`. It also runs a thousand calls of a minute each on the session actor, which have to give back every byte they took, and measures how much of a thread a session takes (see "Performance gates" below). The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
 
 **Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps and of rebuilding a session from its journal, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
 
@@ -265,9 +265,39 @@ The journal has one of each. `ir_journal` counts what a record costs the session
 cargo bench -p waveport-benches --bench wall_journal
 ```
 
+## Performance gates
+
+`perf/targets.toml` holds what the code is held to. A number there is either a target of the design (section 12 of the architecture) or what the code does today, and a number that is held is never looser than its target. A change that does worse than today fails. If the cost is meant, change the number in the same pull request, where a reviewer sees it; if a change does better, lower the number, so that the next change is held to the better one.
+
+Three kinds of test read the file, all in the `benches` package, and all run whole calls on the real session actor with a stand-in in every port (`benches/src/calls.rs`).
+
+- `tests/latency.rs`, in every test run: how long the parts of a turn take on a clock the test controls. Such a clock counts waiting and not work, so these numbers are the same on every machine.
+- `tests/memory.rs`, in every test run: what a session holds on the heap when it listens and when it speaks, and that nothing is left of sessions that are over. A session that holds much less than the file says fails too: say the good news in the file. The thousand calls of every night are the test in it that is ignored:
+
+  ```sh
+  cargo test --release -p waveport-benches --test memory -- --ignored
+  ```
+
+- `tests/load.rs`, every night and by hand: fifty calls on one shard of the runtime in real time. It prints how much of its thread a session takes, how long a session takes to start and how long the parts of a turn take.
+
+  ```sh
+  cargo test --release -p waveport-benches --test load -- --ignored --nocapture --test-threads 1
+  ```
+
+A time is a number about a machine, so two things are done with what `tests/load.rs` prints. Every night, on a shared runner, the share of a thread is divided by what a piece of reference work takes in the same run, and that ratio is held to `[density]` in the file. And on a machine that is left alone, the numbers themselves are recorded and checked:
+
+```sh
+cargo xtask perf record --cpu 6    # writes perf/baselines/<processor>.toml
+cargo xtask perf check             # measures the same way, and holds the machine to its record
+```
+
+`--cpu` keeps the measurement on one processor, with `taskset`, and is worth using on a machine whose cores are not alike: the numbers then repeat to about 1%. A check that fails measures again, up to three times, because whatever else a machine does can only make a measurement worse.
+
+The same machine is not always the same machine. A laptop takes nearly twice as long over the same work when it is on its battery, warm, or busy, and then over a session too. So a record says how long the reference work took, and a check refuses a machine that takes a tenth longer or shorter over it now: bring the machine back to that state, or make a new record. Record with the machine as it is when it is left alone. The record is named after the machine's processor and says nothing else of the machine. Make a new record in the pull request that changes what a session costs, and say why it changed.
+
 ## Spikes
 
-`spikes/` holds throwaway experiments that answer a question before product code depends on the answer. Each is its own Cargo workspace with its own lockfile, so it can use dependencies the product workspace would reject, and none of the gates build it. A spike's conclusions are written up under `docs/decisions/` and its raw numbers under `perf/`; the code is deleted once the product has its own benchmark for the same question.
+`spikes/` holds throwaway experiments that answer a question before product code depends on the answer. Each is its own Cargo workspace with its own lockfile, so it can use dependencies the product workspace would reject, and none of the gates build it. A spike's conclusions are written up under `docs/decisions/` and its raw numbers under `perf/`; the code is deleted once the product has its own benchmark for the same question. There is none at the moment: the density spike was deleted when `cargo xtask perf` could measure the runtime itself, and its record is [decision 0001](docs/decisions/0001-density-spike.md).
 
 ## Pull requests
 
