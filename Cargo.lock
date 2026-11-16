@@ -2404,10 +2404,14 @@ dependencies = [
  "waveport-ports",
  "waveport-runtime",
  "waveport-store-memory",
+ "waveport-stt-assemblyai",
+ "waveport-stt-deepgram",
  "waveport-stt-openai",
  "waveport-testkit",
  "waveport-transport-local-audio",
+ "waveport-transport-websocket",
  "waveport-tts-cartesia",
+ "waveport-tts-elevenlabs",
 ]
 
 [[package]]
@@ -2513,6 +2517,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "waveport-stt-assemblyai"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
+name = "waveport-stt-deepgram"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
 name = "waveport-stt-openai"
 version = "0.1.0"
 dependencies = [
@@ -2556,7 +2588,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "waveport-transport-websocket"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+]
+
+[[package]]
 name = "waveport-tts-cartesia"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
+name = "waveport-tts-elevenlabs"
 version = "0.1.0"
 dependencies = [
  "serde",

@@ -42,6 +42,21 @@ pub trait Transport: Send + 'static {
     ///
     /// [`Full`]: the transport is behind. The request was not taken.
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full>;
+
+    /// Tells the far end that the session is over, in whatever way the
+    /// transport has for that: a goodbye, a call that is hung up. `Ready`
+    /// means that it is said, or that nobody is left to say it to.
+    ///
+    /// It is asked for when a session has closed, and until it is ready
+    /// or the session will not wait any longer. Nothing is sent after
+    /// it. A session that has lost its journal does not ask: whoever has
+    /// the session now may still be talking to the far end.
+    ///
+    /// A transport with nothing to say need not have this at all.
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let _ = cx;
+        Poll::Ready(())
+    }
 }
 
 /// Something that happened on a transport.

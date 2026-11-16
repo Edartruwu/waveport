@@ -16,6 +16,7 @@
 //! When opening it again has failed too many times in a row the session
 //! is told to close, because a session that cannot hear is of no use.
 
+use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use waveport_media::resample::Resampler;
 use waveport_ports::audio::{AudioRef, Rate};
 use waveport_ports::error::{BoxFuture, PortError};
 use waveport_ports::plan::ListenPlan;
-use waveport_ports::stt::{Stt, SttConfig, SttEvent, SttStream};
+use waveport_ports::stt::{Stt, SttConfig, SttEvent, SttRx, SttStream};
 
 use crate::compute::{Listener, Sensed};
 use crate::edges::{EdgeConfig, Edges};
@@ -179,6 +180,23 @@ impl Ear {
     /// What went wrong so far.
     pub(crate) const fn stats(&self) -> HearStats {
         self.stats
+    }
+
+    /// Stops listening to the participant. Returns what went wrong
+    /// while they were heard, and what is left of their recogniser: the
+    /// half of its stream that is read, with the half that sends dropped.
+    /// A recogniser is told that way that no more audio follows, and one
+    /// that is then read to its end has been let go of in good order. One
+    /// that is dropped where it stands only has its connection cut.
+    pub(crate) fn leave(self) -> (HearStats, Option<Pin<Box<dyn SttRx>>>) {
+        let left = match self.recogniser {
+            Recogniser::Open(SttStream { tx, rx }) => {
+                drop(tx);
+                Some(rx)
+            }
+            Recogniser::Opening(_) | Recogniser::Waiting(_) | Recogniser::Off => None,
+        };
+        (self.stats, left)
     }
 
     /// Takes a packet of the participant.

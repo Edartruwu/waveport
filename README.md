@@ -4,9 +4,9 @@ Waveport is an open-source platform for real-time voice and multimodal AI agents
 
 ## Status
 
-**Foundations, the first measurements, the session kernel, the audio path, the ports, the runtime and a first agent to talk to.** The repository holds the workspace, the quality gates, the test and benchmark harnesses, and the first product code. The session kernel decides who has the floor, what the agent says and how much of it was heard, which tool calls run and what became of each, and what a session is after its process died. The audio path turns the packets of a transport into audio in order and the audio of speech synthesis into frames handed over at the pace they are heard, and knows how much of a response has been heard. Both are libraries with no I/O. The ports are the traits that a provider, a transport, a store or a tool implements, each with a statement of what it can do, and a planner that decides from those statements how a session is run and names what it will do less well. The runtime runs sessions: each is one task on a thread it never leaves, which drives the kernel and the audio path through the ports, keeps a journal and goes on from it after its process has died, while the models that listen are shared by all sessions. Behind the ports there is now one of each part a voice agent needs: the two models that listen for speech and for the end of a turn, speech recognition by OpenAI, any language model behind an OpenAI-compatible API, speech synthesis by Cartesia, and the microphone and loudspeaker of the machine. The `waveport` command puts them together into an agent you can talk to. Its journal is in memory: a session does not yet outlive its process.
+**Foundations, the first measurements, the session kernel, the audio path, the ports, the runtime and an agent to talk to, with a choice of providers.** The repository holds the workspace, the quality gates, the test and benchmark harnesses, and the first product code. The session kernel decides who has the floor, what the agent says and how much of it was heard, which tool calls run and what became of each, and what a session is after its process died. The audio path turns the packets of a transport into audio in order and the audio of speech synthesis into frames handed over at the pace they are heard, and knows how much of a response has been heard. Both are libraries with no I/O. The ports are the traits that a provider, a transport, a store or a tool implements, each with a statement of what it can do, and a planner that decides from those statements how a session is run and names what it will do less well. The runtime runs sessions: each is one task on a thread it never leaves, which drives the kernel and the audio path through the ports, keeps a journal and goes on from it after its process has died, while the models that listen are shared by all sessions. Behind the ports there is every part a voice agent needs, and for some a choice: the two models that listen for speech and for the end of a turn, speech recognition by OpenAI, Deepgram or AssemblyAI, any language model behind an OpenAI-compatible API, speech synthesis by Cartesia or ElevenLabs, and for a transport the microphone and loudspeaker of the machine or a WebSocket. The `waveport` command puts them together into an agent you can talk to, at the machine it runs on or from another terminal. Its journal is in memory: a session does not yet outlive its process.
 
-Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel is the second: it passes the six scenarios written before it, and its invariants are checked on random sessions and on every path through small ones. The audio path is the third: Opus and G.711, the change of rate, a reorder buffer, pacing and the playout ledger, with no allocation per frame. The ports are the fourth, with the plumbing adapters share: a stream helper, WebSocket and HTTP clients and a parser for server-sent events. The runtime is the fifth: shards, the session actor and the compute plane, tried every night on ten thousand sessions made up from seeds, with parts that fail, lines that lose packets and processes that die. The first voice loop is the sixth: the listening models, the first three providers, the local-audio transport and the `waveport` command, with a whole call run from a script on every platform against servers that stand in for the providers. The Cartesia adapter is written from the provider's documentation and has not been tried against the provider yet. Three more providers and a WebSocket transport, a journal on disk, and traces, metrics and the performance gates come next.
+Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel is the second: it passes the six scenarios written before it, and its invariants are checked on random sessions and on every path through small ones. The audio path is the third: Opus and G.711, the change of rate, a reorder buffer, pacing and the playout ledger, with no allocation per frame. The ports are the fourth, with the plumbing adapters share: a stream helper, WebSocket and HTTP clients and a parser for server-sent events. The runtime is the fifth: shards, the session actor and the compute plane, tried every night on ten thousand sessions made up from seeds, with parts that fail, lines that lose packets and processes that die. The first voice loop is the sixth: the listening models, the first three providers, the local-audio transport and the `waveport` command, with a whole call run from a script on every platform against servers that stand in for the providers. The seventh adds three providers (Deepgram and AssemblyAI to hear, ElevenLabs to speak), a transport whose far end connects over a WebSocket, with its client, and a workflow that runs the tests against the providers themselves every night. **The adapters for Cartesia, Deepgram, AssemblyAI and ElevenLabs are written from the providers' documentation and have not been tried against the providers yet**; the ones for OpenAI have. A journal on disk, and traces, metrics and the performance gates come next.
 
 ## Documents
 
@@ -28,15 +28,19 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/core/waveport-domain` | Domain model and the session kernel. `no_std`: no sockets, clocks or threads |
 | `crates/core/waveport-media` | The per-frame audio path: reordering, decoding, resampling, pacing |
 | `crates/core/waveport-ports` | The traits adapters implement, what each can say it does, and the session planner |
-| `crates/core/waveport-adapter-kit` | What adapters share: a stream helper, WebSocket and HTTP clients, server-sent events, retry classes |
+| `crates/core/waveport-adapter-kit` | What adapters share: a stream helper, WebSocket and HTTP clients, connections kept for the next response, server-sent events, retry classes |
 | `crates/core/waveport-runtime` | Application layer: runs sessions. Shards, the session actor, and the compute plane that shares the listening models among sessions |
 | `crates/core/waveport-control` | Application layer: runs the fleet |
 | `crates/core/waveport-protocol` | Wire formats: client protocol, control API, journal records. Depends on no other crate |
 | `crates/adapters/models/onnx` | The models that listen, run by ONNX Runtime: Silero VAD and Smart Turn |
 | `crates/adapters/stt/openai` | Speech recognition by OpenAI's realtime transcription |
+| `crates/adapters/stt/deepgram` | Speech recognition by Deepgram's live transcription |
+| `crates/adapters/stt/assemblyai` | Speech recognition by AssemblyAI's streaming transcription |
 | `crates/adapters/llm/openai-compat` | Language models behind an OpenAI-compatible chat completions API |
-| `crates/adapters/tts/cartesia` | Speech synthesis by Cartesia |
+| `crates/adapters/tts/cartesia` | Speech synthesis by Cartesia, with the time of every word |
+| `crates/adapters/tts/elevenlabs` | Speech synthesis by ElevenLabs, with the time of every character |
 | `crates/adapters/transport/local-audio` | The microphone and loudspeaker of this machine, or a caller who follows a script |
+| `crates/adapters/transport/websocket` | A far end that connects over a WebSocket, and the client for it. For this machine and networks that are trusted |
 | `crates/adapters/store/memory` | A journal that lasts as long as its process |
 | `apps/waveport-cli` | The `waveport` command, where the parts are put together |
 | `crates/testing/waveport-sim` | Deterministic simulation: seeded runs with a virtual clock |
@@ -65,7 +69,7 @@ cargo xtask ci           # every gate
 
 ## Talking to an agent
 
-The agent hears through OpenAI, thinks with an OpenAI model and speaks through Cartesia, so it needs a key for each, in the environment. Wear headphones: nothing takes the agent's voice out of what the microphone hears, and an agent that hears itself stops speaking.
+Told nothing else, the agent hears through OpenAI, thinks with an OpenAI model and speaks through Cartesia, so it needs a key for each, in the environment. Wear headphones: nothing takes the agent's voice out of what the microphone hears, and an agent that hears itself stops speaking.
 
 ```sh
 cargo xtask fetch-assets         # the listening models and the library that runs them, once
@@ -80,7 +84,17 @@ The command prints what it heard, what the agent said and how long the first sou
 |---|---|
 | `waveport dev` | An agent on this machine's microphone and loudspeaker. `--half-duplex` is for loudspeakers without headphones: the microphone is silenced while the agent speaks, so the agent cannot be interrupted |
 | `waveport run --script <file>` | The same agent with a caller who follows a script of recordings and silences. `--record <file>` keeps what the caller was played |
+| `waveport serve` | The same agent for callers who are somewhere else: it takes calls over a WebSocket, at `127.0.0.1:9283` unless `--listen` says otherwise, as many at a time as come. Nothing asks a caller who they are, so it takes calls from other machines only with `--exposed` |
+| `waveport client` | Calls an agent that `waveport serve` runs, from this machine's microphone and loudspeaker or from a script |
 | `waveport devices` | Lists the sound devices, for `--microphone` and `--loudspeaker` |
+
+`--stt openai|deepgram|assemblyai` and `--tts cartesia|elevenlabs` say who hears and who speaks. Each provider brings its own model, voice and the name of the variable that holds its key (`DEEPGRAM_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`):
+
+```sh
+export DEEPGRAM_API_KEY=…
+export ELEVENLABS_API_KEY=…
+cargo run --release -p waveport-cli -- dev --stt deepgram --tts elevenlabs
+```
 
 `--llm-url` points the agent at any server that speaks the chat completions protocol, a model on this machine among them. `waveport dev --help` lists the rest. A key is never an argument: `--stt-key-env`, `--llm-key-env` and `--tts-key-env` name the variables that hold them.
 

@@ -402,7 +402,21 @@ impl Transport for LocalAudio {
         let (pairs, odd) = frame.payload.as_chunks::<2>();
         // Not audio as this transport takes it. It is let go of: sent
         // again it would be no better.
-        if pairs.is_empty() || !odd.is_empty() || self.stage != Stage::Open {
+        if !odd.is_empty() || self.stage != Stage::Open {
+            return Ok(());
+        }
+        if pairs.is_empty() {
+            // Nothing to play. A response can still be said to end here,
+            // by whoever learns only afterwards which frame was its last.
+            if frame.last
+                && let Some(run) = self.runs.back_mut()
+                && run.tag == frame.tag
+                && !run.cut
+                && !run.last
+            {
+                run.last = true;
+                self.line.end(run.number);
+            }
             return Ok(());
         }
         let number = match self.runs.back() {

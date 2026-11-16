@@ -217,6 +217,46 @@ async fn a_response_is_played_and_said_to_be_as_it_goes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_response_can_be_said_to_have_ended_after_its_last_frame() {
+    let (mut transport, recording, mut seen) =
+        scripted(vec![Step::Silence(Duration::from_secs(5))]);
+    listen(&mut transport, &mut seen, Duration::from_millis(100)).await;
+
+    // Too little for the loudspeaker to begin on: more may follow, and a
+    // response that began and ran dry would be heard as a break.
+    let audio = sound(600);
+    speak(&mut transport, &mut seen, tag(1), &audio, false).await;
+    listen(&mut transport, &mut seen, Duration::from_millis(200)).await;
+    assert!(recording.samples().iter().all(|sample| *sample == 0));
+
+    // Whoever sends it learns only now that this was all of it, and says
+    // so with a frame that holds nothing.
+    let end = FrameOut {
+        tag: tag(1),
+        at: MediaDur::from_ticks(600),
+        length: MediaDur::ZERO,
+        payload: &[],
+        last: true,
+    };
+    transport.try_send(end).unwrap();
+    // Said twice, it ends once.
+    transport.try_send(end).unwrap();
+    listen(&mut transport, &mut seen, Duration::from_millis(200)).await;
+    assert_eq!(seen.last(tag(1)), Some(600));
+    let played = recording.samples();
+    let from = played.iter().position(|sample| *sample != 0).unwrap();
+    assert_eq!(played[from..from + 600], audio[..]);
+
+    // A frame that holds nothing and ends nothing does nothing, whether
+    // or not anything was ever sent of its response.
+    let nothing = FrameOut { last: false, ..end };
+    transport.try_send(nothing).unwrap();
+    transport.try_send(FrameOut { tag: tag(2), ..end }).unwrap();
+    listen(&mut transport, &mut seen, Duration::from_millis(200)).await;
+    assert!(seen.played.iter().all(|(of, _)| *of == tag(1)));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_response_that_is_discarded_falls_silent_and_says_how_far_it_got() {
     let (mut transport, recording, mut seen) =
         scripted(vec![Step::Silence(Duration::from_secs(5))]);

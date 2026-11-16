@@ -1,0 +1,94 @@
+# The tests that talk to the providers themselves, with real keys.
+#
+# Every provider adapter has tests named `live_*` that are ignored unless
+# asked for. They are the only ones that can say whether an adapter still
+# speaks as its provider does, and they cost money: cents a run. So they
+# run here, every night and when somebody asks, and nowhere else. This
+# workflow has no trigger for a pull request and must never get one: code
+# that nobody has reviewed would run with the keys in reach.
+#
+# It is opt-in. A provider whose key is not among the repository's secrets
+# is passed over with a notice, so a repository with no secrets runs
+# nothing and spends nothing. The secrets are named as the variables the
+# tests read: `OPENAI_API_KEY`, `CARTESIA_API_KEY`, `DEEPGRAM_API_KEY`,
+# `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`. A voice other than the one
+# the tests name can be given as a repository variable, `CARTESIA_VOICE`
+# or `ELEVENLABS_VOICE`.
+name: live
+
+on:
+  schedule:
+    - cron: "43 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  provider:
+    name: ${{ matrix.package }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: waveport-stt-openai
+            key: OPENAI_API_KEY
+          - package: waveport-llm-openai-compat
+            key: OPENAI_API_KEY
+          - package: waveport-tts-cartesia
+            key: CARTESIA_API_KEY
+            voice: CARTESIA_VOICE
+          - package: waveport-stt-deepgram
+            key: DEEPGRAM_API_KEY
+          - package: waveport-stt-assemblyai
+            key: ASSEMBLYAI_API_KEY
+          - package: waveport-tts-elevenlabs
+            key: ELEVENLABS_API_KEY
+            voice: ELEVENLABS_VOICE
+    env:
+      PACKAGE: ${{ matrix.package }}
+      KEY_NAME: ${{ matrix.key }}
+    steps:
+      - name: Is there a key?
+        id: key
+        env:
+          KEY: ${{ secrets[matrix.key] }}
+        run: |
+          if [ -n "${KEY}" ]; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice::${KEY_NAME} is not among the secrets: the live tests of ${PACKAGE} were not run"
+          fi
+      - uses: actions/checkout@v7.0.1
+        if: steps.key.outputs.present == 'true'
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+        if: steps.key.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2.9.3
+        if: steps.key.outputs.present == 'true'
+      # The key is in the environment of this one step, under the name the
+      # tests read it by. Nothing prints it: the adapters strike a key out
+      # of every failure they report.
+      - name: cargo test -- --ignored live_
+        if: steps.key.outputs.present == 'true'
+        env:
+          KEY: ${{ secrets[matrix.key] }}
+          VOICE_NAME: ${{ matrix.voice }}
+          VOICE: ${{ matrix.voice && vars[matrix.voice] || '' }}
+        run: |
+          export "${KEY_NAME}=${KEY}"
+          if [ -n "${VOICE_NAME}" ] && [ -n "${VOICE}" ]; then
+            export "${VOICE_NAME}=${VOICE}"
+          fi
+          cargo test --locked -p "${PACKAGE}" -- --ignored live_

@@ -437,6 +437,97 @@ mod tests {
         );
     }
 
+    /// The crates whose tests named `live_*` talk to a provider, by the
+    /// names of their packages: every adapter for speech recognition, a
+    /// language model or speech synthesis under `crates/adapters` whose
+    /// tests or sources define one. The sound devices have tests of that
+    /// name too, which need a machine with a loudspeaker and no key.
+    fn packages_with_live_tests() -> Vec<String> {
+        fn holds_one(folder: &Path) -> bool {
+            let Ok(entries) = std::fs::read_dir(folder) else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    return holds_one(&path);
+                }
+                path.extension().is_some_and(|extension| extension == "rs")
+                    && std::fs::read_to_string(&path)
+                        .is_ok_and(|text| text.contains("async fn live_"))
+            })
+        }
+        let adapters = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/adapters");
+        let mut packages = Vec::new();
+        for kind in ["stt", "llm", "tts"] {
+            for adapter in std::fs::read_dir(adapters.join(kind)).unwrap().flatten() {
+                let folder = adapter.path();
+                if !holds_one(&folder.join("tests")) && !holds_one(&folder.join("src")) {
+                    continue;
+                }
+                let manifest = std::fs::read_to_string(folder.join("Cargo.toml")).unwrap();
+                let name = manifest
+                    .lines()
+                    .find_map(|line| line.strip_prefix("name = \""))
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .unwrap();
+                packages.push(name.to_owned());
+            }
+        }
+        packages.sort();
+        packages
+    }
+
+    /// The tests that talk to the providers run with real keys. They run
+    /// every night and by hand, for every adapter that has some, and
+    /// never for a pull request: code that nobody has reviewed would
+    /// have the keys in reach.
+    #[test]
+    fn live_workflow_runs_every_live_test_and_never_for_a_pull_request() {
+        let text = workflow("live.yml");
+        assert_runs(
+            "live.yml",
+            &text,
+            &["cargo test --locked -p \"${PACKAGE}\" -- --ignored live_"],
+        );
+        let packages = packages_with_live_tests();
+        assert!(packages.len() >= 6, "{packages:?}");
+        for package in &packages {
+            assert!(
+                text.contains(&format!("- package: {package} ")),
+                "`.github/workflows/live.yml` does not run the live tests of `{package}`"
+            );
+        }
+        // What starts it: the clock, and somebody who asks.
+        let triggers = text
+            .split_once(" on: ")
+            .and_then(|(_, rest)| rest.split_once(" permissions:"))
+            .map(|(triggers, _)| triggers)
+            .unwrap();
+        assert_eq!(
+            triggers,
+            "schedule: - cron: \"43 4 * * *\" workflow_dispatch:"
+        );
+        // A key is in reach of the one step that runs the tests, and of
+        // the one that looks whether there is a key at all.
+        assert_eq!(text.matches("secrets[").count(), 2);
+        assert!(!text.contains("pull_request"));
+    }
+
+    /// No other workflow has a provider's key in reach.
+    #[test]
+    fn no_other_workflow_reads_a_providers_key() {
+        for name in ["ci.yml", "pr-meta.yml", "scheduled.yml", "release-plz.yml"] {
+            let text = workflow(name);
+            for key in ["_API_KEY", "secrets["] {
+                assert!(
+                    !text.contains(key),
+                    "`.github/workflows/{name}` reads `{key}`"
+                );
+            }
+        }
+    }
+
     #[test]
     fn pull_request_workflow_runs_the_title_and_semver_gates() {
         let text = workflow("pr-meta.yml");

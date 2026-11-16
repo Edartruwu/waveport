@@ -46,12 +46,12 @@ mod wire;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
-use tokio::time::Instant;
+use waveport_adapter_kit::pool::{Line, Pool};
 use waveport_adapter_kit::secret::Secret;
 use waveport_adapter_kit::stream::{self, Commands, Either, Events, Sender};
-use waveport_adapter_kit::ws::{CONNECT_TIMEOUT, WsConn, WsMessage, WsRequest};
+use waveport_adapter_kit::ws::{CONNECT_TIMEOUT, WsMessage};
 use waveport_ports::audio::RateSet;
 use waveport_ports::error::{BoxFuture, Full, PortError};
 use waveport_ports::tts::{
@@ -62,9 +62,6 @@ use crate::wire::{Heard, Speaking};
 
 /// How many pieces of text may wait for the loop.
 const ROOM: usize = 64;
-
-/// How many connections are kept for the responses to come.
-const KEPT_AT_MOST: usize = 4;
 
 /// How the adapter is set up.
 #[derive(Clone, Debug)]
@@ -124,45 +121,14 @@ impl Config {
     }
 }
 
-/// What the streams of one adapter share: how to connect, and the
-/// connections that are kept.
+/// What the streams of one adapter share.
 struct Shared {
     config: Config,
-    url: String,
-    /// Connections whose response came to its end, with when that was.
-    kept: Mutex<Vec<(WsConn, Instant)>>,
+    /// How connections are made, and the ones kept for the responses to
+    /// come.
+    pool: Arc<Pool>,
     /// How many contexts were named.
     contexts: AtomicU64,
-}
-
-impl Shared {
-    async fn connect(&self) -> Result<WsConn, PortError> {
-        let key = self.config.key.as_ref().map(Secret::expose);
-        let headers: Vec<(&str, &str)> = key.iter().map(|key| ("x-api-key", *key)).collect();
-        WsConn::connect(WsRequest {
-            url: &self.url,
-            headers: &headers,
-            timeout: self.config.timeout,
-        })
-        .await
-    }
-
-    /// A kept connection that is not too old, the newest there is.
-    fn take(&self) -> Option<WsConn> {
-        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
-        kept.retain(|(_, since)| now.duration_since(*since) < self.config.keep);
-        kept.pop().map(|(conn, _)| conn)
-    }
-
-    /// Keeps a connection for the next response.
-    fn keep(&self, conn: WsConn) {
-        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
-        if kept.len() == KEPT_AT_MOST {
-            kept.remove(0);
-        }
-        kept.push((conn, Instant::now()));
-    }
 }
 
 /// A speech synthesiser at Cartesia.
@@ -174,7 +140,7 @@ pub struct CartesiaTts {
 impl fmt::Debug for CartesiaTts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CartesiaTts")
-            .field("url", &self.shared.url)
+            .field("url", &self.shared.pool.url())
             .field("model", &self.shared.config.model)
             .field("voice", &self.shared.config.voice)
             .finish_non_exhaustive()
@@ -191,11 +157,12 @@ impl CartesiaTts {
             config.url.trim_end_matches('/'),
             config.version
         );
+        let key = config.key.clone().map(|key| ("x-api-key", key));
+        let pool = Pool::new(url, key, config.timeout, config.keep);
         Self {
             shared: Arc::new(Shared {
                 config,
-                url,
-                kept: Mutex::new(Vec::new()),
+                pool: Arc::new(pool),
                 contexts: AtomicU64::new(0),
             }),
         }
@@ -209,19 +176,13 @@ impl CartesiaTts {
     /// The connection could not be made. Nothing is lost by that but the
     /// time: a stream makes its own when none is kept.
     pub async fn warm(&self) -> Result<(), PortError> {
-        let conn = self.shared.connect().await?;
-        self.shared.keep(conn);
-        Ok(())
+        self.shared.pool.warm().await
     }
 
     /// How many connections are kept for the responses to come.
     #[must_use]
     pub fn kept(&self) -> usize {
-        self.shared
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
+        self.shared.pool.kept()
     }
 }
 
@@ -237,10 +198,7 @@ impl Tts for CartesiaTts {
     fn open(&self, config: TtsConfig) -> BoxFuture<'_, Result<TtsStream, PortError>> {
         Box::pin(async move {
             let shared = Arc::clone(&self.shared);
-            let (conn, kept) = match shared.take() {
-                Some(conn) => (conn, true),
-                None => (shared.connect().await?, false),
-            };
+            let line = shared.pool.line().await?;
             let number = shared.contexts.fetch_add(1, Ordering::Relaxed) + 1;
             let context = format!("{}-{number}", shared.config.context_prefix);
             let speaking = Speaking::new(
@@ -249,14 +207,9 @@ impl Tts for CartesiaTts {
                 config.rate,
                 config.language.as_deref(),
             );
-            let line = Line {
-                conn,
-                kept,
-                sent: Vec::new(),
-                shared,
-            };
+            let stall = shared.config.stall_timeout;
             let (commands, events) = stream::pair(ROOM, move |commands, events| {
-                run(line, speaking, commands, events)
+                run(line, stall, speaking, commands, events)
             });
             Ok(TtsStream {
                 tx: Box::new(Tx { commands }),
@@ -292,50 +245,6 @@ impl TtsTx for Tx {
     }
 }
 
-/// The connection of one stream.
-struct Line {
-    conn: WsConn,
-    /// Whether the connection was kept from an earlier response, and the
-    /// provider has not been heard on it since. Such a connection may be
-    /// gone without this side knowing.
-    kept: bool,
-    /// What was sent on a kept connection, to be sent again on a new one
-    /// should the kept one turn out to be gone.
-    sent: Vec<String>,
-    shared: Arc<Shared>,
-}
-
-impl Line {
-    /// Sends a message.
-    async fn send(&mut self, message: String) -> Result<(), PortError> {
-        if !self.kept {
-            return self.conn.send_text(message).await;
-        }
-        self.sent.push(message.clone());
-        if self.conn.send_text(message).await.is_err() {
-            self.renew().await?;
-        }
-        Ok(())
-    }
-
-    /// Takes a new connection in place of a kept one that is gone, and
-    /// says on it what was said on the old one.
-    async fn renew(&mut self) -> Result<(), PortError> {
-        self.conn = self.shared.connect().await?;
-        self.kept = false;
-        for message in core::mem::take(&mut self.sent) {
-            self.conn.send_text(message).await?;
-        }
-        Ok(())
-    }
-
-    /// The provider was heard on the connection, so it is not gone.
-    fn alive(&mut self) {
-        self.kept = false;
-        self.sent = Vec::new();
-    }
-}
-
 /// The loop of one stream: text one way, audio and marks the other.
 ///
 /// A sending half that goes away without saying that the text is over is
@@ -343,19 +252,19 @@ impl Line {
 /// to be told.
 async fn run(
     mut line: Line,
+    stall: Duration,
     mut speaking: Speaking,
     mut commands: Commands<Command>,
     mut events: Events<TtsEvent>,
 ) -> Result<(), PortError> {
     let mut out = Vec::new();
     let mut fed = true;
-    let stall = line.shared.config.stall_timeout;
     loop {
         let next = async {
             if fed {
-                stream::first(commands.next(), line.conn.next()).await
+                stream::first(commands.next(), line.next()).await
             } else {
-                Either::Right(line.conn.next().await)
+                Either::Right(line.next().await)
             }
         };
         // Once the provider has all the text it has no reason to be
@@ -388,7 +297,7 @@ async fn run(
             Either::Right(Ok(Some(WsMessage::Text(text)))) => {
                 let heard = speaking.heard(text.as_str(), &mut out)?;
                 if heard != Heard::NotOurs {
-                    line.alive();
+                    line.proven();
                 }
                 for event in out.drain(..) {
                     events.send(event).await;
@@ -396,14 +305,13 @@ async fn run(
                 if heard == Heard::Done {
                     // The connection is as good as new for the next
                     // response.
-                    let Line { conn, shared, .. } = line;
-                    shared.keep(conn);
+                    line.keep();
                     return Ok(());
                 }
             }
             Either::Right(Ok(Some(WsMessage::Binary(_)))) => {}
             // A kept connection that the provider had closed meanwhile.
-            Either::Right(Ok(None) | Err(_)) if line.kept && !speaking.was_heard() => {
+            Either::Right(Ok(None) | Err(_)) if line.is_unproven() && !speaking.was_heard() => {
                 line.renew().await?;
             }
             Either::Right(Ok(None)) => {

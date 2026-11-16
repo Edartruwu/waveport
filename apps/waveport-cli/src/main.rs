@@ -2,8 +2,10 @@
 //!
 //! Stability: experimental
 //!
-//! An agent to talk to at this machine, or one that takes a call whose
-//! caller follows a script. This is where the parts are put together:
+//! An agent to talk to at this machine, one that takes a call whose
+//! caller follows a script, or one that takes calls over a WebSocket from
+//! the same command run as a client. This is where the parts are put
+//! together:
 //! the session runtime, the models that listen, a provider for each of
 //! hearing, thinking and speaking, a transport, a journal and two tools.
 //! Nothing here decides anything about a conversation.
@@ -13,8 +15,10 @@
 
 mod args;
 mod call;
+mod client;
 mod report;
 mod script;
+mod serve;
 mod tools;
 
 use core::fmt;
@@ -66,6 +70,8 @@ async fn command(command: Command) -> Result<Outcome, Failure> {
     match command {
         Command::Dev(dev) => at_the_desk(dev).await,
         Command::Run(run) => scripted(run).await,
+        Command::Serve(serve) => serve::serve(serve).await,
+        Command::Client(client) => client::call(client).await,
         Command::Devices => list_devices(),
     }
 }

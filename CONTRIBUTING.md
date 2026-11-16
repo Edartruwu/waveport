@@ -177,7 +177,7 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-domain --test simulat
 WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay
 ```
 
-**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile and 1,000 of the runtime per story and profile (see below), other ones each night, and the larger sessions of `tests/model.rs`.
+**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile and 1,000 of the runtime per story and profile (see below), other ones each night, and the larger sessions of `tests/model.rs`. The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
 
 **Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps and of rebuilding a session from its journal, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
 
@@ -214,17 +214,23 @@ If you change what crosses between a session and the compute plane, change it th
 
 **Provider adapters.** An adapter is tested against a server that the test starts on the loopback interface and that follows a script (`waveport_testkit::servers`): each line of a script is something the server says, something it waits to be told, a pause, or the way it ends the connection. Where a provider has been listened to, the script is a recording of it, kept under `tests/fixtures/` with the day it was made, and the crate documentation lists what the recording taught. Where it has not, the crate documentation says so in bold, and the messages are made up in the documented shapes. Never edit a recording to make a test pass: what the provider said is the fact, and the adapter is what has to change.
 
-The tests named `live_*` talk to the provider itself. They are ignored in an ordinary run, need the provider's key in the environment (`OPENAI_API_KEY`, `CARTESIA_API_KEY`), cost a few cents, and send speech made by a machine, never a recording of a person:
+The tests named `live_*` talk to the provider itself. They are ignored in an ordinary run, need the provider's key in the environment (`OPENAI_API_KEY`, `CARTESIA_API_KEY`, `DEEPGRAM_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`), cost a few cents, and send speech made by a machine, never a recording of a person:
 
 ```sh
 cargo nextest run -p waveport-stt-openai --run-ignored only live_
 ```
 
+The `live` workflow runs them every night, and when somebody starts it by hand, with keys from the repository's secrets, which are named as the variables are. A provider whose key is not there is passed over, so a repository with no secrets runs nothing. **That workflow must never run for a pull request**: code that nobody has reviewed would have the keys in reach. A test in `xtask` fails if it is given such a trigger, if an adapter has `live_*` tests that it does not run, or if another workflow reads a provider's key.
+
+An adapter that has not been held against its provider says so in bold in its crate documentation. The first run of its `live_*` tests is expected to find things; when it has, the made-up messages give way to recordings.
+
 A key is read from the environment and goes nowhere but to its provider: none is ever an argument, a file in the repository or a line of output. `xtask` has a test that reads every file under a `fixtures` directory and fails on anything with the shape of a key, because a provider repeats a key it does not know.
 
 **Sound devices.** `waveport-transport-local-audio` is tested without a sound card. Everything between the session and the device is in `src/line.rs`, whose tests play both sides, two threads among them. `tests/scripted.rs` puts a person who follows a script where the card would be, on a clock the test controls. Three tests named `live_*` use the devices of the machine and are ignored in an ordinary run; `live_a_tone_is_played_while_the_microphone_listens` makes a sound and opens the microphone.
 
-**A whole call.** `apps/waveport-cli/tests/scripted.rs` starts the `waveport` command itself with a scripted caller and with scripted servers in place of the three providers. The speech recognition server replays a recording of the provider, and the other two are made up. The models, the adapters, the runtime and the audio path are the real ones, and so is the clock: the test takes about four seconds. It checks what the command printed, what each server was sent, and the recording of what the caller was played. When it fails it prints what each server was sent, which is where to start reading.
+**A whole call.** `apps/waveport-cli/tests/scripted.rs` starts the `waveport` command itself with a scripted caller and with scripted servers in place of the three providers. The server that stands in for OpenAI's speech recognition replays a recording of it, and the others are made up. The models, the adapters, the runtime and the audio path are the real ones, and so is the clock: a call takes about four seconds. The same call is run with OpenAI and Cartesia, with Deepgram and ElevenLabs, and with AssemblyAI, and once with the agent in `waveport serve` and the caller in `waveport client`, two processes with a WebSocket between them. Each run checks what the command printed, what each server was sent, and the recording of what the caller was played. When one fails it prints what each server was sent, which is where to start reading. An adapter for a new provider gets a stand-in and a run here.
+
+**The WebSocket transport.** `crates/adapters/transport/websocket/tests/loopback.rs` runs the server side and the client against each other over real sockets on the loopback interface, and a client that breaks the protocol against the server.
 
 **Adapter kit.** The WebSocket and HTTP clients are tested against servers that the tests start on the loopback interface; nothing leaves the machine. A test of a connection that is refused has to accept a timeout as well: Windows takes about two seconds to refuse a closed port on the loopback interface.
 
