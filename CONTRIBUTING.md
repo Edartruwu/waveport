@@ -297,13 +297,13 @@ The runtime does not pin the threads of its shards ([decision 0003](docs/decisio
 
 The same machine is not always the same machine. A laptop takes nearly twice as long over the same work when it is on its battery, warm, or busy, and then over a session too. So a record says how long the reference work took, and a check refuses a machine that takes a tenth longer or shorter over it now: bring the machine back to that state, or make a new record. Record with the machine as it is when it is left alone. The record is named after the machine's processor and says nothing else of the machine. Make a new record in the pull request that changes what a session costs, and say why it changed.
 
-The share of every night is measured three times, on three runners, and each measurement says in its summary which processor it ran on and what it measured. Runners are not alike, so when a measurement fails, read the three together before anything is changed:
+The share of every night is measured three times, on three runners, and each measurement says in its summary which processor it ran on and what it measured. Runners are not alike: in the first twelve measurements a session took 0.20% of its thread on one processor and 0.27% on another, and the ratio was between 0.68 and 0.77 on all three. So when a measurement fails, read the three together, and against what the same processor measured on other nights, before anything is changed:
 
 - **The reference work took longer at one end of the run than at the other** ("the machine was not left alone"). Nothing was measured: run that measurement again.
-- **One of the three fails, and a session took within a tenth of the share it took in the other two.** That is the runner: the reference work is quicker there, and the ratio is the larger for it. Note its processor and change nothing. If the same processor fails a second time, set what is held again, as below, without waiting for the ten nights.
-- **All three fail, and a session takes over a tenth more of its thread than on the last night that passed.** That is the code. Find the change with `cargo xtask perf check` on a machine that has a record, where the numbers repeat to about 1%.
+- **One or two of the three fail.** Look at what the processor of the one that failed measured on other nights. If its ratio was as high then, that is the runner: set what is held again, as below, without waiting for the ten nights. If it was not, run that measurement again, and if it fails again take it for the next case.
+- **All three fail.** That is the code. Find the change with `cargo xtask perf check` on a machine that has a record, where the numbers repeat to about 1%.
 
-What `[density]` holds was set from three runs. It is set again once ten nights have been measured, which is thirty measurements:
+What `[density]` holds was set from the first runs. It is set again once ten nights have been measured, which is thirty measurements:
 
 - Read `density.ratio`, `density.share_percent`, `poll.over_budget_share` and the processor out of the summaries, or out of the logs of the jobs.
 - Of the ratio and the share, hold the one that moves less from runner to runner, at its median. A run may be over it by twice what the largest measurement was over the median, as a share of the median, rounded up to the next twentieth, and by a tenth at the least.
