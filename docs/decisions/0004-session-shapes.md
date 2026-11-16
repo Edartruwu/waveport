@@ -47,6 +47,15 @@ A session tells whoever follows it a fact when it makes it, and its journal stor
 - **`Attached` while attached does nothing**, because every restart of a process sends it.
 - **Not journaled.** Whether a line is there is a matter of the moment. A session rebuilt from its journal is told by its transport.
 
+Building it settled what the list above leaves open:
+
+- **The wait is 30 s** unless a session is given another. It runs from when the line was lost: `Detached` again while it is gone does not begin it anew, and `Detached` again when it is over closes the session, as the timer does.
+- **Not every reply that is cut is owed again.** One that was heard to its end is in the conversation whole. Words the application gave the agent to say were the application's to give, and are its to give again. A reply whose tool calls are still out is not asked for again either: what is owed is the answer made of their results, and that one is started again if the line cut it off.
+- **Words the application gives the agent to say while the line is gone are not said**, and not kept for later.
+- **The journal's format is as it was.** The cut is recorded as the epoch advancing because the agent was interrupted, which is what an interruption by the application leaves too. A reason of its own would have been a new format, for a difference nothing reads.
+- **An eleventh invariant** says it (section 13 of the architecture): nothing is started for a line that is gone, the reply that was cut is owed again, and a session closes by itself only when it has waited, and then it does.
+- **It cost what was measured**: the transcript that completes a turn takes 1.2% more instructions, and no other step 1%.
+
 ## Keys
 
 - **`Event::Key { who, key }`**, with the sixteen keys of RFC 4733 (digits, star, hash, A to D).

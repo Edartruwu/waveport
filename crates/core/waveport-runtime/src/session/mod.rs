@@ -956,6 +956,10 @@ impl<P: Policies> Session<P> {
                         text: text.into(),
                     });
                 }
+                // The line dropped, and may be back. The kernel cuts off
+                // what the agent was saying where it was heard to, says
+                // nothing while the line is gone, and waits for it only
+                // as long as the session was given.
                 Some(TransportEvent::Detached) => {
                     self.queue.push(Event::Control(ControlInput::Detached));
                 }
@@ -963,11 +967,9 @@ impl<P: Policies> Session<P> {
                     self.queue.push(Event::Control(ControlInput::Attached));
                 }
                 // The transport is gone, and with it everyone the session
-                // could talk to. The session is closed first, so that it
-                // starts nothing more, and then what the agent was saying
-                // is cut off where it was heard to: nobody hears the rest,
-                // and a response begun now would be heard by nobody at
-                // all.
+                // could talk to. It is a line that dropped and will not
+                // be back, so there is nothing to wait for: the session
+                // is told both.
                 None => {
                     self.line = Line::Closed;
                     self.transport = Box::new(Gone);
@@ -975,7 +977,6 @@ impl<P: Policies> Session<P> {
                     let reason = CloseReason::Abandoned;
                     self.queue
                         .push(Event::Control(ControlInput::Close { reason }));
-                    self.queue.push(Event::Control(ControlInput::Interrupt));
                 }
             }
         }

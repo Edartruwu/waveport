@@ -101,17 +101,14 @@ fn words_after_barge_in() -> Result<(), Report> {
     unstarted(words_after_barge_in::words_after_barge_in)
 }
 
-/// Waits for the kernel to act on a line that drops: today it is told and
-/// goes on speaking.
 #[test]
 fn line_drops() -> Result<(), Report> {
-    pending(line_drops::line_drops)
+    passes(line_drops::line_drops)
 }
 
-/// Waits for the same.
 #[test]
 fn line_stays_gone() -> Result<(), Report> {
-    pending(line_stays_gone::line_stays_gone)
+    passes(line_stays_gone::line_stays_gone)
 }
 
 /// Waits for the kernel to take keys: today there is no event to tell it

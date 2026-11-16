@@ -351,6 +351,20 @@ impl<P: Policies> Step<'_, P> {
         if self.now.since(open.begun) < turn_max || open.ended.is_some() {
             return;
         }
+        self.speech_given_up(turn);
+    }
+
+    /// Nobody is going to say where the speech of a turn ends: the turn
+    /// has gone on for too long, or the line its speaker was on is gone.
+    /// The turn is over, with the words it has and those still on their
+    /// way.
+    fn speech_given_up(&mut self, turn: TurnId) {
+        let Some(open) = self
+            .turn_index(turn)
+            .and_then(|index| self.state.turns.get_mut(index))
+        else {
+            return;
+        };
         let overlap = open.overlap.take();
         if open.speaking {
             // Nobody said where the speech ends, so it is taken to have
@@ -809,6 +823,7 @@ impl<P: Policies> Step<'_, P> {
                 }
             }
             TimerId::Checkpoint => self.checkpoint(),
+            TimerId::Detach => self.give_line_up(),
             // These only need the session to look at the time, which
             // `settle` does after every event.
             TimerId::Drain
@@ -831,12 +846,88 @@ impl<P: Policies> Step<'_, P> {
             ControlInput::Close { reason } => self.close_asked(*reason),
             ControlInput::Interrupt => self.interrupt(EpochCause::Interrupted),
             ControlInput::Say { text } => self.say(text.as_str()),
-            ControlInput::Detached => self.state.attached = false,
-            ControlInput::Attached => self.state.attached = true,
+            ControlInput::Detached => self.line_dropped(),
+            ControlInput::Attached => self.line_returned(),
             ControlInput::Handoff { to, context } => self.handoff_asked(*to, context),
             ControlInput::StageReady => self.stage_ready(),
             // Losing the lease is handled before the step is routed.
             ControlInput::LeaseLost => {}
+        }
+    }
+
+    /// The line to whoever the session talks to is gone. Nobody hears the
+    /// agent from here on: what it was saying ends where it was heard to,
+    /// nothing is said until the line is back, and the session waits for
+    /// that only so long.
+    fn line_dropped(&mut self) {
+        if self.state.gone_until.is_some() {
+            // The wait runs from when the line was lost. Told of it again
+            // when the wait is over, the session need not hear it from
+            // its timer.
+            self.give_line_up();
+            return;
+        }
+        let wait = self.config.timing.detach_wait;
+        let until = self.now.after(wait);
+        self.state.gone_until = Some(until);
+
+        // A reply that a language model was writing is owed again once
+        // the line is back, unless all of it was heard. What the
+        // application had the agent say is not: the kernel does not keep
+        // it.
+        let cut = self
+            .floor()
+            .and_then(|index| self.state.generations.get(index))
+            .filter(|running| running.source != Source::Given)
+            .map(|running| running.tag.generation);
+        self.interrupt(EpochCause::Interrupted);
+        if let Some(generation) = cut {
+            // Unless tool calls it asked for are still running. Then
+            // their results are what is owed, when they are in: a reply
+            // begun before would ask for the same calls again.
+            let asked = self.state.batches.iter().any(|open| open.by == generation);
+            if !asked {
+                self.state.started = self.state.answered;
+            }
+        }
+
+        // Nobody is going to say where speech that was under way ends.
+        let mut index = 0;
+        while let Some(open) = self.state.turns.get(index) {
+            if open.speaking {
+                let turn = open.id;
+                self.speech_given_up(turn);
+            }
+            index += 1;
+        }
+
+        if self.state.lifecycle != Lifecycle::Running {
+            return;
+        }
+        if wait.is_zero() {
+            self.close_asked(CloseReason::Abandoned);
+        } else {
+            self.cmd(Command::SetTimer(TimerId::Detach, Some(until)));
+        }
+    }
+
+    /// Closes the session as abandoned if its line has been gone for as
+    /// long as the session waits for one. The timer of the wait only
+    /// wakes the session: whether the wait is over is read from the
+    /// state.
+    fn give_line_up(&mut self) {
+        let gone = self.state.gone_until;
+        if gone.is_some_and(|until| self.now >= until) {
+            self.close_asked(CloseReason::Abandoned);
+        }
+    }
+
+    /// The line is there again, and whatever is owed can be said.
+    fn line_returned(&mut self) {
+        // Every restart of a process says that the line is there, which
+        // is no news then.
+        if self.state.gone_until.take().is_some() {
+            self.cancel_timer(TimerId::Detach);
         }
     }
 
@@ -856,8 +947,10 @@ impl<P: Policies> Step<'_, P> {
     /// it was saying.
     fn say(&mut self, text: &str) {
         let running = self.state.lifecycle == Lifecycle::Running;
-        // While the floor is changing hands, nobody holds it.
-        if !running || self.state.handoff.is_some() || text.trim().is_empty() {
+        // While the floor is changing hands, nobody holds it. And nothing
+        // is said into a line that is gone.
+        let nobody = self.state.handoff.is_some() || self.state.gone_until.is_some();
+        if !running || nobody || text.trim().is_empty() {
             return;
         }
         self.interrupt(EpochCause::Interrupted);
@@ -1015,8 +1108,12 @@ impl<P: Policies> Step<'_, P> {
     /// Starts the response that is owed, if one is and it can start.
     fn start_reply(&mut self) {
         // A session that is closing starts nothing, and while the floor is
-        // changing hands there is nobody to respond.
-        if self.state.lifecycle != Lifecycle::Running || self.state.handoff.is_some() {
+        // changing hands there is nobody to respond. While the line is
+        // gone there is nobody to respond to: the reply waits for it.
+        if self.state.lifecycle != Lifecycle::Running
+            || self.state.handoff.is_some()
+            || self.state.gone_until.is_some()
+        {
             return;
         }
         let Some((_, cause)) = self.state.owed.filter(|_| self.state.reply_owed()) else {
@@ -1123,6 +1220,9 @@ impl<P: Policies> Step<'_, P> {
             self.stop_calls();
             for id in [TimerId::Checkpoint, TimerId::Drain] {
                 self.cancel_timer(id);
+            }
+            if self.state.gone_until.is_some() {
+                self.cancel_timer(TimerId::Detach);
             }
         }
         if self.state.lifecycle != Lifecycle::Closing {

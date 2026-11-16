@@ -204,7 +204,9 @@ fn the_frequent_steps_do_not_touch_the_heap() {
                 result: "{}".into(),
             },
         ),
-        Event::Control(ControlInput::Detached),
+        // That the line is there is said by every restart of a process,
+        // and is no news. That it is gone ends a response, which may use
+        // the heap as every end of one may.
         Event::Control(ControlInput::Attached),
         speech(VadEdge::Start, 100),
         speech(VadEdge::End, 100),

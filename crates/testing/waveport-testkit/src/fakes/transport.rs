@@ -5,6 +5,10 @@
 //! loudspeaker plays what it is sent at the pace it is spoken, and, if
 //! the transport is set up to, says how far it has got and discards what
 //! it is told to.
+//!
+//! The line between the two can be scripted to drop and to come back.
+//! While it is gone nothing gets through either way: what the far end
+//! says is lost, and so is what it is sent.
 
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -65,6 +69,12 @@ pub struct TransportLog {
     /// How many times the transport was asked to tell the far end that
     /// the session is over.
     pub goodbyes: usize,
+    /// How many times the line dropped.
+    pub drops: usize,
+    /// How many frames were sent while the line was gone. Nobody heard
+    /// them. A session that is told its line is gone fades out what it
+    /// was saying, which is one frame for each time the line drops.
+    pub unheard: usize,
 }
 
 impl TransportLog {
@@ -118,8 +128,8 @@ struct Playing {
     received: MediaDur,
     /// How much the far end last said it had played.
     reported: Option<MediaDur>,
-    /// Whether it was told to discard the response. It plays no more of
-    /// it then, whatever arrives.
+    /// Whether it was told to discard the response, or lost the line
+    /// while it played it. It plays no more of it then, whatever arrives.
     cleared: bool,
 }
 
@@ -161,6 +171,24 @@ impl FakeTransportBuilder {
     pub fn leave(mut self, at_ms: u64, who: ParticipantId) -> Self {
         self.events
             .push((Duration::from_millis(at_ms), TransportEvent::Left { who }));
+        self
+    }
+
+    /// At `at_ms` the line drops. The far end hears no more of what it
+    /// was playing, and nothing it says or is sent gets through until the
+    /// line [is back](Self::line_returns).
+    #[must_use]
+    pub fn line_drops(mut self, at_ms: u64) -> Self {
+        self.events
+            .push((Duration::from_millis(at_ms), TransportEvent::Detached));
+        self
+    }
+
+    /// At `at_ms` the line is back.
+    #[must_use]
+    pub fn line_returns(mut self, at_ms: u64) -> Self {
+        self.events
+            .push((Duration::from_millis(at_ms), TransportEvent::Attached));
         self
     }
 
@@ -321,7 +349,7 @@ impl FakeTransportBuilder {
             script: self.events.into(),
             closes: self.closes,
             clings: self.clings,
-            closed: false,
+            line: Line::There,
             holds: self.holds,
             playing: None,
             timer: Box::pin(tokio::time::sleep_until(start)),
@@ -330,6 +358,16 @@ impl FakeTransportBuilder {
         };
         (transport, handle)
     }
+}
+
+/// The line to the far end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Line {
+    There,
+    /// It has dropped and is not back.
+    Gone,
+    /// The transport has said that it is closed.
+    Closed,
 }
 
 /// A transport with a far end that follows a script.
@@ -341,8 +379,7 @@ pub struct FakeTransport {
     closes: bool,
     /// Whether it never finishes saying goodbye.
     clings: bool,
-    /// Whether it has said that it is closed.
-    closed: bool,
+    line: Line,
     holds: Duration,
     playing: Option<Playing>,
     timer: Pin<Box<Sleep>>,
@@ -394,9 +431,42 @@ impl FakeTransport {
             .map_or_else(RemoteBuffer::default, |audio| audio.remote_buffer)
     }
 
+    /// Takes the next thing of the script that is due at `now` and gets
+    /// through. What a microphone sends into a line that is gone, and what
+    /// is typed into it, is lost.
+    fn scripted(&mut self, now: Instant) -> Option<TransportEvent> {
+        while let Some((at, _)) = self.script.front() {
+            if self.start + *at > now {
+                break;
+            }
+            let (_, event) = self.script.pop_front()?;
+            match event {
+                TransportEvent::Detached => {
+                    self.line = Line::Gone;
+                    self.log().drops += 1;
+                    // The loudspeaker hears no more of what it was
+                    // playing.
+                    if let Some(playing) = &mut self.playing {
+                        playing.received = playing.played(now);
+                        playing.cleared = true;
+                    }
+                }
+                TransportEvent::Attached => self.line = Line::There,
+                TransportEvent::Audio { .. } | TransportEvent::Text { .. }
+                    if self.line == Line::Gone =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            return Some(event);
+        }
+        None
+    }
+
     /// What the loudspeaker has to report at `now`, if anything.
     fn report(&mut self, now: Instant) -> Option<TransportEvent> {
-        if !self.remote_buffer().reports_played {
+        if !self.remote_buffer().reports_played || self.line == Line::Gone {
             return None;
         }
         let playing = self.playing.as_mut()?;
@@ -422,7 +492,7 @@ impl FakeTransport {
 
     /// When the loudspeaker next has something to report.
     fn next_report(&self, now: Instant) -> Option<Instant> {
-        if !self.remote_buffer().reports_played {
+        if !self.remote_buffer().reports_played || self.line == Line::Gone {
             return None;
         }
         let playing = self.playing.as_ref()?;
@@ -452,15 +522,12 @@ impl Transport for FakeTransport {
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>> {
         let this = self;
         let now = Instant::now();
-        if let Some((at, _)) = this.script.front()
-            && this.start + *at <= now
-            && let Some((_, event)) = this.script.pop_front()
-        {
+        if let Some(event) = this.scripted(now) {
             return Poll::Ready(Some(event));
         }
-        if this.closed || (this.closes && this.script.is_empty()) {
+        if this.line == Line::Closed || (this.closes && this.script.is_empty()) {
             // The far end is gone, whatever it was playing.
-            this.closed = true;
+            this.line = Line::Closed;
             return Poll::Ready(None);
         }
         if let Some(event) = this.report(now) {
@@ -487,11 +554,26 @@ impl Transport for FakeTransport {
     }
 
     fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full> {
-        if self.closed {
+        if self.line == Line::Closed {
             self.log().after_close += 1;
             return Ok(());
         }
         let now = Instant::now();
+        if self.line == Line::Gone {
+            // It is sent, and nobody hears it.
+            let sent = SentFrame {
+                when: now.saturating_duration_since(self.start),
+                tag: frame.tag,
+                at: frame.at,
+                length: frame.length,
+                payload: Bytes::copy_from_slice(frame.payload),
+                last: frame.last,
+            };
+            let mut log = self.log();
+            log.unheard += 1;
+            log.frames.push(sent);
+            return Ok(());
+        }
         let end = frame.at.saturating_add(frame.length);
         match &mut self.playing {
             Some(playing) if playing.tag == frame.tag => {
@@ -532,7 +614,7 @@ impl Transport for FakeTransport {
     }
 
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full> {
-        if self.closed {
+        if self.line == Line::Closed {
             self.log().after_close += 1;
             return Ok(());
         }

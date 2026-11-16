@@ -212,7 +212,8 @@ pub enum Lifecycle {
 pub enum EpochCause {
     /// A user spoke over the agent and wanted the floor.
     BargeIn,
-    /// The application interrupted the agent.
+    /// The application interrupted the agent, or the line to whoever was
+    /// listening dropped.
     Interrupted,
     /// Another agent took the floor.
     Handoff,

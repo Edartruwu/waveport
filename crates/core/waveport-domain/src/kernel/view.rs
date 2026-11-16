@@ -9,7 +9,7 @@ use crate::ids::{
     AgentId, BatchId, ContextVersion, Epoch, GenId, OpTag, ParticipantId, Seq, ToolCallId, ToolId,
     TurnId,
 };
-use crate::time::MediaSpan;
+use crate::time::{MediaSpan, MonoTime};
 
 /// A read-only look at a session, for the runtime, for policies' callers
 /// and for tests. Looking changes nothing.
@@ -36,10 +36,17 @@ impl<'a> View<'a> {
         self.state.lifecycle
     }
 
-    /// Whether a client is connected.
+    /// Whether the line to whoever the session talks to is there.
     #[must_use]
     pub const fn is_attached(&self) -> bool {
-        self.state.attached
+        self.state.gone_until.is_none()
+    }
+
+    /// When a line that dropped has had its time to come back, if the line
+    /// is gone.
+    #[must_use]
+    pub const fn gone_until(&self) -> Option<MonoTime> {
+        self.state.gone_until
     }
 
     /// The agent that holds the floor.

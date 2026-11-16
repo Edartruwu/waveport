@@ -75,17 +75,25 @@ pub enum Profile {
     /// The process dies, up to three times, and the session goes on from
     /// what of its journal had reached the disk.
     Crashes,
+    /// The line drops, up to three times, and is back in time, too late or
+    /// never. The session waits for it for a moment, for a few seconds or
+    /// not at all.
+    Lines,
 }
 
 impl Profile {
     /// Every profile.
-    pub const ALL: [Self; 6] = [
+    ///
+    /// A new one is added at the end: the seeds of a sweep are numbered
+    /// from its profile's place here.
+    pub const ALL: [Self; 7] = [
         Self::Calm,
         Self::Chaos,
         Self::Stalls,
         Self::Duplicates,
         Self::Shutdown,
         Self::Crashes,
+        Self::Lines,
     ];
 
     /// The profile's name, as failures print it.
@@ -98,6 +106,7 @@ impl Profile {
             Self::Duplicates => "duplicates",
             Self::Shutdown => "shutdown",
             Self::Crashes => "crashes",
+            Self::Lines => "lines",
         }
     }
 
@@ -149,6 +158,14 @@ impl Profile {
                 lost: 30,
                 stale: 100,
                 nonsense: 4,
+                late: 5,
+            },
+            Self::Lines => Faults {
+                jitter: 80,
+                twice: 20,
+                lost: 20,
+                stale: 100,
+                nonsense: 3,
                 late: 5,
             },
         }
@@ -224,6 +241,15 @@ pub struct Tally {
     pub handoffs: u64,
     /// Times the process died.
     pub crashes: u64,
+    /// Times a line dropped.
+    pub drops: u64,
+    /// Times a line came back to a session that was waiting for it.
+    pub returns: u64,
+    /// Responses started because the line was back: for a reply the drop
+    /// cut off, or for what was said or done while the line was gone.
+    pub resumed: u64,
+    /// Sessions that closed because their line stayed gone.
+    pub abandoned: u64,
     /// Times the journal was checked against the kernel.
     pub checks: u64,
     /// A fingerprint of everything the runs emitted, for telling whether
@@ -257,6 +283,10 @@ impl Tally {
         self.continuations += other.continuations;
         self.handoffs += other.handoffs;
         self.crashes += other.crashes;
+        self.drops += other.drops;
+        self.returns += other.returns;
+        self.resumed += other.resumed;
+        self.abandoned += other.abandoned;
         self.checks += other.checks;
         self.trace = mix(self.trace, other.trace);
     }
@@ -454,6 +484,11 @@ impl Run {
         config.timing.rollback_wait = Duration::from_millis(pick(&[300, 2_000]));
         config.timing.stage_wait = Duration::from_millis(pick(&[400, 5_000]));
         config.limits.open_calls = usize::try_from(pick(&[1, 3, 16])).unwrap_or(16);
+        if profile == Profile::Lines {
+            // Asked only here, so that the sessions of the other profiles
+            // stay the ones they were.
+            config.timing.detach_wait = Duration::from_millis(pick(&[0, 1_000, 5_000, 5_000]));
+        }
 
         // The tools: some run by the application, and perhaps one that a
         // second agent answers.
@@ -660,6 +695,17 @@ impl Run {
                 self.at(when, Item::Crash);
             }
         }
+        if profile == Profile::Lines {
+            for _ in 0..self.rng.range(1..4) {
+                let when = self.rng.range(200..horizon + 2_000);
+                self.at(when, Item::Control(Event::Control(ControlInput::Detached)));
+                // Back in time, too late, or never.
+                if self.rng.chance(5, 6) {
+                    let back = when + self.rng.range(30..2_500);
+                    self.at(back, Item::Control(Event::Control(ControlInput::Attached)));
+                }
+            }
+        }
 
         let closes = match profile {
             Profile::Shutdown => Some(self.rng.range(300..horizon)),
@@ -732,6 +778,7 @@ impl Run {
     fn step(&mut self, event: &Event) -> Result<(), Violation> {
         self.tally.steps += 1;
         let now = MonoTime::from_millis(self.now);
+        let line = self.kernel.view().is_attached();
         if let Event::Durable(seq) = event {
             // Whatever the kernel is told is stored has to be: the journal
             // is taken at its word.
@@ -798,12 +845,49 @@ impl Run {
                 self.count(&fact);
             }
         }
+        self.count_line(event, line);
         for index in 0..self.out.cmds.len() {
             if let Some(&command) = self.out.cmds.get(index) {
                 self.react(command);
             }
         }
         Ok(())
+    }
+
+    /// Counts what the step did about the line, which was there before
+    /// the step if `line` says so.
+    fn count_line(&mut self, event: &Event, line: bool) {
+        let view = self.kernel.view();
+        let running = view.lifecycle() == Lifecycle::Running;
+        let tally = &mut self.tally;
+        match (line, view.is_attached()) {
+            (true, false) => tally.drops += 1,
+            (false, true) if running => {
+                tally.returns += 1;
+                let started = |command: &Command| {
+                    matches!(command, Command::Llm(_, LlmCmd::Start { cause, .. })
+                        if !matches!(cause, LlmCause::Delegated { .. }))
+                };
+                tally.resumed += u64::from(self.out.cmds.iter().any(started));
+            }
+            _ => {}
+        }
+        // Nobody asked a session to close that closes on being told of
+        // its line, or by the timer of its wait.
+        let told = matches!(
+            event,
+            Event::Timer(TimerId::Detach) | Event::Control(ControlInput::Detached)
+        );
+        let closes = |stamped: &waveport_domain::fact::Stamped| {
+            matches!(
+                stamped.fact,
+                Fact::LifecycleChanged {
+                    to: Lifecycle::Draining,
+                    ..
+                }
+            )
+        };
+        tally.abandoned += u64::from(told && self.out.facts.iter().any(closes));
     }
 
     fn count(&mut self, fact: &Fact) {

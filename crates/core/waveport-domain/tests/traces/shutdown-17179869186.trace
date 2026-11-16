@@ -178,47 +178,30 @@
     > SetTimer(Gen(GenId(6)), Some(MonoTime(67965000000)))
     > SetTimer(Checkpoint, Some(MonoTime(8965000000)))
 8262 control detached
-8804 control join 2
-    = #21 ParticipantJoined { who: ParticipantId(2) }
-8962 control attached
-8965 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(9965000000)))
-9974 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(10974000000)))
-10976 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(11976000000)))
-11978 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(12978000000)))
-12983 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(13983000000)))
-13986 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(14986000000)))
-14989 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(15989000000)))
-15995 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(16995000000)))
-16995 timer checkpoint
-    > SetTimer(Checkpoint, Some(MonoTime(17995000000)))
-17157 control close failure
-    = #22 LifecycleChanged { to: Draining, reason: Some(Failure) }
-    > SetTimer(Drain, Some(MonoTime(17657000000)))
-    > SetTimer(Grace, Some(MonoTime(19657000000)))
-    > Emit(Lifecycle(Draining))
-17660 timer drain
-    = #23 LifecycleChanged { to: Closing, reason: Some(Failure) }
-    = #24 UtteranceCommitted { generation: GenId(6), agent: AgentId(0), answers: None, text: TextRef { start: 0, len: 18 }, truncated: true } "it über 日本 my"
-    = #25 EpochAdvanced { to: Epoch(4), cause: Closing }
-    = #26 LifecycleChanged { to: Closed, reason: Some(Failure) }
+    = #21 UtteranceCommitted { generation: GenId(6), agent: AgentId(0), answers: None, text: TextRef { start: 0, len: 18 }, truncated: true } "it über 日本 my"
+    = #22 EpochAdvanced { to: Epoch(4), cause: Interrupted }
     > Playout(OpTag { generation: GenId(6), epoch: Epoch(3) }, Stop { fade_ms: 8 })
     > SetTimer(Gen(GenId(6)), None)
     > SetTimer(Checkpoint, None)
     > Emit(Agent { agent: AgentId(0), generation: Some(GenId(6)), activity: Listening })
+    > SetTimer(Detach, Some(MonoTime(38262000000)))
+8804 control join 2
+    = #23 ParticipantJoined { who: ParticipantId(2) }
+8962 control attached
+    > SetTimer(Detach, None)
+17157 control close failure
+    = #24 LifecycleChanged { to: Draining, reason: Some(Failure) }
+    = #25 LifecycleChanged { to: Closing, reason: Some(Failure) }
+    = #26 LifecycleChanged { to: Closed, reason: Some(Failure) }
+    > SetTimer(Drain, Some(MonoTime(17657000000)))
+    > SetTimer(Grace, Some(MonoTime(19657000000)))
+    > Emit(Lifecycle(Draining))
     > Stt(Close { who: ParticipantId(1) })
     > Stt(Close { who: ParticipantId(2) })
     > SetTimer(Checkpoint, None)
     > SetTimer(Drain, None)
     > SetTimer(Grace, None)
     > Emit(Lifecycle(Closed))
-63552 timer gen 3
-63923 timer gen 3
-66628 timer gen 5
+33028 timer tool-timeout 1
+67971 timer gen 6
+125684 timer turn-max 2

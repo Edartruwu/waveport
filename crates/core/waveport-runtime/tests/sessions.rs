@@ -1092,19 +1092,118 @@ async fn a_transport_that_closes_ends_the_session() {
     // The recogniser of whoever left is let go of all the same.
     assert_eq!(world.stt.log().let_go, 1);
 
+    // The agent is cut off because its line is gone, and the session
+    // closes because the line is gone for good.
     let records = world.journal.records(SESSION);
     assert_eq!(
         kinds(&records)[3..],
         [
-            "lifecycle_changed draining",
             "utterance_committed",
             "epoch_advanced",
+            "lifecycle_changed draining",
             "lifecycle_changed closing",
             "lifecycle_changed closed",
         ]
     );
     let last = String::from_utf8_lossy(records.last().unwrap()).into_owned();
     assert!(last.contains("\"reason\":\"abandoned\""), "{last}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_line_that_drops_is_waited_for_and_its_caller_is_answered_again() {
+    let speech = [(1_000, 2_200, "what time is it please")];
+    let llm = ScriptedLlm::replies(vec![
+        vec![LlmStep::say(STORY)],
+        vec![LlmStep::say("It is ten past three.")],
+    ]);
+    let world = World::new(&speech, llm);
+    // The line drops while the agent is speaking, and is back three
+    // seconds later.
+    let transport = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 12_000, &talks(&speech))
+        .line_drops(4_000)
+        .line_returns(7_000);
+    let mut running = Running::start(&world, transport).await;
+
+    // While the line is gone the agent has stopped where it was heard
+    // to, and says nothing: no model is asked, and nothing is sent.
+    assert_eq!(running.until(6_900).await, None);
+    let stopped = running.watch.first("Stop {").unwrap();
+    assert!((4_000..4_100).contains(&stopped), "stopped at {stopped} ms");
+    let utterances = running.utterances();
+    assert_eq!(utterances.len(), 1, "{utterances:?}");
+    let (heard, cut) = utterances[0].clone();
+    assert!(cut, "{heard:?}");
+    assert!(
+        STORY.starts_with(heard.as_str()) && heard.len() < 30,
+        "{heard:?}"
+    );
+    assert!(!running.session.view().is_attached());
+    assert_eq!(world.llm.asked().len(), 1);
+    let sent = running.far_end.log().frames.len();
+
+    // When it is back, the caller is given the reply they did not get.
+    assert_eq!(running.until(20_000).await, None);
+    assert!(running.session.view().is_attached());
+    let utterances = running.utterances();
+    assert_eq!(utterances.len(), 2, "{utterances:?}");
+    assert_eq!(utterances[1], ("It is ten past three.".to_owned(), false));
+    // All that went into the gap is the fade of what was cut off.
+    let log = running.far_end.log();
+    assert_eq!((log.drops, log.unheard), (1, 1));
+    assert!(log.frames[sent..].iter().all(|frame| ms(frame) >= 7_000));
+    // The model was asked again for the same turn, and shown what the
+    // caller had heard of the first reply.
+    let asked = world.llm.asked();
+    assert_eq!(asked.len(), 2);
+    assert_eq!(asked[1].last_user(), Some("what time is it please"));
+    assert!(
+        asked[1].messages.contains(&Said::Assistant { text: heard }),
+        "{:?}",
+        asked[1].messages
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_line_that_stays_gone_ends_the_session_when_it_has_waited() {
+    let speech = [(1_000, 2_200, "what time is it please")];
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say(STORY)]]);
+    let world = World::new(&speech, llm);
+    let transport = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 12_000, &talks(&speech))
+        .line_drops(4_000);
+    let mut spec = spec();
+    spec.kernel.timing.detach_wait = Duration::from_secs(5);
+    let mut running = Running::start_as(spec, &world, transport).await;
+
+    // Just before the wait is over the session is there, and then it is
+    // not.
+    assert_eq!(running.until(8_950).await, None);
+    assert_eq!(running.until(30_000).await, Some(Ended::Closed));
+    let took = running.began.elapsed();
+    assert!(
+        (Duration::from_millis(9_000)..Duration::from_millis(9_100)).contains(&took),
+        "{took:?}"
+    );
+    let records = world.journal.records(SESSION);
+    assert_eq!(
+        kinds(&records)[3..],
+        [
+            "utterance_committed",
+            "epoch_advanced",
+            "lifecycle_changed draining",
+            "lifecycle_changed closing",
+            "lifecycle_changed closed",
+        ]
+    );
+    let last = String::from_utf8_lossy(records.last().unwrap()).into_owned();
+    assert!(last.contains("\"reason\":\"abandoned\""), "{last}");
+    // Nothing was said into the line while it was gone, beyond the fade
+    // of what was cut off.
+    assert_eq!(running.far_end.log().unheard, 1);
+    assert_eq!(world.llm.asked().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]

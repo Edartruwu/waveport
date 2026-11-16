@@ -231,6 +231,8 @@ pub enum TimerId {
     Drain,
     /// A closing session has had its time to stop.
     Grace,
+    /// A line that dropped has had its time to come back.
+    Detach,
 }
 
 /// A request from outside the conversation.
@@ -265,9 +267,14 @@ pub enum ControlInput {
         /// Who.
         who: ParticipantId,
     },
-    /// The client's connection dropped; it may come back.
+    /// The line to whoever the session talks to dropped; it may come
+    /// back. What the agent was saying ends where it was heard to, and
+    /// nothing is said until the line is back. The session waits for that
+    /// for [`Timing::detach_wait`](crate::config::Timing::detach_wait),
+    /// and then closes as abandoned.
     Detached,
-    /// The client is connected again.
+    /// The line is there again. A reply that the drop cut off is owed
+    /// again. Said of a line that was never gone, this changes nothing.
     Attached,
     /// The parts that serve the active agent are ready.
     StageReady,
@@ -292,7 +299,7 @@ pub enum HandoffContext {
 pub enum CloseReason {
     /// The application or the user asked.
     Requested,
-    /// Every human left.
+    /// Every human left, or the line to them dropped and stayed gone.
     Abandoned,
     /// The session cannot go on.
     Failure,

@@ -108,6 +108,22 @@ pub(super) struct Desk {
 }
 
 impl Desk {
+    /// A line that dropped cut off the response `generation`, which a
+    /// language model was writing. Returns whether what it was started
+    /// for is owed again. It is, unless tool calls the response asked for
+    /// are still running: then their results are owed, when they are in.
+    /// What is owed again for the results of a batch gives the batch a
+    /// second response.
+    pub(super) fn cut_by_line(&mut self, generation: GenId) -> bool {
+        if self.batches.iter().any(|open| open.by == generation) {
+            return false;
+        }
+        if let Some(LlmCause::Continuation { batch }) = self.cause {
+            self.continued.retain(|continued| *continued != batch);
+        }
+        true
+    }
+
     /// The account of a session in the state `view` shows.
     pub(super) fn of(view: View<'_>) -> Self {
         let args = |call: ToolCallId| {

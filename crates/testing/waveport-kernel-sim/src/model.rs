@@ -6,8 +6,8 @@
 //! speaks when, when each transcript and estimate comes in, what the
 //! language model writes and which tools it asks for, how far synthesis
 //! and playback have got, which tool answers first, which timer fires,
-//! when the application interrupts or closes the session, and when the
-//! process dies. A [`Monitor`] checks every step of every path, and at the
+//! when the application interrupts or closes the session, when the line
+//! drops and whether it comes back, and when the process dies. A [`Monitor`] checks every step of every path, and at the
 //! end of each path the journal is checked against the kernel.
 //!
 //! A [`Scope`] says how small the session is. Within it nothing is
@@ -70,6 +70,9 @@ pub struct Scope {
     pub says: u8,
     /// Times the application asks for the session to close.
     pub closes: u8,
+    /// Times the line drops. Each time it comes back at any moment after,
+    /// or never.
+    pub drops: u8,
     /// Times the process dies.
     pub crashes: u8,
     /// Language models that go on to report their end after they were
@@ -96,6 +99,7 @@ impl Scope {
             interrupts: 1,
             says: 0,
             closes: 1,
+            drops: 0,
             crashes: 0,
             late: 0,
             most_states: 2_000_000,
@@ -208,6 +212,7 @@ struct Left {
     interrupts: u8,
     says: u8,
     closes: u8,
+    drops: u8,
     crashes: u8,
     late: u8,
 }
@@ -238,6 +243,8 @@ struct World {
     /// Whether the process has just come back and nothing has woken the
     /// session.
     asleep: bool,
+    /// Whether the line has dropped and is not back.
+    gone: bool,
     left: Left,
 }
 
@@ -279,6 +286,7 @@ impl World {
             storing: Vec::new(),
             vouched: 0,
             asleep: false,
+            gone: false,
             left: Left {
                 turns: scope.turns,
                 calls: scope.calls,
@@ -287,6 +295,7 @@ impl World {
                 interrupts: scope.interrupts,
                 says: scope.says,
                 closes: scope.closes,
+                drops: scope.drops,
                 crashes: scope.crashes,
                 late: scope.late,
             },
@@ -382,6 +391,8 @@ impl World {
                     storing: Vec::new(),
                     vouched: stored,
                     asleep: true,
+                    // The process that comes back has its line.
+                    gone: false,
                     left: self.left,
                 };
                 next.left.crashes -= 1;
@@ -649,6 +660,17 @@ impl World {
             moves.push(self.then(
                 |next| next.left.closes -= 1,
                 control(ControlInput::Close { reason }),
+            ));
+        }
+        if self.gone {
+            moves.push(self.then(|next| next.gone = false, control(ControlInput::Attached)));
+        } else if self.left.drops > 0 {
+            moves.push(self.then(
+                |next| {
+                    next.left.drops -= 1;
+                    next.gone = true;
+                },
+                control(ControlInput::Detached),
             ));
         }
     }
@@ -960,6 +982,7 @@ mod tests {
             interrupts: 0,
             says: 0,
             closes: 0,
+            drops: 0,
             crashes: 0,
             late: 0,
             most_states: 100_000,
@@ -1011,8 +1034,12 @@ mod tests {
             crashes: 1,
             ..one.clone()
         };
+        let dropped = Scope {
+            drops: 1,
+            ..one.clone()
+        };
         let base = explore(&one).unwrap().states;
-        for scope in [interrupted, with_tool, died] {
+        for scope in [interrupted, with_tool, died, dropped] {
             let explored = explore(&scope).unwrap();
             assert!(explored.states > base, "{scope:?}: {explored:?}");
         }
