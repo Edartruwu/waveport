@@ -92,6 +92,47 @@ impl What {
     }
 }
 
+/// How lengths of time are spread: the least and the greatest of them,
+/// and the lengths that half of them, 95 in a hundred and 99 in a
+/// hundred are no longer than.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Spread {
+    /// How many lengths there are.
+    pub count: usize,
+    /// The least.
+    pub min: Duration,
+    /// Half are no longer than this.
+    pub p50: Duration,
+    /// 95 in a hundred are no longer than this.
+    pub p95: Duration,
+    /// 99 in a hundred are no longer than this.
+    pub p99: Duration,
+    /// The greatest.
+    pub max: Duration,
+}
+
+impl Spread {
+    /// How `lengths` are spread, which puts them in order. Each of the
+    /// lengths it names is one of them: the least that so many are no
+    /// longer than. No lengths have no spread.
+    #[must_use]
+    pub fn of(lengths: &mut [Duration]) -> Option<Self> {
+        lengths.sort_unstable();
+        let no_longer = |in_a_hundred: usize| {
+            let rank = (lengths.len() * in_a_hundred).div_ceil(100).max(1);
+            lengths.get(rank - 1).copied()
+        };
+        Some(Self {
+            count: lengths.len(),
+            min: lengths.first().copied()?,
+            p50: no_longer(50)?,
+            p95: no_longer(95)?,
+            p99: no_longer(99)?,
+            max: lengths.last().copied()?,
+        })
+    }
+}
+
 /// What is known of a response that is under way.
 #[derive(Clone, Copy, Debug)]
 struct Response {
@@ -329,7 +370,9 @@ mod tests {
     use waveport_domain::time::{MediaSpan, MediaTime, MonoTime};
     use waveport_ports::telemetry::{Stage, StageMark};
 
-    use super::{Stretch, Tracker, What};
+    use core::time::Duration;
+
+    use super::{Spread, Stretch, Tracker, What};
 
     /// What a tracker found in the marks it was given, as the name of
     /// each part and how long it took in milliseconds.
@@ -380,6 +423,34 @@ mod tests {
             text: text.push("It is nine."),
             truncated: false,
         }
+    }
+
+    #[test]
+    fn lengths_are_spread_between_their_least_and_their_greatest() {
+        let ms = Duration::from_millis;
+        // In any order.
+        let mut lengths: Vec<Duration> = (1..=100).rev().map(ms).collect();
+        let spread = Spread::of(&mut lengths);
+        let expected = Spread {
+            count: 100,
+            min: ms(1),
+            p50: ms(50),
+            p95: ms(95),
+            p99: ms(99),
+            max: ms(100),
+        };
+        assert_eq!(spread, Some(expected));
+
+        // Few lengths: each named length is still one of them.
+        let spread = Spread::of(&mut [ms(30), ms(10), ms(20)]);
+        let (p50, p95) = (spread.map(|it| it.p50), spread.map(|it| it.p95));
+        assert_eq!((p50, p95), (Some(ms(20)), Some(ms(30))));
+        let one = Spread::of(&mut [ms(7)]);
+        assert_eq!(
+            one.map(|it| (it.min, it.p50, it.p99, it.max)),
+            Some((ms(7), ms(7), ms(7), ms(7)))
+        );
+        assert_eq!(Spread::of(&mut []), None);
     }
 
     #[test]
