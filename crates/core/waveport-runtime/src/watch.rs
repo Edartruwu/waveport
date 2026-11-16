@@ -28,6 +28,8 @@ pub(crate) struct Counters {
     over: AtomicU64,
     /// The longest of them, in nanoseconds.
     longest: AtomicU64,
+    /// How long the sessions ran in all, in nanoseconds.
+    busy: AtomicU64,
 }
 
 impl Counters {
@@ -38,6 +40,7 @@ impl Counters {
             self.over.fetch_add(1, Ordering::Relaxed);
         }
         self.longest.fetch_max(nanos, Ordering::Relaxed);
+        self.busy.fetch_add(nanos, Ordering::Relaxed);
     }
 
     /// The counts as they stand.
@@ -47,6 +50,7 @@ impl Counters {
             polls: self.polls.load(Ordering::Relaxed),
             over_budget: self.over.load(Ordering::Relaxed),
             longest: Duration::from_nanos(self.longest.load(Ordering::Relaxed)),
+            busy: Duration::from_nanos(self.busy.load(Ordering::Relaxed)),
         }
     }
 }
@@ -63,6 +67,9 @@ pub struct ShardStats {
     pub over_budget: u64,
     /// The longest run.
     pub longest: Duration,
+    /// How long its sessions ran in all. Against the time that has
+    /// passed, it says how much of its thread the shard uses.
+    pub busy: Duration,
 }
 
 /// A future whose every poll is timed.
@@ -130,5 +137,8 @@ mod tests {
         assert_eq!(stats.polls, 3);
         assert_eq!(stats.over_budget, 1);
         assert!(stats.longest >= Duration::from_millis(20), "{stats:?}");
+        // The three runs together took at least as long as the longest,
+        // and it is their sum that is kept, not the last.
+        assert!(stats.busy >= stats.longest, "{stats:?}");
     }
 }
