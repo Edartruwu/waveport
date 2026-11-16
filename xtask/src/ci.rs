@@ -28,6 +28,13 @@ const FEATURES: &str = "cargo hack check --feature-powerset --workspace --locked
 const MSRV: &str = "cargo hack check --rust-version --workspace --all-targets --locked";
 const DENY: &str = "cargo deny check";
 const BENCH_SMOKE: &str = "cargo bench -p waveport-benches --bench wall_smoke --locked -- --test";
+/// Tries every way the threads of the compute plane can take turns over
+/// what they hand each other. The build is one of its own, made with
+/// [`LOOM_FLAGS`] and kept apart so that it and the ordinary one do not
+/// throw each other's work away.
+const LOOM: &str =
+    "cargo test --release --locked -p waveport-runtime --lib --target-dir target/loom";
+const LOOM_FLAGS: &str = "--cfg waveport_loom";
 const MIRI: &str = concat!(
     "rustup run ",
     miri_toolchain!(),
@@ -199,6 +206,18 @@ const GATES: &[Gate] = &[
         run: |env| shell(env, BENCH_SMOKE),
     },
     Gate {
+        name: "loom",
+        fast: false,
+        tool: None,
+        run: |env| {
+            command(env, LOOM, true)?
+                .env("RUSTFLAGS", LOOM_FLAGS)
+                .status()
+                .map(|status| status.success())
+                .context("could not run the loom schedules")
+        },
+    },
+    Gate {
         name: "miri",
         fast: false,
         tool: Some(Tool::Miri),
@@ -316,8 +335,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        BENCH_SMOKE, CLIPPY, DENY, DOCS, DOCTEST, FEATURES, FMT, GATES, MIRI, MSRV, NO_STD, TEST,
-        Tool,
+        BENCH_SMOKE, CLIPPY, DENY, DOCS, DOCTEST, FEATURES, FMT, GATES, LOOM, LOOM_FLAGS, MIRI,
+        MSRV, NO_STD, TEST, Tool,
     };
 
     #[test]
@@ -379,6 +398,7 @@ mod tests {
                 MSRV,
                 DENY,
                 BENCH_SMOKE,
+                LOOM,
                 MIRI,
                 Tool::Miri.hint(),
                 // Run in-process by `cargo xtask ci`.
@@ -390,6 +410,7 @@ mod tests {
                 // Settings the local runner applies to its child processes.
                 "CARGO_BUILD_WARNINGS: deny",
                 "RUSTDOCFLAGS: -D warnings",
+                &format!("RUSTFLAGS: {LOOM_FLAGS}"),
             ],
         );
     }
@@ -405,6 +426,7 @@ mod tests {
             &[
                 "cargo deny check advisories",
                 "cargo test --release --locked -p waveport-domain --test simulation",
+                "cargo test --release --locked -p waveport-runtime --test simulation",
                 "WAVEPORT_SIM_SEEDS=",
                 "cargo test --release --locked -p waveport-domain --test model -- --include-ignored",
             ],

@@ -2,6 +2,7 @@
 
 use core::time::Duration;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
@@ -36,6 +37,10 @@ pub struct MemoryJournal {
     sessions: Arc<Mutex<BTreeMap<SessionId, Stored>>>,
     /// What the next append fails with, once.
     fail_next: Arc<Mutex<Option<PortError>>>,
+    /// The number of the last record that is stored before the journal
+    /// stops, if it is to stop.
+    stops_after: Arc<Mutex<Option<u64>>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl Default for MemoryJournal {
@@ -52,7 +57,37 @@ impl MemoryJournal {
             latency: Duration::from_millis(2),
             sessions: Arc::default(),
             fail_next: Arc::default(),
+            stops_after: Arc::default(),
+            stopped: Arc::default(),
         }
+    }
+
+    /// Makes the journal stop once it holds the record numbered `last`
+    /// of a session: what a process that dies does to its journal. The
+    /// records up to that one are stored, also when they are the
+    /// beginning of a batch, and nothing after it is. A request that
+    /// meets the end is never answered.
+    pub fn stop_after(&self, last: u64) {
+        *self
+            .stops_after
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(last);
+    }
+
+    /// Whether the journal has stopped.
+    #[must_use]
+    pub fn has_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Lets a journal that was to stop, or has stopped, go on: what it
+    /// stored is what the next process finds.
+    pub fn go_on(&self) {
+        *self
+            .stops_after
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.stopped.store(false, Ordering::Relaxed);
     }
 
     /// Makes the next append fail with `error`, having stored nothing.
@@ -121,7 +156,11 @@ impl Journal for MemoryJournal {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
-            self.with(session, lease, |stored| {
+            let stops_after = *self
+                .stops_after
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let answer = self.with(session, lease, |stored| {
                 if let Some(error) = failure {
                     return Err(JournalError::Store(error));
                 }
@@ -129,9 +168,22 @@ impl Journal for MemoryJournal {
                 if batch.first != expected {
                     return Err(JournalError::OutOfOrder { expected });
                 }
-                stored.records.extend(batch.records);
+                // A journal that stops stores what comes before its end.
+                let room = stops_after.map_or(usize::MAX, |last| {
+                    usize::try_from(last.saturating_sub(expected.0.saturating_sub(1)))
+                        .unwrap_or(usize::MAX)
+                });
+                let whole = batch.records.len() <= room;
+                stored.records.extend(batch.records.into_iter().take(room));
+                if !whole {
+                    self.stopped.store(true, Ordering::Relaxed);
+                }
                 Ok(Seq(stored.next().0 - 1))
-            })
+            });
+            if self.has_stopped() {
+                core::future::pending::<()>().await;
+            }
+            answer
         })
     }
 

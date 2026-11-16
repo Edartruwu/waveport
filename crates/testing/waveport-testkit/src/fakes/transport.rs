@@ -59,6 +59,9 @@ pub struct TransportLog {
     /// How many frames of a response were sent after the far end was told
     /// to discard it. The port does not allow any.
     pub late: usize,
+    /// How many frames and requests were sent after the transport had
+    /// said that it was closed.
+    pub after_close: usize,
 }
 
 impl TransportLog {
@@ -178,8 +181,28 @@ impl FakeTransportBuilder {
     /// The codec of the transport cannot be set up.
     #[must_use]
     pub fn microphone(
+        self,
+        who: ParticipantId,
+        from_ms: u64,
+        to_ms: u64,
+        talks: &[(u64, u64)],
+    ) -> Self {
+        self.microphone_of(who, 0, from_ms, to_ms, talks)
+    }
+
+    /// A [`microphone`](Self::microphone) whose tone is in the voice
+    /// numbered `voice`, from 0 to 2: the higher the number the quieter
+    /// the tone, which is how a scripted recogniser tells who is
+    /// speaking.
+    ///
+    /// # Panics
+    ///
+    /// The codec of the transport cannot be set up.
+    #[must_use]
+    pub fn microphone_of(
         mut self,
         who: ParticipantId,
+        voice: u8,
         from_ms: u64,
         to_ms: u64,
         talks: &[(u64, u64)],
@@ -199,7 +222,7 @@ impl FakeTransportBuilder {
             let talking = talks.iter().any(|(from, to)| (*from..*to).contains(&at_ms));
             for (offset, sample) in frame.iter_mut().enumerate() {
                 *sample = if talking {
-                    tone(n * rate.frame() + offset)
+                    tone(n * rate.frame() + offset) / (i16::from(voice.min(2)) + 1)
                 } else {
                     0
                 };
@@ -225,6 +248,26 @@ impl FakeTransportBuilder {
         self
     }
 
+    /// Changes when the packets written so far arrive: each at the time
+    /// `arrival` makes of the time it was sent, or never, for `None`.
+    /// Packets that arrive in another order than they were sent in are
+    /// what a network does to them.
+    #[must_use]
+    pub fn disturbed(mut self, mut arrival: impl FnMut(Duration) -> Option<Duration>) -> Self {
+        let mut kept = Vec::with_capacity(self.events.len());
+        for (at, event) in self.events {
+            if matches!(event, TransportEvent::Audio { .. }) {
+                if let Some(at) = arrival(at) {
+                    kept.push((at, event));
+                }
+            } else {
+                kept.push((at, event));
+            }
+        }
+        self.events = kept;
+        self
+    }
+
     /// The far end holds `ms` of each response before it plays any of it,
     /// as a buffer against jitter does. What it has played is then that
     /// far behind what it was sent.
@@ -234,8 +277,9 @@ impl FakeTransportBuilder {
         self
     }
 
-    /// The transport closes once its script has run out. Without this it
-    /// stays open, with nothing more happening at the far end.
+    /// The transport closes once its script has run out, whatever the
+    /// far end is playing then. Without this it stays open, with nothing
+    /// more happening at the far end.
     #[must_use]
     pub const fn then_closes(mut self) -> Self {
         self.closes = true;
@@ -256,6 +300,7 @@ impl FakeTransportBuilder {
             start,
             script: self.events.into(),
             closes: self.closes,
+            closed: false,
             holds: self.holds,
             playing: None,
             timer: Box::pin(tokio::time::sleep_until(start)),
@@ -273,6 +318,8 @@ pub struct FakeTransport {
     start: Instant,
     script: VecDeque<(Duration, TransportEvent)>,
     closes: bool,
+    /// Whether it has said that it is closed.
+    closed: bool,
     holds: Duration,
     playing: Option<Playing>,
     timer: Pin<Box<Sleep>>,
@@ -368,14 +415,19 @@ impl Transport for FakeTransport {
         self.caps
     }
 
-    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>> {
-        let this = self.get_mut();
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>> {
+        let this = self;
         let now = Instant::now();
         if let Some((at, _)) = this.script.front()
             && this.start + *at <= now
             && let Some((_, event)) = this.script.pop_front()
         {
             return Poll::Ready(Some(event));
+        }
+        if this.closed || (this.closes && this.script.is_empty()) {
+            // The far end is gone, whatever it was playing.
+            this.closed = true;
+            return Poll::Ready(None);
         }
         if let Some(event) = this.report(now) {
             return Poll::Ready(Some(event));
@@ -387,9 +439,6 @@ impl Transport for FakeTransport {
             (a, b) => a.or(b),
         };
         let Some(next) = next else {
-            if this.closes && this.script.is_empty() {
-                return Poll::Ready(None);
-            }
             // Nothing is due. A frame that is sent may change that.
             this.waker = Some(cx.waker().clone());
             return Poll::Pending;
@@ -404,6 +453,10 @@ impl Transport for FakeTransport {
     }
 
     fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full> {
+        if self.closed {
+            self.log().after_close += 1;
+            return Ok(());
+        }
         let now = Instant::now();
         let end = frame.at.saturating_add(frame.length);
         match &mut self.playing {
@@ -445,6 +498,10 @@ impl Transport for FakeTransport {
     }
 
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full> {
+        if self.closed {
+            self.log().after_close += 1;
+            return Ok(());
+        }
         let now = Instant::now();
         let TransportControl::Clear { tag } = control;
         let when = now.saturating_duration_since(self.start);

@@ -68,32 +68,41 @@ Waveport is a hexagonal (ports and adapters) system with a domain-driven core. D
 
 | Plane | What runs there | Rule |
 |---|---|---|
-| Control | One single-writer actor per session driving `Kernel::step(now, event, &mut out)` | `step` never awaits, does no I/O and reads no clock. The actor's mailbox receive is the only await |
+| Control | One single-writer actor per session driving `Kernel::step(now, event, &mut out)` | `step` never awaits, does no I/O and reads no clock. The actor waits in one place only: when no part has anything for it |
 | Media | `Ingress` (reorder, decode, denoise, resample, fan-out) and `Playout` (buffer, pace, fade, encode) | Audio samples never enter the kernel. Plain structs, static dispatch, pooled frames, no allocation |
-| Compute | Voice-activity detection, end-of-turn, interruption classifier, neural noise suppression | Pinned OS threads. One model instance per compute thread, shared by every session, batched across sessions |
+| Compute | Voice-activity detection, end-of-turn, interruption classifier, neural noise suppression | OS threads of their own. One model instance per compute thread, shared by every session, batched across sessions |
 
-The whole control plane of a session is this loop:
+The whole control plane of a session is one task, and this is all it does:
 
 ```rust
 loop {
-    let ev = mailbox.recv_or_timer().await;    // the only await
-    kernel.step(clock.now(), ev, &mut out);    // pure; target under 10 µs
-    journal.enqueue(&out.facts);               // copy into the shard's journal buffer
-    for cmd in out.cmds.drain(..) {
-        drivers.dispatch(cmd);                 // try_send; never blocks
+    let events = parts.gather(now);            // every part looked at once, in a fixed order
+    for event in events {
+        kernel.step(now, &event, &mut out);    // pure; target under 10 µs
+        journal.enqueue(&out.facts);           // serialised here, stored off the session's path
+        for cmd in out.cmds.drain(..) {
+            parts.carry_out(cmd);              // an ordinary call; never waits
+        }
+    }
+    transport.send(frames_due(now));
+    if nothing_moved {
+        sleep_until_woken_or(next_deadline).await;   // the only await
     }
 }
 ```
+
+The parts are the transport, a recogniser for each participant, the answers of the listening models, the responses that are being written, the voice (synthesis and playout), the tool calls, the journal, and what the application asks. None of them is a task of its own, and there is no queue between two of them. A command is a call on the part it is for, so when the kernel says stop, playback has stopped before the next event is looked at. The order in which the parts are looked at is fixed and nothing in a session is random, so a session on a clock that a test controls does the same thing every time. A session that has more to do than fits in one run gives way to the other sessions of its shard and goes on at its next turn.
 
 Two alternatives were rejected. A chain of per-processor tasks joined by queues (Pipecat's model) makes an interruption a message racing data through N queues, which is the structural cause of its race bugs. A compiled static dataflow graph is right for the per-frame audio chain, and waveport uses one there, but turn-taking is reactive control with cancellation, not dataflow.
 
 ### 4.2 Executor and shards
 
-- The process runs N shards. Each shard is a pinned, single-threaded Tokio `LocalRuntime`, and a session stays on one shard for life.
+- The process runs N shards. Each shard is a thread with a single-threaded Tokio `LocalRuntime`, and a session stays on one shard for life. A new session goes to the shard that has the fewest. The threads are not pinned to cores yet: that comes with the density gate, which is what can say whether it helps.
 - The session path therefore has no cross-thread wake-ups and no locks, the kernel-to-playout call is an ordinary function call, and production has the same topology as the simulator.
-- The cost is head-of-line blocking. Inline work is capped at 250 µs per call, enforced by a poll-time watchdog and a CI gate. Opus and SIMD resampling fit that budget and run inline. The cap was 100 µs until the phase 1 spike measured an Opus encode at 24 kHz: 110 to 140 µs on average and up to 215 µs, depending on encoder complexity.
+- The cost is head-of-line blocking. Inline work is capped at 250 µs per call. Every run of a session is timed, and each shard counts the runs that took longer and keeps the longest; the CI gate on those counts comes with the other performance gates. Opus and SIMD resampling fit that budget and run inline. The cap was 100 µs until the phase 1 spike measured an Opus encode at 24 kHz: 110 to 140 µs on average and up to 215 µs, depending on encoder complexity.
+- A session that panics ends alone. Its shard and the other sessions on it go on, whoever waits for the session is told that it panicked, and what it had recorded is in its journal.
 - Adapters are still required to be `Send`, so moving to a work-stealing runtime stays possible. If pacing jitter misses its target, the media loop moves to a sibling thread per shard without touching the kernel.
-- Model batching: shards push `(slot, frame)` into a lock-free ring. Every model fires immediately with whatever is queued, up to 64 frames for voice activity, so batches grow by themselves as load grows. The spike measured the alternative, waiting up to 2 ms to fill a batch: it saves 14% of inference time and misses the latency target in section 12. Results return as kernel events stamped with media time, so batching cannot reorder them.
+- Model batching: each stream of audio has rings of its own to the thread that judges frames, one for where each frame begins and one for the samples, and a ring back for the answers. Neither side waits for the other: a frame that finds no room is dropped whole and counted. The models that judge a whole turn are slower and are asked far less often, and have a thread of their own. What a session and those threads hand each other is in one module of the runtime, and every way its threads can take turns over it is tried with `loom` (section 14). Every model fires immediately with whatever is queued, up to 64 frames for voice activity, so batches grow by themselves as load grows. The spike measured the alternative, waiting up to 2 ms to fill a batch: it saves 14% of inference time and misses the latency target in section 12. Results return as kernel events stamped with media time, so batching cannot reorder them.
 
 ### 4.3 Identities
 
@@ -208,7 +217,9 @@ A tool call moves through `Proposed → Authorized → Dispatched` and ends once
 
 ### 4.9 Shutdown
 
-The lifecycle is `Running → Draining → Closing → Closed`. A session that is draining lets the agent finish what it is saying and starts nothing new; it moves on as soon as nothing is under way, or at the first step after the drain time has passed, whichever event that step is for. Two timers, for the drain and for the grace time, make sure such a step happens even if one of them is lost. Commands are sent with `try_send`. Adapter tasks sit in a join set and are aborted when the grace timer fires. `Closed` is reached within drain time plus grace time whatever any adapter does.
+The lifecycle is `Running → Draining → Closing → Closed`. A session that is draining lets the agent finish what it is saying and starts nothing new; it moves on as soon as nothing is under way, or at the first step after the drain time has passed, whichever event that step is for. Two timers, for the drain and for the grace time, make sure such a step happens even if one of them is lost. No command waits for an adapter, and an adapter that does not answer is dropped with the session. `Closed` is reached within drain time plus grace time whatever any adapter does.
+
+A session whose transport ends is closed as abandoned, and what the agent was saying is cut off where it was heard to. It is closed first and cut off after, so that the response that was owed next is not started for nobody. A session that cannot hear, because its recogniser failed six times in a row without a transcript in between, is closed as failed. A session that is told its journal belongs to another owner stops where it is: it falls silent at once and asks nothing more of anyone, the tools included.
 
 ### 4.10 Extension points
 
@@ -228,8 +239,10 @@ The principle is: **audio drops, text blocks, control coalesces.**
 | Transport → reorder buffer | A wait of 0–60 ms that adapts; 10 packets (200 ms) held at most | A late packet is dropped. A gap is made up by the codec for 60 ms, then filled with silence up to 1 s. A longer one breaks the stream off, and it begins anew when the next packet arrives |
 | Ingress → voice-activity batcher | About 100 ms ring | Drop the frame, hold the last state, count it |
 | Ingress → speech-to-text | 2 s ring | Drop oldest, mark the session degraded, fail over |
-| Adapter → kernel mailbox | 256 events | The sender awaits, so pressure reaches the provider socket |
-| Kernel → adapter commands | 32 | `try_send`; full means unhealthy, so cancel and fail over |
+| Adapter → kernel | No queue. The session reads a stream when it runs | What is not read stays in the adapter, so pressure reaches the provider socket |
+| Kernel → adapter commands | No queue. Calls that never wait | Text an adapter has no room for is kept and given when it has. A request for a transcript that is refused is counted |
+| Application → session | 256 requests | The request is refused, and the application is told that the session is behind |
+| Session → a follower | 256 things told | The follower is let go, and follows again from the last fact it saw |
 | LLM → text-to-speech | Credit: release text while synthesized-minus-played is 3 s or less | Hold text; stop reading the LLM stream above 8 KB pending. A model that writes on to twice that is cancelled, and what it wrote is spoken |
 | Text-to-speech → playout buffer | 3 s of audio | The driver stops reading the provider socket |
 | Playout → transport | 20 ms frames; 20 ms send-ahead by default, 40 ms at most | Never queue beyond the lead |
@@ -338,7 +351,7 @@ pub trait Llm: Send + Sync + 'static {
 
 pub trait Transport: Send + 'static {
     fn caps(&self) -> TransportCaps; // codec each way, remote buffer (clearable, says what it played), text
-    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>>;
     fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full>;
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full>; // Clear
 }
@@ -410,12 +423,11 @@ Both clients use one TLS configuration: `rustls` with `ring`, and certificates c
 ### 8.4 Driving ports (sketches)
 
 ```rust
-pub trait SessionControl {
-    fn start(&self, spec: SessionSpec) -> BoxFuture<'_, Result<SessionId, StartError>>;
-    fn send(&self, s: SessionId, input: ControlInput) -> Result<(), ControlError>;
-    // ControlInput: Text, Say, Interrupt, Handoff, Close
-    fn subscribe(&self, s: SessionId, from: Seq) -> Box<dyn EventRx>; // resumable by Seq
-    fn migrate(&self, s: SessionId, to: NodeId) -> BoxFuture<'_, Result<(), MigrateError>>;
+pub trait SessionControl: Send + Sync + 'static {
+    fn send(&self, session: SessionId, input: SessionInput) -> Result<(), ControlError>;
+    // SessionInput: Text, Say, Interrupt, Handoff, Close
+    fn subscribe(&self, session: SessionId, from: Seq)
+        -> Result<Pin<Box<dyn EventRx>>, ControlError>;       // resumable by Seq
 }
 
 pub trait Dispatch {
@@ -425,7 +437,11 @@ pub trait Dispatch {
 }
 ```
 
-Neither is built. `SessionControl` comes with the runtime that implements it.
+`SessionControl` is built, and the runtime implements it. `Dispatch` is a sketch.
+
+- Whoever follows a session is told two kinds of thing: the facts of the session, each with its number and in the form the journal holds it in, and the news that is not kept, such as who is speaking. A follower that comes back after a break names the first fact it has not seen. A session holds its last 128 facts for that; a follower that asks for older ones is told at which fact what follows begins, and has the ones before it from the journal.
+- A request is taken or refused at once. A session that has 256 requests waiting refuses the next.
+- Starting a session is a method of the runtime and not of the port. What a session is made of (its transport, its providers, its tools) is decided where the parts are put together, and a port cannot name that yet. It joins the port with the daemon, which starts sessions from a description. `migrate` comes with the fleet.
 
 ## 9. Durability
 
@@ -439,6 +455,8 @@ Waveport stores a snapshot plus a journal of **domain events**, not inputs. Reco
 | One synchronous barrier | Before dispatching a call to a tool that is not `Pure`, the kernel emits `AwaitDurable(seq)` for the record that authorises the dispatch, and dispatches on `Durable` |
 | Format | Facts and snapshots are versioned serde records defined in `waveport-protocol`. The domain crate stays free of serialisation: the runtime maps each fact to its record with an exhaustive match, so a new fact does not compile until it is mapped. Zero-copy archives (`rkyv`) were rejected for snapshots, because an archived layout cannot evolve and a newer build must read the state an older one wrote |
 | Fencing | Appends are conditional on `(lease epoch, expected seq)`, so a superseded owner can neither write nor speak |
+| A journal that does not answer | The append is tried again, after 50 ms and then after twice as long each time, up to 2 s. Nothing is lost meanwhile: the facts wait in order, and a tool call that has an effect waits with them. An append that is refused, because another owner has the session or the numbering does not fit, ends the session where it is |
+| Snapshots | Not written yet: a session is rebuilt from the whole of its journal. They come with the local journal |
 
 Three recovery levels:
 
@@ -465,7 +483,7 @@ What cannot be restored, and what happens instead:
 |---|---|
 | In-flight LLM or text-to-speech work | Discarded and regenerated from committed context |
 | A partially played utterance after a crash | Committed to the last checkpoint and flagged truncated, with up to 1 s of uncertainty |
-| Speech-to-text hypothesis state | On migration the open turn's pre-roll (up to 8 s) travels with the snapshot and is re-fed. On a crash it is lost and the agent asks again |
+| Speech-to-text hypothesis state | On migration the open turn's pre-roll (up to 8 s) travels with the snapshot and is re-fed. On a crash it is lost and the agent asks again. A recogniser that fails while its session lives is opened again, after 200 ms and then after twice as long each time, up to 5 s, and is given what was heard since its last final transcript, from the same 8 s |
 | A speech-to-speech provider session | Server-side audio context is not portable. Use the provider's resumption handle if it has one; otherwise seed a new session from the kernel's text mirror (prosody is lost); otherwise from a summary |
 
 ## 10. Multi-agent
@@ -539,15 +557,15 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 |---|---|
 | Kernel scenarios | Six stories written before the kernel, each closing a race from section 4.5 or a session shape from section 6. A simulated world stands in for every adapter, and each story is run along every order in which its events could arrive. The scenario files are not edited to make them pass |
 | Deterministic simulation, level 1 | A seed makes up a session: who is in it, when they speak, what the model writes and which tools it calls, which agent has the floor, and how each adapter answers. Six profiles decide what goes wrong: calm, chaos, stalls, duplicates, shutdown, and crashes, in which the process dies and the session goes on from what of its journal had reached the disk. `Kernel::step` is driven with a virtual clock, no executor needed, and a monitor that keeps its own account of the session checks the invariants after every step, that the journal alone adds up to the kernel's state, and that nothing is left unfinished at the end. Each session runs twice to show the kernel is deterministic. Every test run has 600 sessions per profile; a nightly run has 200,000, and other ones each night |
-| Deterministic simulation, level 2 | The real actor loop and drivers on a simulated single-threaded executor. Fake adapters delay, reorder, stall, disconnect and crash at any journal offset. Every failure is a seed |
+| Deterministic simulation, level 2 | The real session actor on an executor whose clock the test controls, with a fake in every port and the monitor of level 1 on every step. A seed makes up the session: who calls and what they say, how late every part answers, what the line does to the packets, which parts fail and when, what the application asks, and at which record of its journal the process dies, up to three times. The six stories of the kernel scenarios are told again under many seeds, and sessions nobody wrote are made up under four profiles: calm, chaos, crashes and shutdown. Beyond the invariants, every run is checked on what the far end was sent (frames in order and on time, none after a clear or a close), that nothing is in the conversation that the far end did not play, that no tool with an effect was called before the record that allows it was stored, or twice, that the journal has no gaps, and that a session rebuilt from the journal is the session that wrote it. Every test run has 250 sessions; a nightly run has 10,000, and other ones each night. Every failure is a seed |
 | Property tests | The ten invariants over arbitrary interleavings |
 | Small-scope model check | Every order in which the events of a small session can arrive: speech, transcripts and estimates, model text and tool requests, synthesis and playback, tool results, timers, an interruption, a close and the death of the process, with the same monitor checking each step. One session with all of that would be too large, so there are several, each without what another has: up to 2 participants, 3 turns, 2 tools and 2 calls. Every test run tries about 200,000 states, and the nightly run about 6 million |
 | Replay | A session is written down as the events its kernel was given, a line each. Five such traces are kept with what the kernel emitted for every line, and each test run gives a new kernel the same events and compares: a change in what the kernel does shows as the first line that differs. A path on which the model check or the simulation fails can be written down and run again in the same way. Flight-recorder traces from the runtime will use the format |
 | Random networks | A seed makes up the network between a sender and the inbound path: jitter, loss, repeats, outages, bursts, and packets that arrive together. Rules are checked on what comes out: one unbroken timeline, each packet once and in order, never more than 60 ms made up in a row, every deadline in the future, and counters that add up. 500 networks in every test run. The outbound path, the codecs and the change of rate have exact tests of their own: a tone must come through the filter at its level, and one above the band must be 55 dB down |
 | Fuzzing | `step` with structured events; every wire parser (SIP, SDP, RTP, client protocol); journal decode with snapshot round trip |
-| Concurrency checking | The few lock-free structures (rings, batcher) |
+| Concurrency checking | What a session and the compute plane hand each other: the frames of a stream, the answers, the wake-up of the session and of the thread that judges frames. `loom` tries every way the threads of small cases can take turns, in every test run, and fails on a frame that arrives in pieces or a wake-up that is missed. The rings themselves are `rtrb`'s and are stood in for there: what is tried is how they are used |
 | Port conformance kit | Functions in `waveport-testkit` that hold any implementation of a port to the port's rules: a model's response ends once and says how, a recogniser's final transcripts are in order and inside the audio it was sent, a synthesiser's audio and marks add up, a journal fences and keeps its numbering, and a stream that is dropped stops. They run in every test run on the fakes, in every combination of what a fake can say it does, and on implementations made to break one rule at a time, to show that each rule is checked. Adapters run them against recorded servers, and nightly against the live provider |
-| Whole sessions on fakes | A fake of every port, on virtual time: a transport whose far end speaks, plays what it is sent and says what it played; a recogniser, a model, a synthesiser and tools that follow a script; a journal in memory. The kernel and the audio path are the real ones. Four conversations are run through the ports and nothing else: a question and its answer heard to the end, an interruption answered on the words that were heard, a tool call and its result, and the same interruption with parts that can do less. The loop that joins the parts is test code until the runtime exists |
+| Whole sessions on fakes | A fake of every port, on virtual time: a transport whose far end speaks, plays what it is sent and says what it played; a recogniser, a model, a synthesiser and tools that follow a script; a journal in memory. The kernel, the audio path and the session actor are the real ones. Conversations written by hand are run through the ports and nothing else, one for each thing a session has to do or to live through: a question and its answer heard to the end, an interruption answered on the words that were heard, a tool call and its result, parts that can do less, what an application asks, a line that closes, a recogniser that fails, a journal that fails or is taken over, a process that dies, and a follower that comes back. Sessions on real threads are started, driven, followed and ended, one that panics among them |
 | CI gates | Instruction-count benchmarks for `step` and the per-frame media path; a counting allocator that fails on any allocation in the media path; a 1,000-session soak with flat memory; the density and interruption targets; a `kill -9` test that must resume |
 
 ## 15. Workspace and Cargo spec

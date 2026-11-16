@@ -24,6 +24,7 @@ bench = false
 unsafe_code = "deny"
 missing_docs = "warn"
 unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(waveport_loom)"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

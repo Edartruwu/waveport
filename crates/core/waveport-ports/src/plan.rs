@@ -198,7 +198,10 @@ pub enum Shortfall {
     /// can be a few words away from what was heard. That is so inside a
     /// piece of text whose audio has all arrived. Inside one whose audio
     /// is still arriving nothing is known yet, and the cut is where the
-    /// piece begins.
+    /// piece begins. For a synthesiser that is given the text of a
+    /// response bit by bit in one stream, the whole response is such a
+    /// piece until the synthesiser has finished: a response that is
+    /// interrupted before that is recorded as not heard at all.
     CoarseSpokenText,
     /// The far end does not say what it has played. What was heard is
     /// worked out from the pace, and is ahead of the truth by whatever

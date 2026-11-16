@@ -16,5 +16,29 @@ stability = "experimental"
 [lib]
 bench = false
 
+[dependencies]
+waveport-domain = { workspace = true }
+waveport-media = { workspace = true }
+waveport-ports = { workspace = true }
+waveport-protocol = { workspace = true }
+
+bytes = { workspace = true }
+futures-util = { workspace = true }
+rtrb = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+waveport-kernel-sim = { workspace = true }
+waveport-sim = { workspace = true }
+waveport-testkit = { workspace = true }
+
+# The checker that tries every way threads can take turns. It is used by the
+# build that `cargo xtask ci` makes for its gate `loom` and by no other, and
+# is named here without that condition so that `cargo deny` sees it.
+loom = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+
 [lints]
 workspace = true
