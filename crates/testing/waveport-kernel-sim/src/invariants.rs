@@ -10,7 +10,7 @@
 //!
 //! The invariants are those of `docs/architecture.md`, section 13. A
 //! monitor checks all of them that can be seen in one life of a session:
-//! 1 to 8, the numbering of facts from 10, and progress. Invariant 9, that
+//! 1 to 8, the numbering of facts from 10, 11, and progress. Invariant 9, that
 //! the journal rebuilds the session, is checked by [`Journal`], which
 //! keeps what the kernel journaled; and what must hold from one life of a
 //! session to the next is checked by whoever restarts it, with a monitor
@@ -26,7 +26,7 @@ use waveport_domain::command::{
     Activity, ClientEvent, Command, LlmCause, LlmCmd, PlayoutCmd, SenseCmd, TtsCmd,
 };
 use waveport_domain::config::{KernelConfig, Limits};
-use waveport_domain::event::{ControlInput, Event, OpEvent, Part};
+use waveport_domain::event::{CloseReason, ControlInput, Event, OpEvent, Part, TimerId};
 use waveport_domain::fact::{Dismissal, EpochCause, Fact, Lifecycle, Stamped};
 use waveport_domain::ids::{AgentId, Epoch, GenId, OpTag, ParticipantId, Seq, ToolCallId, TurnId};
 use waveport_domain::kernel::{Kernel, Snapshot, View};
@@ -71,6 +71,11 @@ pub enum Rule {
     /// Invariant 10: facts are numbered without gaps, and a kernel that
     /// lost its lease emits nothing.
     Journal,
+    /// Invariant 11: nothing is said into a line that is gone, a reply the
+    /// drop cut off is started again when the line is back, and a session
+    /// whose line stays gone closes as abandoned when its wait is over
+    /// and not before.
+    Line,
     /// The floor went from one agent to another in a way it may not.
     Stage,
     /// Nothing more is going to happen, and something is unfinished.
@@ -93,6 +98,7 @@ impl Rule {
             Self::Bounds => Some(8),
             Self::Restore => Some(9),
             Self::Journal => Some(10),
+            Self::Line => Some(11),
             Self::Stage | Self::Progress => None,
         }
     }
@@ -388,6 +394,12 @@ pub struct Monitor {
     lifecycle: Lifecycle,
     /// When the session must be closed, once it was asked to close.
     close_by: Option<MonoTime>,
+    /// When a line that dropped has had its time to come back. `None`
+    /// while the line is there.
+    gone: Option<MonoTime>,
+    /// The response a language model was writing that the line's drop
+    /// cuts off, in the step that tells of the drop.
+    dropped: Option<GenId>,
     people: Vec<ParticipantId>,
     turns: Vec<Heard>,
     /// The highest turn number seen.
@@ -423,6 +435,8 @@ impl Hash for Monitor {
             epoch,
             lifecycle,
             close_by,
+            gone,
+            dropped,
             people,
             turns,
             last_turn,
@@ -436,6 +450,7 @@ impl Hash for Monitor {
             desk,
         } = self;
         (leased, last_seq, began, entered, epoch, lifecycle, close_by).hash(state);
+        (gone, dropped).hash(state);
         (people, turns, last_turn, responses, last_generation, voice).hash(state);
         (context, owed, replied, arrived, desk).hash(state);
     }
@@ -460,6 +475,8 @@ impl Monitor {
             epoch: view.epoch(),
             lifecycle: view.lifecycle(),
             close_by: None,
+            gone: view.gone_until(),
+            dropped: None,
             people: view.participants().collect(),
             turns: Vec::new(),
             last_turn: 0,
@@ -545,7 +562,7 @@ impl Monitor {
             )?;
             self.last_seq = stamped.seq.get();
             let text = stamped.fact.text().map_or("", |text| out.text.get(text));
-            self.fact(event, stamped, text, whole)?;
+            self.fact(now, event, stamped, text, whole)?;
         }
         for command in &out.cmds {
             let text = command.text().map_or("", |text| out.text.get(text));
@@ -585,6 +602,9 @@ impl Monitor {
                 .map(|spoken| spoken.tag)
                 .collect::<Vec<_>>();
             format!("the responses {tags:?} never ended")
+        })?;
+        ensure(self.gone.is_none(), Rule::Line, || {
+            "the line is gone for good, and the session goes on waiting for it".to_owned()
         })?;
         self.desk_at_rest()?;
         ensure(
@@ -640,6 +660,15 @@ impl Monitor {
             Event::Control(ControlInput::Close { .. }) if self.lifecycle == Lifecycle::Running => {
                 self.close_by = Some(now.after(self.closing_time));
             }
+            Event::Control(ControlInput::Detached) if self.gone.is_none() => {
+                self.gone = Some(now.after(self.config.timing.detach_wait));
+                self.dropped = self
+                    .responses
+                    .iter()
+                    .find(|spoken| spoken.asked && spoken.works_on.is_none())
+                    .map(|spoken| spoken.tag.generation);
+            }
+            Event::Control(ControlInput::Attached) => self.gone = None,
             // Nothing is stored that was not emitted.
             Event::Durable(seq) => {
                 self.desk.durable = self.desk.durable.max(seq.get().min(self.last_seq));
@@ -697,6 +726,7 @@ impl Monitor {
     #[expect(clippy::too_many_lines, reason = "one arm per fact, each a few checks")]
     fn fact(
         &mut self,
+        now: MonoTime,
         event: &Event,
         stamped: &Stamped,
         text: &str,
@@ -715,7 +745,7 @@ impl Monitor {
                 })?;
                 self.people.retain(|known| *known != who);
             }
-            Fact::LifecycleChanged { to, .. } => {
+            Fact::LifecycleChanged { to, reason } => {
                 let next = match self.lifecycle {
                     Lifecycle::Running => Some(Lifecycle::Draining),
                     Lifecycle::Draining => Some(Lifecycle::Closing),
@@ -725,6 +755,9 @@ impl Monitor {
                 ensure(next == Some(to), Rule::Closing, || {
                     format!("the session went from {:?} to {to:?}", self.lifecycle)
                 })?;
+                if to == Lifecycle::Draining {
+                    self.began_to_close(now, event, reason)?;
+                }
                 self.lifecycle = to;
             }
             Fact::EpochAdvanced { to, cause } => {
@@ -829,6 +862,11 @@ impl Monitor {
                 ..
             } => {
                 self.context += 1;
+                if answers.is_some() && self.dropped == Some(generation) {
+                    // The line dropped when all of it had been heard:
+                    // nothing of it is owed again.
+                    self.dropped = None;
+                }
                 let Some(spoken) = self.spoken(generation) else {
                     // The one response a session can record without ever
                     // having seen it is the one its earlier life lost.
@@ -1066,6 +1104,9 @@ impl Monitor {
                         spoken.agent = Some(agent);
                         let works_on = self.started(tag, agent, cause)?;
                         if works_on.is_none() {
+                            ensure(self.gone.is_none(), Rule::Line, || {
+                                format!("{tag:?} was started for {cause:?} while the line is gone")
+                            })?;
                             self.replied = self.replied.max(on.get());
                         }
                         if let Some(spoken) = self.responses.get_mut(index) {
@@ -1409,6 +1450,7 @@ impl Monitor {
         })?;
 
         self.desk_settled(view)?;
+        self.line_settled(now, event, view)?;
 
         let limits = self.limits;
         let within = self.people.len() <= limits.participants
@@ -1443,6 +1485,87 @@ impl Monitor {
                 self.closing_time.as_millis()
             )
         })
+    }
+}
+
+impl Monitor {
+    /// The session begins to close. It does when it is asked to, for the
+    /// reason it was given. By itself it does only when its line has been
+    /// gone for as long as it waits for one.
+    fn began_to_close(
+        &mut self,
+        now: MonoTime,
+        event: &Event,
+        reason: Option<CloseReason>,
+    ) -> Result<(), Violation> {
+        let asked = matches!(event, Event::Control(ControlInput::Close { reason: why })
+            if Some(*why) == reason);
+        let waited =
+            reason == Some(CloseReason::Abandoned) && self.gone.is_some_and(|until| now >= until);
+        ensure(asked || waited, Rule::Line, || {
+            format!(
+                "the session began to close for {reason:?} on {event:?}; nobody asked it to, \
+                 and the wait for its line ends at {:?}",
+                self.gone
+            )
+        })?;
+        // What closes by itself has the time a session that was asked
+        // has.
+        self.close_by.get_or_insert(now.after(self.closing_time));
+        Ok(())
+    }
+
+    /// Compares what the account says of the line with what the kernel
+    /// did about it.
+    fn line_settled(
+        &mut self,
+        now: MonoTime,
+        event: &Event,
+        view: View<'_>,
+    ) -> Result<(), Violation> {
+        ensure(view.gone_until() == self.gone, Rule::Line, || {
+            format!(
+                "the kernel waits for its line until {:?}; what it was told says {:?}",
+                view.gone_until(),
+                self.gone
+            )
+        })?;
+        if let Some(generation) = self.dropped.take()
+            && self.desk.cut_by_line(generation)
+            && self.owed > 0
+        {
+            self.replied = self.replied.min(self.owed - 1);
+        }
+        let Some(until) = self.gone else {
+            return Ok(());
+        };
+        // Whoever works on a tool call goes on. Nobody else says or
+        // prepares anything.
+        let speaks = self
+            .responses
+            .iter()
+            .find(|spoken| spoken.works_on.is_none())
+            .map(|spoken| spoken.tag);
+        ensure(speaks.is_none(), Rule::Line, || {
+            format!("{speaks:?} holds the floor while the line is gone")
+        })?;
+        // The wait is over when the session is told so: by the timer it
+        // set, or at once when it waits no time at all.
+        let told = matches!(
+            event,
+            Event::Timer(TimerId::Detach) | Event::Control(ControlInput::Detached)
+        );
+        let over = told && now >= until;
+        ensure(
+            !over || self.lifecycle != Lifecycle::Running,
+            Rule::Line,
+            || {
+                format!(
+                    "the line has been gone since before {until:?}, the session was told on \
+                     {event:?}, and it is still running"
+                )
+            },
+        )
     }
 }
 
@@ -1774,6 +1897,176 @@ mod tests {
         });
         assert_eq!(rule(checked), Some(Rule::Journal));
         assert_eq!(watched.monitor.at_rest(watched.kernel.view()), Ok(()));
+    }
+
+    impl Watched {
+        /// Steps the kernel on `done` and shows the monitor the step as
+        /// one on `shown`.
+        fn shown_as(&mut self, millis: u64, done: &Event, shown: &Event) -> Result<(), Violation> {
+            self.now_ms = millis;
+            let now = MonoTime::from_millis(millis);
+            self.kernel.step(now, done, &mut self.out);
+            self.monitor
+                .observe(now, shown, &self.out, self.kernel.view())
+        }
+    }
+
+    const DROPPED: Event = Event::Control(ControlInput::Detached);
+    const BACK: Event = Event::Control(ControlInput::Attached);
+    const WAITED: Event = Event::Timer(TimerId::Detach);
+    const QUIET: Event = Event::Timer(TimerId::StageAck);
+
+    #[test]
+    fn a_line_that_drops_and_returns_is_accepted() {
+        let mut watched = Watched::new();
+        watched.answering();
+        // The answer is cut where it was heard, and given again when the
+        // line is back.
+        assert_eq!(watched.at(2_000, DROPPED), Ok(()));
+        let waiting = watched.monitor.at_rest(watched.kernel.view());
+        assert_eq!(waiting.map_err(|v| v.rule), Err(Rule::Line));
+        assert_eq!(watched.at(4_000, BACK), Ok(()));
+        let again = watched.out.cmds.iter().any(|command| {
+            matches!(
+                command,
+                Command::Llm(_, waveport_domain::command::LlmCmd::Start { .. })
+            )
+        });
+        assert!(again, "{:?}", watched.out.cmds);
+    }
+
+    #[test]
+    fn a_line_that_stays_gone_is_given_up_when_it_has_been_waited_for() {
+        let mut watched = Watched::new();
+        assert_eq!(watched.at(1_000, DROPPED), Ok(()));
+        assert_eq!(watched.at(30_999, WAITED), Ok(()));
+        assert_eq!(watched.at(31_000, WAITED), Ok(()));
+        assert_eq!(watched.monitor.at_rest(watched.kernel.view()), Ok(()));
+    }
+
+    #[test]
+    fn a_line_given_up_before_its_time_is_noticed() {
+        let mut watched = Watched::new();
+        watched.at(1_000, DROPPED).unwrap();
+        // The session closes as abandoned after five seconds of thirty,
+        // and nobody asked it to.
+        let reason = CloseReason::Abandoned;
+        let close = Event::Control(ControlInput::Close { reason });
+        let checked = watched.shown_as(6_000, &close, &WAITED);
+        assert_eq!(rule(checked.clone()), Some(Rule::Line), "{checked:?}");
+        let said = checked.unwrap_err().to_string();
+        assert!(
+            said.starts_with("invariant 11 is broken: the session began to close"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_session_that_closes_by_itself_with_its_line_there_is_noticed() {
+        let mut watched = Watched::new();
+        let reason = CloseReason::Abandoned;
+        let close = Event::Control(ControlInput::Close { reason });
+        let checked = watched.shown_as(6_000, &close, &QUIET);
+        assert_eq!(rule(checked), Some(Rule::Line));
+        // Asked to, it may, and for the reason it was given only.
+        let mut watched = Watched::new();
+        assert_eq!(watched.at(6_000, close), Ok(()));
+        let mut watched = Watched::new();
+        let asked = Event::Control(ControlInput::Close {
+            reason: CloseReason::Requested,
+        });
+        let reason = CloseReason::Abandoned;
+        let other = Event::Control(ControlInput::Close { reason });
+        assert_eq!(
+            rule(watched.shown_as(6_000, &other, &asked)),
+            Some(Rule::Line)
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_waited_for_beyond_its_time_is_noticed() {
+        let mut watched = Watched::new();
+        watched.at(1_000, DROPPED).unwrap();
+        // The timer fires and the session goes on as if it had not.
+        let checked = watched.shown_as(31_000, &QUIET, &WAITED);
+        assert_eq!(rule(checked.clone()), Some(Rule::Line), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("it is still running"),
+        );
+        // And so when it is told again of a line it has waited for.
+        let mut watched = Watched::new();
+        watched.at(1_000, DROPPED).unwrap();
+        let checked = watched.shown_as(31_000, &QUIET, &DROPPED);
+        assert_eq!(rule(checked), Some(Rule::Line));
+    }
+
+    #[test]
+    fn a_kernel_that_forgets_its_line_is_noticed() {
+        // It takes the line for back when nobody said so.
+        let mut watched = Watched::new();
+        watched.at(1_000, DROPPED).unwrap();
+        let checked = watched.shown_as(2_000, &BACK, &QUIET);
+        assert_eq!(rule(checked.clone()), Some(Rule::Line), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("the kernel waits for its line until None"),
+        );
+        // Or it does not notice that the line dropped.
+        let mut watched = Watched::new();
+        let checked = watched.shown_as(1_000, &QUIET, &DROPPED);
+        assert_eq!(rule(checked), Some(Rule::Line));
+    }
+
+    #[test]
+    fn a_reply_begun_while_the_line_is_gone_is_noticed() {
+        let mut watched = Watched::new();
+        watched.asking();
+        watched.step(DROPPED).unwrap();
+        // The kernel takes the line for back, and answers the turn.
+        let now = MonoTime::from_millis(watched.now_ms);
+        watched.kernel.step(now, &BACK, &mut watched.out);
+        let checked = watched.step(Watched::words());
+        assert_eq!(rule(checked.clone()), Some(Rule::Line), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("while the line is gone"),
+        );
+    }
+
+    #[test]
+    fn a_reply_that_a_dropped_line_cut_and_nobody_gives_again_is_noticed() {
+        let mut watched = Watched::new();
+        watched.answering();
+        // A kernel that cuts the answer as it does for an interruption,
+        // which owes nobody anything, and then waits for its line. To the
+        // monitor it is one step, on a line that dropped.
+        watched.now_ms = 2_000;
+        let now = MonoTime::from_millis(2_000);
+        let interrupt = Event::Control(ControlInput::Interrupt);
+        watched.kernel.step(now, &interrupt, &mut watched.out);
+        let mut waits = Out::new();
+        watched.kernel.step(now, &DROPPED, &mut waits);
+        assert!(waits.facts.is_empty(), "{:?}", waits.facts);
+        watched.out.cmds.extend(waits.cmds.iter().copied());
+        let view = watched.kernel.view();
+        let cut = watched.monitor.observe(now, &DROPPED, &watched.out, view);
+        assert_eq!(cut, Ok(()));
+        // The line is back, and the caller is not answered.
+        assert_eq!(watched.at(4_000, BACK), Ok(()));
+        assert_eq!(watched.out.cmds.len(), 1, "{:?}", watched.out.cmds);
+        let stuck = watched.monitor.at_rest(watched.kernel.view()).unwrap_err();
+        assert_eq!(stuck.rule, Rule::Progress, "{stuck}");
+        assert!(
+            stuck.to_string().contains("the session is stuck"),
+            "{stuck}"
+        );
     }
 
     #[test]

@@ -48,9 +48,10 @@ jobs:
           cargo test --release --locked -p waveport-domain --test simulation
 
   # Whole sessions made up from seeds and run by the real session actor,
-  # with a fake in every port: a thousand for each of the six stories and
-  # each of the four profiles, and other ones every night. A failure prints
-  # its seed, and `WAVEPORT_SIM_SEED=<seed>` runs that session alone.
+  # with a fake in every port: a thousand for each of the stories and each
+  # of the profiles, in speech and in writing, and other ones every night.
+  # A failure prints its seed, and `WAVEPORT_SIM_SEED=<seed>` runs that
+  # session alone.
   sessions:
     runs-on: ubuntu-24.04
     timeout-minutes: 60

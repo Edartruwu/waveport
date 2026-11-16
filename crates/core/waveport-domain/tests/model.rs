@@ -37,6 +37,7 @@ fn one_turn() -> Scope {
         interrupts: 0,
         says: 0,
         closes: 0,
+        drops: 0,
         crashes: 0,
         late: 0,
         most_states: 4_000_000,
@@ -61,6 +62,10 @@ struct Seen {
     closed: Cell<u64>,
     /// Two responses under way at once.
     together: Cell<u64>,
+    /// A session that waits for its line with a reply owed.
+    waiting: Cell<u64>,
+    /// A session that closed with its line gone.
+    abandoned: Cell<u64>,
 }
 
 impl Seen {
@@ -97,6 +102,13 @@ impl Seen {
         count(&self.restored, restored);
         count(&self.closed, view.lifecycle() == Lifecycle::Closed);
         count(&self.together, view.generations().count() >= 2);
+        let gone = !view.is_attached();
+        let running = view.lifecycle() == Lifecycle::Running;
+        count(&self.waiting, gone && running && view.reply_owed());
+        count(
+            &self.abandoned,
+            gone && view.lifecycle() == Lifecycle::Closed,
+        );
     }
 }
 
@@ -259,6 +271,45 @@ fn words_to_say_and_a_model_that_does_not_stop() -> Result<(), Report> {
     Ok(())
 }
 
+#[test]
+fn a_line_that_drops() -> Result<(), Report> {
+    let scope = Scope {
+        drops: 1,
+        timers: 2,
+        ..one_turn()
+    };
+    let (explored, seen) = tried(&scope)?;
+    assert!(explored.states >= 1_500, "{explored:?}");
+    // The line drops before the turn, in the middle of it, while its
+    // reply is written and while it is heard. It comes back, or the
+    // session gives it up.
+    assert!(seen.waiting.get() > 0, "{seen:?}");
+    assert!(seen.abandoned.get() > 0, "{seen:?}");
+    assert!(seen.cut.get() > 0 && seen.whole.get() > 0, "{seen:?}");
+    Ok(())
+}
+
+#[test]
+fn a_call_and_a_line_that_drops() -> Result<(), Report> {
+    for effect in [Effect::Pure, Effect::SideEffecting] {
+        let scope = Scope {
+            tools: vec![effect],
+            calls: 1,
+            drops: 1,
+            timers: 1,
+            ..one_turn()
+        };
+        let (explored, seen) = tried(&scope)?;
+        assert!(explored.states >= 5_000, "{effect:?}: {explored:?}");
+        // The call goes on while the line is gone, and what it found is
+        // said when the line is back.
+        assert!(seen.completed.get() > 0, "{effect:?}: {seen:?}");
+        assert!(seen.waiting.get() > 0, "{effect:?}: {seen:?}");
+        assert!(seen.whole.get() > 0, "{effect:?}: {seen:?}");
+    }
+    Ok(())
+}
+
 /// The sessions of the nightly run: what the tests above have, with more
 /// of it at once.
 #[expect(clippy::too_many_lines, reason = "a list of sessions")]
@@ -267,6 +318,41 @@ fn larger() -> Vec<(&'static str, Scope, u64)> {
     let once = vec![Effect::SideEffecting];
     let both = vec![Effect::Pure, Effect::SideEffecting];
     vec![
+        (
+            "a line that drops twice, an interruption and a close",
+            Scope {
+                drops: 2,
+                timers: 2,
+                interrupts: 1,
+                closes: 1,
+                ..one_turn()
+            },
+            40_000,
+        ),
+        (
+            "two turns, a call and a line that drops",
+            Scope {
+                turns: 2,
+                tools: pure.clone(),
+                calls: 1,
+                drops: 1,
+                timers: 2,
+                ..one_turn()
+            },
+            2_500_000,
+        ),
+        (
+            "a call, a line that drops and a process that dies",
+            Scope {
+                tools: once.clone(),
+                calls: 1,
+                drops: 1,
+                crashes: 1,
+                timers: 1,
+                ..one_turn()
+            },
+            40_000,
+        ),
         (
             "a call, an interruption, a close and a process that dies",
             Scope {
@@ -397,6 +483,6 @@ fn larger_sessions() -> Result<(), Report> {
         assert!(explored.states >= least, "{name}: {explored:?}");
         states += explored.states;
     }
-    assert!(states >= 5_000_000, "{states}");
+    assert!(states >= 8_000_000, "{states}");
     Ok(())
 }

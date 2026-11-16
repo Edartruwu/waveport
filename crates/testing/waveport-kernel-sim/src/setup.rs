@@ -180,6 +180,9 @@ impl Setup {
         if let Some(grace) = self.grace {
             config.timing.grace = grace;
         }
+        if let Some(wait) = self.ways.detach_wait {
+            config.timing.detach_wait = wait;
+        }
         config
             .validate()
             .map_err(|error| format!("the setup is unusable: {error}"))?;

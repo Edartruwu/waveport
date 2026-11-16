@@ -1820,13 +1820,16 @@ fn a_kernel_that_lost_its_lease_goes_silent() {
 }
 
 #[test]
-fn the_connection_state_is_remembered() {
+fn whether_the_line_is_there_is_remembered() {
+    // What a session does about a line that drops is in `line.rs`.
     let mut session = Session::new();
     assert!(session.kernel.view().is_attached());
-    assert!(session.control(ControlInput::Detached).is_silent());
+    assert!(session.control(ControlInput::Attached).is_silent());
+    session.control(ControlInput::Detached);
     assert!(!session.kernel.view().is_attached());
     session.control(ControlInput::Attached);
     assert!(session.kernel.view().is_attached());
+    assert_eq!(session.kernel.view().gone_until(), None);
 }
 
 // ---- The journal -----------------------------------------------------------

@@ -174,6 +174,173 @@ fn a_caller_who_interrupts_is_answered_on_what_they_heard() {
     assert_eq!(tally.barge_ins, tally.runs, "{tally:?}");
 }
 
+/// What the agent says when it is asked again for a story of which
+/// something was heard.
+const GOES_ON: &str = "As I was saying, the ship never came home.";
+
+/// The model of the two stories of a line that drops: it tells the story,
+/// and goes on with it when it is shown that some of it was heard.
+fn storyteller(plan: &mut Plan) {
+    plan.llm = Arc::new(|asked| {
+        let heard = asked
+            .messages
+            .iter()
+            .any(|said| matches!(said, Said::Assistant { .. }));
+        if heard {
+            vec![LlmStep::say(GOES_ON)]
+        } else {
+            vec![LlmStep::say(STORY)]
+        }
+    });
+}
+
+/// How long the sessions of the two stories wait for their line.
+const LINE_WAIT_MS: u64 = 5_000;
+
+/// Scenario 13: a line that drops and comes back costs the caller nothing
+/// they had not heard.
+fn line_drops(seed: u64) -> Plan {
+    let mut rng = SimRng::new(Seed(seed)).fork("line drops");
+    let mut plan = Plan::new(seed, spec(&[]));
+    weather(&mut plan, &mut rng);
+    quick(&mut plan, &mut rng);
+    plan.spec.kernel.timing.detach_wait = Duration::from_millis(LINE_WAIT_MS);
+    storyteller(&mut plan);
+    let asked = plan.says(0, 1_000, 300, "tell me a story");
+    // The line drops before the agent has begun, somewhere in the story,
+    // or after it. It is back before the session gives it up.
+    let drops = asked + rng.range(300..9_000);
+    let back = drops + rng.range(100..LINE_WAIT_MS - 500);
+    plan.drops.push((drops, Some(back)));
+    plan.until_ms = back + 40_000;
+    plan
+}
+
+fn line_drops_ends(plan: &Plan, outcome: &Outcome) -> Result<(), String> {
+    let turns: Vec<&str> = outcome.turns().iter().map(|(_, text, _)| *text).collect();
+    if turns != ["tell me a story"] {
+        return Err(format!("the turns are {turns:?}"));
+    }
+    if let Some(ended) = outcome.ended() {
+        return Err(format!("the session ended: {ended:?}"));
+    }
+    let utterances = outcome.utterances();
+    match utterances[..] {
+        // The line dropped after the story, or before anything of it
+        // was known to be heard: the caller has all of it, once.
+        [(_, whole, false)] if whole == STORY => {}
+        // It dropped in the story: the caller has what they heard, and
+        // then the rest in other words.
+        [(_, heard, true), (_, then, false)]
+            if STORY.starts_with(heard) && heard.len() < STORY.len() && then == GOES_ON => {}
+        _ => return Err(format!("the agent said {utterances:?}")),
+    }
+    // The model was asked again only for what a drop cut off.
+    if outcome.asked.len() > 2 {
+        return Err(format!("the model was asked {} times", outcome.asked.len()));
+    }
+    let wire = &outcome.lives[0].wire;
+    if wire.drops != 1 {
+        return Err(format!("the line dropped {} times", wire.drops));
+    }
+    // Nothing was said into the gap: every frame but the fade of what
+    // was cut off went out while the line was there.
+    let (drops, back) = plan.drops[0];
+    let back = back.unwrap();
+    let into_gap = wire
+        .frames
+        .iter()
+        .filter(|frame| {
+            let when = u64::try_from(frame.when.as_millis()).unwrap();
+            when > drops && when < back
+        })
+        .count();
+    if into_gap > 1 {
+        return Err(format!(
+            "{into_gap} frames were sent while the line was gone"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_line_that_drops_and_comes_back_costs_the_caller_nothing() {
+    let Some(tally) = told(SEEDS, line_drops, line_drops_ends) else {
+        return;
+    };
+    assert_eq!(tally.drops, tally.runs, "{tally:?}");
+    // In the story more often than not.
+    assert!(tally.cut >= tally.runs / 3, "{tally:?}");
+    assert_eq!(tally.abandoned, 0, "{tally:?}");
+}
+
+/// Scenario 14: a line that stays gone ends the session, and not before
+/// its time.
+fn line_stays_gone(seed: u64) -> Plan {
+    let mut rng = SimRng::new(Seed(seed)).fork("line stays gone");
+    let mut plan = Plan::new(seed, spec(&[]));
+    weather(&mut plan, &mut rng);
+    quick(&mut plan, &mut rng);
+    plan.spec.kernel.timing.detach_wait = Duration::from_millis(LINE_WAIT_MS);
+    storyteller(&mut plan);
+    let asked = plan.says(0, 1_000, 300, "tell me a story");
+    let drops = asked + rng.range(300..9_000);
+    plan.drops.push((drops, None));
+    plan.until_ms = drops + 40_000;
+    plan
+}
+
+fn line_stays_gone_ends(plan: &Plan, outcome: &Outcome) -> Result<(), String> {
+    if outcome.ended() != Some(&Ended::Closed) {
+        return Err(format!("the session ended as {:?}", outcome.ended()));
+    }
+    // It waited as long as it was to, and no longer than it then takes
+    // to close.
+    let (drops, _) = plan.drops[0];
+    let over = outcome.lives[0].over_ms;
+    let due = drops + LINE_WAIT_MS;
+    if over < due || over > due + 1_000 {
+        return Err(format!(
+            "the line dropped at {drops} ms and the session was over at {over} ms"
+        ));
+    }
+    let abandoned = outcome.facts.iter().any(|stamped| {
+        matches!(
+            stamped.fact,
+            Fact::LifecycleChanged {
+                to: Lifecycle::Draining,
+                reason: Some(CloseReason::Abandoned)
+            }
+        )
+    });
+    if !abandoned {
+        return Err("the session did not close as abandoned".to_owned());
+    }
+    // What it leaves is what the caller heard. The model was asked once,
+    // or not at all when the line dropped before the caller's words were
+    // in: nothing was prepared for a line that was gone.
+    let utterances = outcome.utterances();
+    match utterances[..] {
+        [] => {}
+        [(_, whole, false)] if whole == STORY => {}
+        [(_, heard, true)] if STORY.starts_with(heard) => {}
+        _ => return Err(format!("the agent said {utterances:?}")),
+    }
+    if outcome.asked.len() > 1 {
+        return Err(format!("the model was asked {} times", outcome.asked.len()));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_line_that_stays_gone_ends_the_session_and_not_before_its_time() {
+    let Some(tally) = told(SEEDS, line_stays_gone, line_stays_gone_ends) else {
+        return;
+    };
+    assert_eq!(tally.abandoned, tally.runs, "{tally:?}");
+    assert_eq!(tally.closed, tally.runs, "{tally:?}");
+}
+
 /// Whether a model was shown the result of a tool call, and not the
 /// stand-in for one that is still running.
 pub(super) fn has_result(asked: &Asked) -> bool {

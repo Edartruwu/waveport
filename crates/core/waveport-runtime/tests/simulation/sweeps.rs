@@ -4,7 +4,7 @@
 //! and which tools it calls, and what the application asks. A profile
 //! says how the world behaves: calmly, or with parts that fail and a
 //! line that loses packets, or with a process that dies, or with an end
-//! that comes at any moment. Nothing is asked of such a session beyond
+//! that comes at any moment, or with a line that drops and comes back. Nothing is asked of such a session beyond
 //! what is asked of every session: the checks of `world`.
 
 use core::time::Duration;
@@ -39,6 +39,10 @@ pub(super) enum Profile {
     /// The session ends at a moment the seed picks: it is asked to
     /// close, or its line closes, or another process takes it over.
     Shutdown,
+    /// The line drops, up to three times, and is back in time, too late
+    /// or never. The session waits for it for a second, for five, or not
+    /// at all.
+    Lines,
 }
 
 pub(super) const WORDS: &[&str] = &[
@@ -325,6 +329,22 @@ fn made_up(profile: Profile, seed: u64) -> Plan {
                 End::Taken => plan.doings.push((at, Doing::Taken)),
             }
         }
+        Profile::Lines => {
+            let wait = *rng.choose(&[0, 1_000, 5_000, 5_000]).unwrap();
+            plan.spec.kernel.timing.detach_wait = Duration::from_millis(wait);
+            let mut from = 400;
+            for _ in 0..rng.range(1..4) {
+                let drops = rng.range(from..from + last / 2 + 2_000);
+                if rng.chance(1, 6) {
+                    // It never comes back, so it cannot drop again.
+                    plan.drops.push((drops, None));
+                    break;
+                }
+                let back = drops + rng.range(60..2_500);
+                plan.drops.push((drops, Some(back)));
+                from = back + 200;
+            }
+        }
     }
     // Long enough for everything that was begun to be given up on.
     plan.until_ms = last + 200_000;
@@ -411,12 +431,57 @@ fn shutdown() {
     assert!(tally.lost >= tally.runs / 20, "{tally:?}");
 }
 
+/// A session whose line dropped for good is closed, and no other is,
+/// whatever became of its line on the way.
+fn waited_as_it_should(plan: &Plan, outcome: &Outcome) -> Result<(), String> {
+    let wait = plan.spec.kernel.timing.detach_wait;
+    let wait = u64::try_from(wait.as_millis()).unwrap();
+    // The line is given up when it stays gone for as long as the session
+    // waits for one. A line that is back at the very moment may be
+    // either.
+    let given_up =
+        |&(drops, back): &(u64, Option<u64>)| back.is_none_or(|back| back > drops + wait);
+    let kept = |&(drops, back): &(u64, Option<u64>)| back.is_some_and(|back| back < drops + wait);
+    let ended = outcome.ended();
+    if plan.drops.iter().any(given_up) && ended != Some(&Ended::Closed) {
+        return Err(format!(
+            "a line stayed gone for more than {wait} ms, and the session ended as {ended:?}"
+        ));
+    }
+    if plan.drops.iter().all(kept) && ended.is_some() {
+        return Err(format!(
+            "every line was back within {wait} ms, and the session ended as {ended:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn lines() {
+    let check = waited_as_it_should;
+    let Some(tally) = told(SEEDS, |seed| made_up(Profile::Lines, seed), check) else {
+        return;
+    };
+    assert!(tally.drops >= tally.runs, "{tally:?}");
+    // Some sessions wait in vain or not at all, and most go on.
+    assert!(tally.abandoned >= tally.runs / 8, "{tally:?}");
+    assert!(tally.closed < tally.runs, "{tally:?}");
+    assert!(tally.turns >= tally.runs, "{tally:?}");
+    assert!(tally.spoken >= tally.runs, "{tally:?}");
+    assert!(tally.cut >= tally.runs / 8, "{tally:?}");
+}
+
 /// A seed is a session: the same steps at the same moments, every time
 /// it is run. A failure is reported as the seed that made it, which is
 /// worth something only if this holds.
 #[test]
 fn a_seed_tells_the_same_session_every_time() {
-    for profile in [Profile::Chaos, Profile::Crashes, Profile::Shutdown] {
+    for profile in [
+        Profile::Chaos,
+        Profile::Crashes,
+        Profile::Shutdown,
+        Profile::Lines,
+    ] {
         for seed in [3, 17] {
             let first = run(&made_up(profile, seed), true).unwrap();
             let again = run(&made_up(profile, seed), true).unwrap();

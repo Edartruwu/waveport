@@ -109,7 +109,9 @@ struct State {
 
     // ---- Not journaled -------------------------------------------------
     closing: Option<Closing>,
-    attached: bool,
+    /// When a line that dropped has had its time to come back. `None`
+    /// while the line is there.
+    gone_until: Option<MonoTime>,
     /// Whether this kernel still owns the session.
     leased: bool,
     /// Whether the session was rebuilt from its journal and has not yet
@@ -156,7 +158,7 @@ impl State {
             speech: None,
             speech_text: String::with_capacity(limits.response_text),
             closing: None,
-            attached: true,
+            gone_until: None,
             leased: true,
             recovering: false,
             next_turn: TurnId(1),
@@ -941,7 +943,7 @@ mod tests {
         let mut out = Out::new();
         out.facts.push(joined(1));
         let _ = out.text.push("left over from an earlier step");
-        let event = Event::Control(ControlInput::Detached);
+        let event = Event::Control(ControlInput::Attached);
         kernel.step(MonoTime::from_millis(5), &event, &mut out);
         assert!(out.is_empty());
         assert!(out.text.is_empty());

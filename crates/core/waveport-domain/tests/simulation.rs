@@ -16,7 +16,7 @@
 use waveport_kernel_sim::check::Report;
 use waveport_kernel_sim::seeded::{Profile, Tally, sweep};
 
-/// Sessions per profile in an ordinary test run: 3,600 in all.
+/// Sessions per profile in an ordinary test run: 4,200 in all.
 const SEEDS: u64 = 600;
 
 /// Runs the profile's sessions. Returns what they did when at least the
@@ -140,6 +140,28 @@ fn crashes() -> Result<(), Report> {
     assert!(tally.continuations >= 280, "{tally:?}");
     // The journal is checked before each death, and now and then.
     assert!(tally.checks >= 2_000, "{tally:?}");
+    Ok(())
+}
+
+#[test]
+fn lines() -> Result<(), Report> {
+    let Some(tally) = swept(Profile::Lines)? else {
+        return Ok(());
+    };
+    // Every session loses its line at least once. Most get it back, and
+    // then say what the drop cut off or what waited for the line.
+    assert!(tally.drops >= tally.runs, "{tally:?}");
+    assert!(tally.returns >= 300, "{tally:?}");
+    assert!(tally.resumed >= 100, "{tally:?}");
+    // And some wait in vain, or do not wait at all.
+    assert!(tally.abandoned >= 100, "{tally:?}");
+    assert!(tally.closed >= tally.abandoned, "{tally:?}");
+    assert!(tally.turns >= 1_000, "{tally:?}");
+    assert!(tally.cut >= 150, "{tally:?}");
+    // Tool calls that go on while the line is gone, and what follows them.
+    assert!(tally.calls >= 200, "{tally:?}");
+    assert!(tally.completed >= 100, "{tally:?}");
+    assert!(tally.continuations >= 80, "{tally:?}");
     Ok(())
 }
 

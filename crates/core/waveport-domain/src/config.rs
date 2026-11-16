@@ -164,6 +164,10 @@ pub struct Timing {
     pub drain: Duration,
     /// How long it may then spend stopping.
     pub grace: Duration,
+    /// How long a session waits for a line that dropped to come back,
+    /// before it closes as abandoned. With no time at all, a line that
+    /// drops ends the session at once.
+    pub detach_wait: Duration,
     /// The fade-out when the agent is interrupted, in milliseconds.
     pub stop_fade_ms: u16,
     /// How much synthesised speech may wait to be played. Text is held back
@@ -183,6 +187,7 @@ impl Default for Timing {
             stage_wait: Duration::from_secs(5),
             drain: Duration::from_secs(5),
             grace: Duration::from_secs(2),
+            detach_wait: Duration::from_secs(30),
             stop_fade_ms: 8,
             speech_credit: MediaDur::from_millis(3_000),
         }

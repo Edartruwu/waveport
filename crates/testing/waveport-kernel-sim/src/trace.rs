@@ -214,6 +214,7 @@ impl fmt::Display for Shown<'_> {
                     TimerId::StageAck => f.write_str("stage-ack"),
                     TimerId::Drain => f.write_str("drain"),
                     TimerId::Grace => f.write_str("grace"),
+                    TimerId::Detach => f.write_str("detach"),
                 }
             }
             Event::Control(input) => {
@@ -517,6 +518,7 @@ impl<'a> Words<'a> {
             "stage-ack" => TimerId::StageAck,
             "drain" => TimerId::Drain,
             "grace" => TimerId::Grace,
+            "detach" => TimerId::Detach,
             other => return Err(format!("{other:?} is no timer")),
         })
     }
@@ -806,6 +808,7 @@ mod tests {
             TimerId::StageAck,
             TimerId::Drain,
             TimerId::Grace,
+            TimerId::Detach,
         ];
         let to = AgentId(2);
         let handoff = |context| ControlInput::Handoff { to, context };

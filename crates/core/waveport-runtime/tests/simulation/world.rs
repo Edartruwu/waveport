@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use waveport_domain::command::{Command, LlmCause, LlmCmd, PlayoutCmd};
 use waveport_domain::config::Effect;
-use waveport_domain::event::Event;
+use waveport_domain::event::{CloseReason, Event};
 use waveport_domain::fact::{EpochCause, Fact, Lifecycle, Stamped, ToolOutcome};
 use waveport_domain::ids::{GenId, ParticipantId, ToolCallId};
 use waveport_domain::kernel::View;
@@ -185,6 +185,9 @@ pub(crate) struct Plan {
     pub mics_until_ms: u64,
     /// When the line closes, if it does.
     pub hangs_up_ms: Option<u64>,
+    /// When the line drops, and when it is back, if it is. In order: the
+    /// line does not drop again before it is back.
+    pub drops: Vec<(u64, Option<u64>)>,
     pub doings: Vec<(u64, Doing)>,
     pub stt: SttScript,
     pub llm: Respond,
@@ -231,6 +234,7 @@ impl Plan {
             speech: Vec::new(),
             mics_until_ms: 0,
             hangs_up_ms: None,
+            drops: Vec::new(),
             doings: Vec::new(),
             stt: SttScript::new(Vec::new()),
             llm: Arc::new(|_| vec![LlmStep::say("Yes.")]),
@@ -335,6 +339,10 @@ pub(crate) struct Tally {
     pub closed: u64,
     pub lost: u64,
     pub hung_up: u64,
+    /// Times a line dropped.
+    pub drops: u64,
+    /// Sessions that began to close because nobody was there any more.
+    pub abandoned: u64,
     pub reopened: u64,
     pub frames: u64,
     /// States the journal stored.
@@ -368,6 +376,8 @@ impl Tally {
             (&mut self.closed, other.closed),
             (&mut self.lost, other.lost),
             (&mut self.hung_up, other.hung_up),
+            (&mut self.drops, other.drops),
+            (&mut self.abandoned, other.abandoned),
             (&mut self.reopened, other.reopened),
             (&mut self.frames, other.frames),
             (&mut self.states, other.states),
@@ -400,8 +410,10 @@ impl Tally {
                     _ => self.failed += 1,
                 },
                 Fact::NoticeAppended { .. } => self.notices += 1,
-                Fact::LifecycleChanged { to, .. } => {
+                Fact::LifecycleChanged { to, reason } => {
                     self.closed += u64::from(to == Lifecycle::Closed);
+                    let left = reason == Some(CloseReason::Abandoned);
+                    self.abandoned += u64::from(to == Lifecycle::Draining && left);
                 }
                 _ => {}
             }
@@ -712,6 +724,17 @@ impl Plan {
                 Some(sent + Duration::from_millis(rng.range(0..jitter + 1)))
             });
         }
+        // A life begins with its line there, whatever became of the line
+        // of the life before.
+        for (drops, back) in &self.drops {
+            if *drops < began_ms {
+                continue;
+            }
+            far = far.line_drops(*drops - began_ms);
+            if let Some(back) = back {
+                far = far.line_returns(*back - began_ms);
+            }
+        }
         if closes.is_some() {
             far = far.then_closes();
         }
@@ -876,6 +899,7 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         }
         let wire = fresh.far_end.log();
         tally.frames += wire.frames.len() as u64;
+        tally.drops += wire.drops as u64;
         tally.reopened += u64::from(session.stats().hearing.recogniser_failures);
         tally.states += u64::from(session.stats().states.stored);
         if explain {
@@ -1127,6 +1151,14 @@ fn wire_is_sound(wire: &TransportLog) -> Result<(), Broken> {
         return broken(format!(
             "{} things were sent after the line had closed",
             wire.after_close
+        ));
+    }
+    // What a session was saying when its line dropped is faded out, in
+    // one frame. Nothing else is said into a line that is gone.
+    if wire.unheard > wire.drops {
+        return broken(format!(
+            "{} frames were sent into a line that was gone, which dropped {} times",
+            wire.unheard, wire.drops
         ));
     }
     // The responses that another has taken over from, and the one being
