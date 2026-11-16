@@ -131,5 +131,16 @@ mod tests {
                 "memory.{kind}: {held} KB is held on the usual line, {usual} KB asked of it"
             );
         }
+        // A session of text: the usual chat against what is asked of the
+        // usual session, and a long one against what is asked of 99 in
+        // a hundred.
+        for (chat, of) in [("usual", "p50"), ("long", "p99")] {
+            let held = targets.number(&format!("memory.text.held_{chat}_kb"));
+            let target = targets.number(&format!("memory.text.target_{of}_kb"));
+            assert!(
+                held <= target,
+                "memory.text: {held} KB is held of a {chat} chat, {target} KB asked"
+            );
+        }
     }
 }

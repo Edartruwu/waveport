@@ -3,12 +3,13 @@
 //! Stability: experimental
 //!
 //! An agent to talk to at this machine, one that takes a call whose
-//! caller follows a script, or one that takes calls over a WebSocket from
-//! the same command run as a client. This is where the parts are put
-//! together:
+//! caller follows a script, one that takes calls over a WebSocket from
+//! the same command run as a client, or one to chat with in writing.
+//! This is where the parts are put together:
 //! the session runtime, the models that listen, a provider for each of
 //! hearing, thinking and speaking, a transport, a journal and two tools.
-//! Nothing here decides anything about a conversation.
+//! An agent that only writes is the same agent with a language model and
+//! its tools alone. Nothing here decides anything about a conversation.
 //!
 //! Calls are kept in a file, so that one that broke off can be gone on
 //! with: `--resume last`.
@@ -18,6 +19,7 @@
 
 mod args;
 mod call;
+mod chat;
 mod client;
 mod halt;
 mod kept;
@@ -78,6 +80,7 @@ async fn command(command: Command) -> Result<Outcome, Failure> {
         Command::Run(run) => scripted(run).await,
         Command::Serve(serve) => serve::serve(serve).await,
         Command::Client(client) => client::call(client).await,
+        Command::Chat(chat) => chat::chat(chat).await,
         Command::Devices => list_devices(),
     }
 }
@@ -101,6 +104,7 @@ async fn at_the_desk(dev: Dev) -> Result<Outcome, Failure> {
     }
     call::run(
         &dev.agent,
+        &dev.aloud,
         transport,
         dev.resume.as_ref(),
         dev.report.as_deref(),
@@ -113,7 +117,8 @@ async fn scripted(run: Run) -> Result<Outcome, Failure> {
     let steps = script::read(&run.script).map_err(Failure)?;
     let (transport, recording) = LocalAudio::scripted(steps, Options::default());
     let report = run.report.as_deref();
-    let outcome = call::run(&run.agent, transport, run.resume.as_ref(), report).await?;
+    let resume = run.resume.as_ref();
+    let outcome = call::run(&run.agent, &run.aloud, transport, resume, report).await?;
     if let Some(file) = &run.record {
         std::fs::write(file, recording.wav())
             .with(|| format!("the recording cannot be written to {}", file.display()))?;

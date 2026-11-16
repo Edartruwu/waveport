@@ -24,16 +24,26 @@
 //! is what its [`Brain`] is made of. Those parts are behind a driver, and
 //! the session asks the driver for what it used to ask them. The kernel,
 //! the timers, the tools, the journal, the followers and the language
-//! model are the same in every shape and stay here. The one shape there
-//! is recognises speech, has a language model write and synthesises what
-//! it wrote.
+//! model are the same in every shape and stay here. There are two shapes.
+//! In one, speech is recognised, a language model writes and what it
+//! wrote is synthesised. In the other there is the language model alone:
+//! what is typed is answered in text.
+//!
+//! A session of text needs no transport. What is asked of it comes as
+//! requests, what it says goes to whoever follows it, and whoever writes
+//! to it is taken to be there. Its kernel is the same as any other's. To
+//! the kernel a response is released, made ready and heard in every
+//! shape, and here text is ready as it is released and "heard" as soon as
+//! it may be read (see `write.rs`).
 
 mod cascade;
 mod drive;
 mod hear;
+mod shaped;
 mod speak;
 mod store;
 mod think;
+mod write;
 
 use core::fmt;
 use core::pin::Pin;
@@ -49,7 +59,7 @@ use waveport_domain::command::{Command, LlmCmd, PlayoutCmd, SttCmd, ToolCmd, Tts
 use waveport_domain::config::{ConfigError, KernelConfig};
 use waveport_domain::event::{CloseReason, ControlInput, Event, TimerId, ToolEvent};
 use waveport_domain::fact::{Fact, Lifecycle, Stamped};
-use waveport_domain::ids::{Seq, ToolCallId, ToolId};
+use waveport_domain::ids::{OpTag, ParticipantId, Seq, ToolCallId, ToolId};
 use waveport_domain::kernel::{Kernel, RestoreError, Snapshot, View};
 use waveport_domain::out::Out;
 use waveport_domain::policy::{DefaultPolicies, Policies};
@@ -74,11 +84,13 @@ use waveport_ports::tts::Tts;
 use self::cascade::Cascade;
 use self::drive::Driver;
 pub use self::hear::HearStats;
+use self::shaped::Shaped;
 use self::speak::Milestone;
 pub use self::speak::SpeakStats;
 use self::store::Store;
 pub use self::store::{StateStats, StoreBroken};
 use self::think::Mind;
+use self::write::Writer;
 use crate::codec::{self, CodecError};
 use crate::compute::Compute;
 use crate::context::{AgentDef, Asking, ToolDef};
@@ -210,12 +222,19 @@ pub enum Brain {
         /// The listening models.
         compute: Arc<Compute>,
     },
+    /// A language model alone. Nothing is heard and nothing is spoken:
+    /// what is typed is answered in text.
+    Text {
+        /// The language model.
+        llm: Arc<dyn Llm>,
+    },
 }
 
 impl fmt::Debug for Brain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Cascaded { .. } => "Cascaded",
+            Self::Text { .. } => "Text",
         })
     }
 }
@@ -376,19 +395,71 @@ pub struct SessionStats {
 type Calling = BoxFuture<'static, ToolReply>;
 type Undoing = BoxFuture<'static, bool>;
 
+/// Where a session's line to whoever it talks with stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Line {
+    /// The session was given none. Nobody tells such a session who is
+    /// there, so whoever writes to it is.
+    None,
+    /// It is there.
+    Open,
+    /// It has ended.
+    Closed,
+}
+
+/// What a session of the shape of `brain` thinks with, how it is run on
+/// a line that can do what `line` says, and the driver of its shape.
+fn shape(
+    brain: Brain,
+    needs: AgentNeeds,
+    line: Option<&TransportCaps>,
+    edges: EdgeConfig,
+    language: Option<String>,
+) -> Result<(Arc<dyn Llm>, SessionPlan, Driver), StartError> {
+    match brain {
+        Brain::Cascaded {
+            stt,
+            llm,
+            tts,
+            compute,
+        } => {
+            let profile = BrainProfile::Cascaded {
+                hear: stt.caps(),
+                think: llm.caps(),
+                speak: tts.caps(),
+            };
+            let plan = plan(&needs, &profile, line).map_err(StartError::Plan)?;
+            let driver = match &plan {
+                SessionPlan::Cascaded(cascade) => {
+                    let cascade = Cascade::new(cascade.clone(), stt, tts, compute, edges, language);
+                    Driver::Cascade(cascade?)
+                }
+                // A plan is of the shape of the parts it was made for.
+                SessionPlan::Text(_) => Driver::Text(Writer::default()),
+            };
+            Ok((llm, plan, driver))
+        }
+        Brain::Text { llm } => {
+            let profile = BrainProfile::Text { think: llm.caps() };
+            let plan = plan(&needs, &profile, line).map_err(StartError::Plan)?;
+            Ok((llm, plan, Driver::Text(Writer::default())))
+        }
+    }
+}
+
 /// One session.
 pub struct Session<P: Policies = DefaultPolicies> {
     id: SessionId,
     /// The reading of the clock at which the session's time is `offset`.
     origin: Instant,
     offset: Duration,
-    kernel: Kernel<P>,
+    kernel: Kernel<Shaped<P>>,
     out: Out,
     plan: SessionPlan,
     defs: Arc<Defs>,
 
     transport: Box<dyn Transport>,
-    transport_open: bool,
+    line: Line,
     llm: Arc<dyn Llm>,
     tools: Arc<dyn ToolExecutor>,
     sink: Option<Arc<dyn EventSink>>,
@@ -410,6 +481,12 @@ pub struct Session<P: Policies = DefaultPolicies> {
     queue: Vec<Event>,
     /// What the session itself has to tell the kernel after a step.
     next: Vec<Event>,
+    /// What a step set in motion that takes no time, which the kernel is
+    /// told before the next thing that happened.
+    at_once: Vec<Event>,
+    /// Whether the kernel has given back what it does not need while
+    /// nothing is under way.
+    parked: bool,
     /// Whether the kernel has been told that the parts of an agent that
     /// is to take the floor are ready.
     stage_reported: bool,
@@ -452,17 +529,6 @@ impl<P: Policies> Session<P> {
         {
             return Err(StartError::Defs);
         }
-        let Brain::Cascaded {
-            stt,
-            llm,
-            tts,
-            compute,
-        } = parts.brain;
-        let brain = BrainProfile::Cascaded {
-            hear: stt.caps(),
-            think: llm.caps(),
-            speak: tts.caps(),
-        };
         let most_tools = spec
             .kernel
             .agents
@@ -473,17 +539,11 @@ impl<P: Policies> Session<P> {
             tools: most_tools.unwrap_or(0),
         };
         let line = parts.transport.as_ref().map(|transport| transport.caps());
-        let plan = plan(&needs, &brain, line.as_ref()).map_err(StartError::Plan)?;
-        let driver = match &plan {
-            SessionPlan::Cascaded(cascade) => Driver::Cascade(Cascade::new(
-                cascade.clone(),
-                stt,
-                tts,
-                compute,
-                spec.edges,
-                spec.language,
-            )?),
-        };
+        let (llm, plan, driver) =
+            shape(parts.brain, needs, line.as_ref(), spec.edges, spec.language)?;
+        // A reader is given every word as it is written. Whole sentences
+        // are for a synthesiser.
+        let policies = Shaped::new(policies, matches!(driver, Driver::Text(_)));
 
         let recovered = parts
             .journal
@@ -517,7 +577,11 @@ impl<P: Policies> Session<P> {
                 agents: spec.agents,
                 tools: spec.tools,
             }),
-            transport_open: parts.transport.is_some(),
+            line: if parts.transport.is_some() {
+                Line::Open
+            } else {
+                Line::None
+            },
             transport: parts.transport.unwrap_or_else(|| Box::new(Gone)),
             llm,
             tools: parts.tools,
@@ -533,6 +597,8 @@ impl<P: Policies> Session<P> {
             followers: Vec::new(),
             queue: Vec::new(),
             next,
+            at_once: Vec::new(),
+            parked: false,
             stage_reported: false,
             taps: parts.taps,
             sleep: Box::pin(tokio::time::sleep_until(origin)),
@@ -657,6 +723,7 @@ impl<P: Policies> Session<P> {
             progressed |= !queue.is_empty();
             for event in queue.drain(..) {
                 self.step(now, &event);
+                self.settle(now);
             }
             self.queue = queue;
             progressed |= self.send_frames(now);
@@ -672,6 +739,7 @@ impl<P: Policies> Session<P> {
                 continue;
             }
             let Some(at) = self.deadline() else {
+                self.park();
                 return Poll::Pending;
             };
             // Everything due by `now` has been done. A deadline that says
@@ -687,6 +755,37 @@ impl<P: Policies> Session<P> {
         // There is still more to do. Others get a turn first.
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+
+    /// Tells the kernel what the step before set in motion that takes no
+    /// time, and what that sets in motion, until nothing more is. In a
+    /// session of text that is all of a response's way to its reader.
+    fn settle(&mut self, now: MonoTime) {
+        let mut at_once = core::mem::take(&mut self.at_once);
+        while self.driver.settle(&mut at_once) {
+            for event in at_once.drain(..) {
+                self.step(now, &event);
+            }
+        }
+        self.at_once = at_once;
+    }
+
+    /// Has the kernel give back what it does not need, when the session
+    /// is of text and has nothing under way and nothing to wake it but
+    /// the next thing somebody writes. Between two messages of a chat a
+    /// session holds its conversation and little else.
+    fn park(&mut self) {
+        if self.parked || !matches!(self.driver, Driver::Text(_)) {
+            return;
+        }
+        let idle = self.minds.is_empty()
+            && self.calls.is_empty()
+            && self.undoing.is_empty()
+            && self.store.is_idle();
+        if idle {
+            self.kernel.park();
+            self.parked = true;
+        }
     }
 
     /// Stops everything the session was doing, where it is. The kernel of
@@ -771,17 +870,22 @@ impl<P: Policies> Session<P> {
         self.poll_transport(cx, now);
 
         let mut follows = Vec::new();
-        if let Some(inbox) = &mut self.inbox {
-            loop {
+        if let Some(mut inbox) = self.inbox.take() {
+            let open = loop {
                 match inbox.poll_recv(cx) {
-                    Poll::Ready(Some(Request::Input(input))) => self.queue.push(asked(input)),
-                    Poll::Ready(Some(Request::Follow { from, to })) => follows.push((from, to)),
-                    Poll::Ready(None) => {
-                        self.inbox = None;
-                        break;
+                    Poll::Ready(Some(Request::Input(input))) => {
+                        if let SessionInput::Text { who, .. } = &input {
+                            self.typed(*who);
+                        }
+                        self.queue.push(asked(input));
                     }
-                    Poll::Pending => break,
+                    Poll::Ready(Some(Request::Follow { from, to })) => follows.push((from, to)),
+                    Poll::Ready(None) => break false,
+                    Poll::Pending => break true,
                 }
+            };
+            if open {
+                self.inbox = Some(inbox);
             }
         }
         for (from, to) in follows {
@@ -818,7 +922,7 @@ impl<P: Policies> Session<P> {
     }
 
     fn poll_transport(&mut self, cx: &mut Context<'_>, now: MonoTime) {
-        while self.transport_open {
+        while self.line == Line::Open {
             let Poll::Ready(event) = self.transport.poll_event(cx) else {
                 break;
             };
@@ -845,10 +949,13 @@ impl<P: Policies> Session<P> {
                     self.driver.packet(now, who, packet);
                 }
                 Some(TransportEvent::Played { tag, played }) => self.driver.acked(tag, played),
-                Some(TransportEvent::Text { who, text }) => self.queue.push(Event::TextIn {
-                    who,
-                    text: text.into(),
-                }),
+                Some(TransportEvent::Text { who, text }) => {
+                    self.typed(who);
+                    self.queue.push(Event::TextIn {
+                        who,
+                        text: text.into(),
+                    });
+                }
                 Some(TransportEvent::Detached) => {
                     self.queue.push(Event::Control(ControlInput::Detached));
                 }
@@ -862,7 +969,7 @@ impl<P: Policies> Session<P> {
                 // and a response begun now would be heard by nobody at
                 // all.
                 None => {
-                    self.transport_open = false;
+                    self.line = Line::Closed;
                     self.transport = Box::new(Gone);
                     self.queue.push(Event::Control(ControlInput::Detached));
                     let reason = CloseReason::Abandoned;
@@ -872,6 +979,31 @@ impl<P: Policies> Session<P> {
                 }
             }
         }
+    }
+
+    /// `who` has typed something, which the kernel is told next. Before
+    /// it is, the agent is stopped: what is typed takes the floor, as
+    /// speech over the agent's does. Otherwise the answer to it would
+    /// wait for the one that is being heard or read to end. And a session
+    /// without a transport is told that whoever writes to it is there.
+    fn typed(&mut self, who: ParticipantId) {
+        let unknown = !self.kernel.view().participants().any(|there| there == who);
+        if self.line == Line::None && unknown {
+            self.queue.push(Event::Control(ControlInput::Join { who }));
+        }
+        self.queue.push(Event::Control(ControlInput::Interrupt));
+    }
+
+    /// Tells whoever follows the session text of the response `tag` that
+    /// has gone out.
+    fn said(&mut self, tag: OpTag, text: &str) {
+        if self.followers.is_empty() {
+            return;
+        }
+        self.tell(&SessionEvent::Said {
+            generation: tag.generation,
+            text: text.to_owned(),
+        });
     }
 
     fn poll_tools(&mut self, cx: &mut Context<'_>, now: MonoTime) {
@@ -941,6 +1073,22 @@ impl<P: Policies> Session<P> {
             mark(self.sink.as_ref(), self.id, now, Stage::Stored(*upto));
         }
 
+        // What a speaker has said so far is news for whoever follows.
+        if let Event::Transcript {
+            who,
+            text,
+            is_final: false,
+            ..
+        } = event
+            && !self.followers.is_empty()
+        {
+            self.tell(&SessionEvent::Hearing {
+                who: *who,
+                text: text.as_str().to_owned(),
+            });
+        }
+
+        self.parked = false;
         let mut out = core::mem::take(&mut self.out);
         self.kernel.step(now, event, &mut out);
         for tap in &mut self.taps {
@@ -1009,9 +1157,14 @@ impl<P: Policies> Session<P> {
             // Dropping the stream is all there is to cancelling it.
             Command::Llm(tag, LlmCmd::Cancel) => self.minds.retain(|mind| mind.tag != tag),
             Command::Tts(tag, TtsCmd::Speak { text: piece }) => {
-                if self.driver.say(tag, text.get(piece)) {
+                let piece = text.get(piece);
+                let said = self.driver.say(tag, piece);
+                if said.first {
                     let stage = Stage::FirstText(tag.generation);
                     mark(self.sink.as_ref(), self.id, now, stage);
+                }
+                if said.out {
+                    self.said(tag, piece);
                 }
             }
             Command::Tts(tag, TtsCmd::Finish) => self.driver.finish(tag),
@@ -1019,7 +1172,11 @@ impl<P: Policies> Session<P> {
             Command::Stt(SttCmd::Finalize { who }) => self.driver.finalize(who),
             Command::Stt(SttCmd::Close { who }) => self.driver.close(who),
             Command::Sense(command) => self.driver.sense(self.kernel.view(), command),
-            Command::Playout(tag, PlayoutCmd::Start) => self.driver.start(tag, now),
+            Command::Playout(tag, PlayoutCmd::Start) => {
+                if let Some(held) = self.driver.start(tag, now) {
+                    self.said(tag, &held);
+                }
+            }
             Command::Playout(tag, PlayoutCmd::Duck) => {
                 self.driver.duck(tag);
                 mark(
@@ -1201,9 +1358,9 @@ struct Earlier {
 /// and what it was rebuilt from.
 fn rebuild<P: Policies>(
     config: &KernelConfig,
-    policies: P,
+    policies: Shaped<P>,
     recovered: &Recovered,
-) -> Result<(Kernel<P>, Option<Earlier>), StartError> {
+) -> Result<(Kernel<Shaped<P>>, Option<Earlier>), StartError> {
     if recovered.is_new() {
         let kernel = Kernel::new(config.clone(), policies).map_err(StartError::Config)?;
         return Ok((kernel, None));

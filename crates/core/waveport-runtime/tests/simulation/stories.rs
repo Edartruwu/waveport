@@ -26,7 +26,7 @@ use crate::{SEEDS, told};
 const INSTRUCTIONS: &str = "You are a helpful agent on a call.";
 
 /// A session with one agent that has `tools`.
-fn spec(tools: &[(&str, Effect)]) -> SessionSpec {
+pub(super) fn spec(tools: &[(&str, Effect)]) -> SessionSpec {
     let ids = (0..tools.len()).map(|index| ToolId(u16::try_from(index).unwrap()));
     SessionSpec {
         kernel: KernelConfig {
@@ -101,7 +101,7 @@ fn quick(plan: &mut Plan, rng: &mut SimRng) {
     plan.tts.first = Duration::from_millis(rng.range(40..300));
 }
 
-const STORY: &str = "Of course. Once upon a time there was a ship that sailed all the seas of \
+pub(super) const STORY: &str = "Of course. Once upon a time there was a ship that sailed all the seas of \
                      the world and never came home. Its captain was a woman from the north.";
 
 /// Scenario 3: a caller who interrupts is answered on what they heard.
@@ -176,7 +176,7 @@ fn a_caller_who_interrupts_is_answered_on_what_they_heard() {
 
 /// Whether a model was shown the result of a tool call, and not the
 /// stand-in for one that is still running.
-fn has_result(asked: &Asked) -> bool {
+pub(super) fn has_result(asked: &Asked) -> bool {
     asked.messages.iter().any(|said| {
         matches!(said, Said::ToolResult { text, .. } if text != waveport_runtime::context::STILL_RUNNING)
     })
@@ -376,29 +376,29 @@ fn a_session_asked_to_close_closes_whatever_its_parts_do() {
     assert_eq!(tally.closed, tally.runs, "{tally:?}");
 }
 
-const FRONT: &str = "You talk to the caller.";
-const BACK: &str = "You look things up.";
-const ONE_MOMENT: &str = "Give me a moment while I check what the warranty says about that.";
-const ALSO: &str = "Sure, I will also ask whether accidental damage is included in it.";
-const COVERS: &str = "The warranty covers parts and labour for two years.";
+pub(super) const FRONT: &str = "You talk to the caller.";
+pub(super) const BACK: &str = "You look things up.";
+pub(super) const ONE_MOMENT: &str =
+    "Give me a moment while I check what the warranty says about that.";
+pub(super) const ALSO: &str = "Sure, I will also ask whether accidental damage is included in it.";
+pub(super) const COVERS: &str = "The warranty covers parts and labour for two years.";
 
 /// What the agent at the back finds out: its answer at the end of some
 /// thinking aloud, so that it takes its time, between two and five
 /// seconds.
-fn researched() -> String {
+pub(super) fn researched() -> String {
     let thinking = "hm ".repeat(200);
     format!("{thinking}Parts and labour for two years.")
 }
 
-/// Scenario 5: work handed to a second agent survives an interruption of
-/// the first.
-fn hybrid_front_back(seed: u64) -> Plan {
-    let mut rng = SimRng::new(Seed(seed)).fork("front and back");
+/// A session of two agents: one that talks to the caller and has one
+/// tool, and one at the back that is the tool.
+pub(super) fn front_and_back() -> SessionSpec {
     let delegated = ToolSpec {
         executor: Executor::Agent(AgentId(1)),
         ..ToolSpec::new(Effect::Pure)
     };
-    let spec = SessionSpec {
+    SessionSpec {
         kernel: KernelConfig {
             agents: vec![
                 AgentSpec {
@@ -423,30 +423,41 @@ fn hybrid_front_back(seed: u64) -> Plan {
             parameters: "{}".to_owned(),
         }],
         ..SessionSpec::new(SESSION, FRONT)
-    };
-    let mut plan = Plan::new(seed, spec);
+    }
+}
+
+/// What the two agents write: the one at the back what it found, and the
+/// one in front that it will ask, then that it will ask more, and then
+/// what was found.
+pub(super) fn asks_the_back(asked: &Asked) -> Vec<LlmStep> {
+    if asked.instructions == BACK {
+        return vec![LlmStep::Say(researched())];
+    }
+    let called = asked
+        .messages
+        .iter()
+        .any(|said| matches!(said, Said::ToolCall { .. }));
+    if has_result(asked) {
+        // Whatever it is asked for now, it knows the answer.
+        vec![LlmStep::say(COVERS)]
+    } else if called {
+        vec![LlmStep::say(ALSO)]
+    } else {
+        vec![
+            LlmStep::say(ONE_MOMENT),
+            LlmStep::call("research", "{\"topic\":\"warranty\"}"),
+        ]
+    }
+}
+
+/// Scenario 5: work handed to a second agent survives an interruption of
+/// the first.
+fn hybrid_front_back(seed: u64) -> Plan {
+    let mut rng = SimRng::new(Seed(seed)).fork("front and back");
+    let mut plan = Plan::new(seed, front_and_back());
     weather(&mut plan, &mut rng);
     quick(&mut plan, &mut rng);
-    plan.llm = Arc::new(|asked| {
-        if asked.instructions == BACK {
-            return vec![LlmStep::Say(researched())];
-        }
-        let called = asked
-            .messages
-            .iter()
-            .any(|said| matches!(said, Said::ToolCall { .. }));
-        if has_result(asked) {
-            // Whatever it is asked for now, it knows the answer.
-            vec![LlmStep::say(COVERS)]
-        } else if called {
-            vec![LlmStep::say(ALSO)]
-        } else {
-            vec![
-                LlmStep::say(ONE_MOMENT),
-                LlmStep::call("research", "{\"topic\":\"warranty\"}"),
-            ]
-        }
-    });
+    plan.llm = Arc::new(asks_the_back);
     let asked = plan.says(0, 1_000, 300, "what does the warranty cover");
     // The caller cuts in while the first agent is still speaking.
     let cuts_in = asked + rng.range(1_700..3_500);
@@ -511,7 +522,7 @@ fn work_handed_to_a_second_agent_survives_an_interruption_of_the_first() {
     assert_eq!(tally.completed, tally.runs, "{tally:?}");
 }
 
-const TOTAL: &str = "The invoice total is four hundred euros.";
+pub(super) const TOTAL: &str = "The invoice total is four hundred euros.";
 
 /// Scenario 6: with several people on the line, the agent knows who said
 /// what, and when it is being spoken to.

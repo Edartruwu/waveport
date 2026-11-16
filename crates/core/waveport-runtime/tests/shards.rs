@@ -159,7 +159,7 @@ async fn sessions_are_started_driven_followed_and_closed() {
                 assert_eq!(journal.records(a)[numbers.len() - 1], record);
             }
             SessionEvent::Told(ClientEvent::Lifecycle(Lifecycle::Closed)) => closed = true,
-            SessionEvent::Told(_) => {}
+            SessionEvent::Told(_) | SessionEvent::Said { .. } | SessionEvent::Hearing { .. } => {}
             SessionEvent::Gap { .. } => panic!("nothing was asked for that is not held"),
         }
     }

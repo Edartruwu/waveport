@@ -1,5 +1,6 @@
 //! The parts an agent is made of, put together, and a call run on them.
 
+use core::pin::Pin;
 use core::time::Duration;
 use std::path::Path;
 use std::sync::{Arc, Weak};
@@ -7,10 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use waveport_adapter_kit::secret::Secret;
+use waveport_domain::ids::{ParticipantId, Seq};
 use waveport_domain::policy::DefaultPolicies;
 use waveport_llm_openai_compat::{Config as LlmConfig, Dialect, OpenAiCompat};
 use waveport_models_onnx::{Runtime as Models, SileroVad, SmartTurn, TURN_MODEL, VAD_MODEL};
-use waveport_ports::control::{SessionControl, SessionInput};
+use waveport_ports::control::{EventRx, SessionControl, SessionInput};
 use waveport_ports::journal::SessionId;
 use waveport_ports::stt::Stt;
 use waveport_ports::telemetry::EventSink;
@@ -28,13 +30,19 @@ use waveport_transport_local_audio::{Health, LocalAudio};
 use waveport_tts_cartesia::CartesiaTts;
 use waveport_tts_elevenlabs::ElevenLabsTts;
 
-use crate::args::{Agent, Chosen, Hears, INSTRUCTIONS, LLM_URL, Resume, Speaks};
+use crate::args::{Agent, Aloud, Chosen, Hears, INSTRUCTIONS, LLM_URL, Resume, Speaks, WRITTEN};
 use crate::halt::Halt;
 use crate::kept::Kept;
 use crate::report::{Reporter, Tell};
 use crate::summary::Summary;
 use crate::tools::Notes;
 use crate::{Context, Failure, tools};
+
+/// What a call tells whoever follows it.
+pub(crate) type Told = Pin<Box<dyn EventRx>>;
+
+/// Who writes to a chat: whoever sits at the terminal.
+const WRITER: ParticipantId = ParticipantId(0);
 
 /// How long a call that was asked to end has to do so before the command
 /// stops waiting for it.
@@ -69,11 +77,11 @@ fn key_of(chosen: &Chosen) -> Result<Option<Secret>, Failure> {
 }
 
 /// The part that recognises speech.
-fn recogniser(agent: &Agent) -> Result<Arc<dyn Stt>, Failure> {
-    let chosen = agent.hears();
+fn recogniser(aloud: &Aloud) -> Result<Arc<dyn Stt>, Failure> {
+    let chosen = aloud.hears();
     let key = key_of(&chosen)?;
     let Chosen { url, model, .. } = chosen;
-    Ok(match agent.stt {
+    Ok(match aloud.stt {
         Hears::OpenAi => Arc::new(OpenAiStt::new(waveport_stt_openai::Config {
             url,
             ..waveport_stt_openai::Config::new(&model, key)
@@ -92,17 +100,17 @@ fn recogniser(agent: &Agent) -> Result<Arc<dyn Stt>, Failure> {
 /// The part that synthesises speech, with a connection made ahead: the
 /// first answer does not then wait for one to be made. If none can be
 /// made the call says so itself, at its first answer.
-async fn synthesiser(agent: &Agent) -> Result<Arc<dyn Tts>, Failure> {
-    let chosen = agent.speaks();
+async fn synthesiser(aloud: &Aloud) -> Result<Arc<dyn Tts>, Failure> {
+    let chosen = aloud.speaks();
     let key = key_of(&chosen)?;
     let Chosen {
         url, model, voice, ..
     } = chosen;
-    let (tts, warmed): (Arc<dyn Tts>, _) = match agent.tts {
+    let (tts, warmed): (Arc<dyn Tts>, _) = match aloud.tts {
         Speaks::Cartesia => {
             let tts = Arc::new(CartesiaTts::new(waveport_tts_cartesia::Config {
                 url,
-                language: agent.language.clone(),
+                language: aloud.language.clone(),
                 ..waveport_tts_cartesia::Config::new(&model, &voice, key)
             }));
             let warmed = tts.warm().await;
@@ -126,16 +134,18 @@ async fn synthesiser(agent: &Agent) -> Result<Arc<dyn Tts>, Failure> {
     Ok(tts)
 }
 
-/// What the agent is told before the call.
-fn instructions(agent: &Agent) -> Result<String, Failure> {
+/// What the agent is told before the call. One that is told nothing is
+/// told what suits an agent that speaks, or one that writes.
+fn instructions(agent: &Agent, speaks: bool) -> Result<String, Failure> {
     if let Some(file) = &agent.instructions_file {
         return std::fs::read_to_string(file)
             .with(|| format!("the instructions in {} cannot be read", file.display()));
     }
+    let usual = if speaks { INSTRUCTIONS } else { WRITTEN };
     Ok(agent
         .instructions
         .clone()
-        .unwrap_or_else(|| INSTRUCTIONS.to_owned()))
+        .unwrap_or_else(|| usual.to_owned()))
 }
 
 /// The models that listen, from the files in `assets`.
@@ -161,21 +171,27 @@ pub(crate) fn name() -> SessionId {
     SessionId(now ^ (u128::from(std::process::id()) << 96))
 }
 
+/// What an agent hears and speaks with, and the language it does so in.
+/// An agent that only writes has none of it.
+struct Speech {
+    stt: Arc<dyn Stt>,
+    tts: Arc<dyn Tts>,
+    compute: Arc<Compute>,
+    language: String,
+}
+
 /// What every call of this command is made of: the runtime, the models
 /// that listen, the providers, the tools and the journal.
 pub(crate) struct Stack {
     runtime: Arc<Runtime>,
-    stt: Arc<dyn Stt>,
     llm: Arc<OpenAiCompat>,
-    tts: Arc<dyn Tts>,
+    speech: Option<Speech>,
     tools: Arc<Registry>,
     /// Where calls are kept.
     pub kept: Kept,
     /// What whoever ran the command should know before any call.
     pub notes: Vec<String>,
-    compute: Arc<Compute>,
     instructions: String,
-    language: String,
     greeting: Option<String>,
     states: StateRule,
     /// What the tools are called, in the kernel's order.
@@ -193,6 +209,8 @@ pub(crate) struct Call {
     pub notes: Vec<String>,
     /// What the call was rebuilt from, if it goes on after it broke off.
     pub rebuilt: Option<Rebuilt>,
+    /// Whether the agent was given something to say as the call began.
+    pub greeted: bool,
     /// Whether it was begun as one to go on with.
     resumed: bool,
     started: Started,
@@ -230,20 +248,26 @@ impl Call {
 }
 
 impl Stack {
-    /// Puts the parts together as `agent` says. `resuming` is whether a
+    /// Puts the parts together as `agent` says, with what `aloud` says it
+    /// hears and speaks with, if it does either. `resuming` is whether a
     /// call is to be gone on with, which the calls that were kept are
     /// needed for.
-    pub(crate) async fn build(agent: &Agent, resuming: bool) -> Result<Self, Failure> {
+    pub(crate) async fn build(
+        agent: &Agent,
+        aloud: Option<&Aloud>,
+        resuming: bool,
+    ) -> Result<Self, Failure> {
         let halt = Halt::from_env().map_err(Failure)?;
         // First, so that a file of calls that cannot be used is said
         // before anything is waited for.
         let (kept, mut notes) = Kept::open(agent, &halt, resuming)?;
         notes.extend(kept.earlier().await);
-        let instructions = instructions(agent)?;
+        let instructions = instructions(agent, aloud.is_some())?;
         let llm_key = key(&agent.llm_key_env, &agent.llm_url, LLM_URL)?;
-        let stt = recogniser(agent)?;
-
-        let compute = models(&agent.assets)?;
+        let hears = match aloud {
+            Some(aloud) => Some((recogniser(aloud)?, models(&aloud.assets)?)),
+            None => None,
+        };
         // What only OpenAI itself understands is asked of nobody else.
         let llm = if agent.llm_url == LLM_URL {
             LlmConfig::openai(&agent.llm_model, llm_key)
@@ -256,7 +280,15 @@ impl Stack {
         };
         let llm =
             OpenAiCompat::new(llm).with(|| "the language model cannot be reached".to_owned())?;
-        let tts = synthesiser(agent).await?;
+        let speech = match (aloud, hears) {
+            (Some(aloud), Some((stt, compute))) => Some(Speech {
+                stt,
+                tts: synthesiser(aloud).await?,
+                compute: Arc::new(compute),
+                language: aloud.language.clone(),
+            }),
+            _ => None,
+        };
 
         let runtime = Arc::new(
             Runtime::new(RuntimeConfig::default()).with(|| "no session can run".to_owned())?,
@@ -284,15 +316,12 @@ impl Stack {
         };
         Ok(Self {
             runtime,
-            stt,
             llm: Arc::new(llm),
-            tts,
+            speech,
             tools: Arc::new(registry),
             kept,
             notes,
-            compute: Arc::new(compute),
             instructions,
-            language: agent.language.clone(),
             greeting: agent.greeting.clone(),
             states: StateRule {
                 records: agent.state_every.max(1),
@@ -301,6 +330,11 @@ impl Stack {
             names,
             otel,
         })
+    }
+
+    /// What the tools are called, in the kernel's order.
+    pub(crate) fn tools(&self) -> Vec<String> {
+        self.names.clone()
     }
 
     /// Something to follow one call with, and say afterwards what it
@@ -344,31 +378,80 @@ impl Stack {
         resumed: bool,
         summary: Option<Arc<Summary>>,
     ) -> Result<Call, Failure> {
-        let mut spec = SessionSpec::new(id, &self.instructions);
-        spec.language = Some(self.language.clone());
-        spec.states = self.states;
-        self.tools.offer(&mut spec);
-        let names = spec.tools.iter().map(|tool| tool.name.clone()).collect();
         // The call is told on the terminal, and to whoever else was
         // asked for.
-        let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(Reporter::new(tell, names))];
+        let mut sinks: Vec<Arc<dyn EventSink>> =
+            vec![Arc::new(Reporter::new(tell, self.names.clone()))];
         if let Some((otel, _)) = &self.otel {
             sinks.push(Arc::clone(otel) as Arc<dyn EventSink>);
         }
         if let Some(summary) = summary {
             sinks.push(summary);
         }
-        let parts = Parts {
-            brain: Brain::Cascaded {
-                stt: self.stt.clone(),
+        let (call, _) = self
+            .begin(id, Some(transport), sinks, resumed, false)
+            .await?;
+        Ok(call)
+    }
+
+    /// Begins a chat called `id`, or goes on with it: a call over no
+    /// line, with whoever writes to it. Returns it with what it tells
+    /// from its beginning here on, which is how what it writes is read.
+    pub(crate) async fn start_written(
+        &self,
+        id: SessionId,
+        resumed: bool,
+    ) -> Result<(Call, Told), Failure> {
+        let sinks = self
+            .otel
+            .iter()
+            .map(|(otel, _)| Arc::clone(otel) as Arc<dyn EventSink>)
+            .collect();
+        let (call, told) = self.begin(id, None, sinks, resumed, true).await?;
+        let told = told.ok_or_else(|| Failure("the chat tells nothing".to_owned()))?;
+        Ok((call, told))
+    }
+
+    /// Follows the call `id` from the fact numbered `from`.
+    pub(crate) fn follow(&self, id: SessionId, from: Seq) -> Option<Told> {
+        self.runtime.subscribe(id, from).ok()
+    }
+
+    /// Says to the call `id` what was typed.
+    pub(crate) fn type_in(&self, id: SessionId, text: String) -> bool {
+        let typed = SessionInput::Text { who: WRITER, text };
+        self.runtime.send(id, typed).is_ok()
+    }
+
+    async fn begin(
+        &self,
+        id: SessionId,
+        transport: Option<Box<dyn Transport>>,
+        sinks: Vec<Arc<dyn EventSink>>,
+        resumed: bool,
+        followed: bool,
+    ) -> Result<(Call, Option<Told>), Failure> {
+        let mut spec = SessionSpec::new(id, &self.instructions);
+        spec.language = self.speech.as_ref().map(|speech| speech.language.clone());
+        spec.states = self.states;
+        self.tools.offer(&mut spec);
+        let brain = match &self.speech {
+            Some(speech) => Brain::Cascaded {
+                stt: speech.stt.clone(),
                 llm: self.llm.clone(),
-                tts: self.tts.clone(),
-                compute: Arc::clone(&self.compute),
+                tts: speech.tts.clone(),
+                compute: Arc::clone(&speech.compute),
             },
-            transport: Some(transport),
+            None => Brain::Text {
+                llm: self.llm.clone(),
+            },
+        };
+        let parts = Parts {
+            brain,
+            transport,
             tools: self.tools.clone(),
             journal: self.kept.journal(),
-            sink: Some(Arc::new(sinks)),
+            sink: (!sinks.is_empty()).then(|| Arc::new(sinks) as Arc<dyn EventSink>),
             taps: Vec::new(),
         };
         let started = self
@@ -382,21 +465,40 @@ impl Stack {
             .iter()
             .map(ToString::to_string)
             .collect();
-        // A call that goes on has been greeted.
         let rebuilt = started.rebuilt;
-        if let Some(greeting) = self.greeting.as_ref().filter(|_| rebuilt.is_none()) {
+        // Whoever follows is there before anything is said: from the
+        // first fact of a new call, and from the first that a call
+        // which goes on did not already hold.
+        let told = if followed {
+            let held = rebuilt.map_or(0, |from| {
+                from.state.map_or(0, Seq::get).saturating_add(from.records)
+            });
+            let from = Seq(held.saturating_add(1));
+            Some(
+                self.runtime
+                    .subscribe(id, from)
+                    .with(|| "the call cannot be followed".to_owned())?,
+            )
+        } else {
+            None
+        };
+        // A call that goes on has been greeted.
+        let greeting = self.greeting.as_ref().filter(|_| rebuilt.is_none());
+        if let Some(greeting) = greeting {
             let text = greeting.clone();
             self.runtime
                 .send(id, SessionInput::Say { text })
                 .with(|| "the greeting could not be said".to_owned())?;
         }
-        Ok(Call {
+        let call = Call {
             id,
             notes,
             rebuilt,
+            greeted: greeting.is_some(),
             resumed,
             started,
-        })
+        };
+        Ok((call, told))
     }
 
     /// The name of the call to run: the one `resume` says to go on with,
@@ -453,12 +555,13 @@ pub(crate) fn outcome(exit: &Exit) -> Outcome {
 /// goes. The call is a new one, or the one `resume` says to go on with.
 pub(crate) async fn run(
     agent: &Agent,
+    aloud: &Aloud,
     transport: LocalAudio,
     resume: Option<&Resume>,
     report: Option<&Path>,
 ) -> Result<Outcome, Failure> {
     let health = transport.health();
-    let stack = Stack::build(agent, resume.is_some()).await?;
+    let stack = Stack::build(agent, Some(aloud), resume.is_some()).await?;
     for note in &stack.notes {
         println!("note: {note}");
     }

@@ -59,6 +59,9 @@ pub const CALLER: ParticipantId = ParticipantId(1);
 /// What the agent is told before a call.
 const INSTRUCTIONS: &str = "You are a helpful agent on a call.";
 
+/// What the caller asks, aloud or in writing.
+pub const QUESTION: &str = "What time is it right now?";
+
 /// What the agent answers a caller who listens: a sentence of a second
 /// and a quarter as the stand-in for the synthesiser speaks it.
 pub const ANSWER: &str = "It is ten past three.";
@@ -706,41 +709,63 @@ impl Shared {
             ..self.script
         };
         let spoken = script.talks().into_iter();
-        let spoken = spoken.map(|(from, to)| Spoken::new(from, to, "What time is it right now?"));
+        let spoken = spoken.map(|(from, to)| Spoken::new(from, to, QUESTION));
         let mut heard = SttScript::new(spoken.collect());
         heard.latency = self.script.delays.stt;
         let (line, sent) = Line::new(&script, &self.packets);
-        let spec = SessionSpec {
-            kernel: KernelConfig {
-                agents: vec![AgentSpec {
-                    tools: vec![ToolId(0)],
-                }],
-                tools: vec![ToolSpec::new(Effect::Pure)],
-                ..KernelConfig::default()
-            },
-            tools: vec![ToolDef {
-                name: "get_time".to_owned(),
-                description: "The time of day.".to_owned(),
-                parameters: "{}".to_owned(),
-            }],
-            ..SessionSpec::new(id, INSTRUCTIONS)
+        let brain = Brain::Cascaded {
+            stt: Arc::new(ScriptedStt::new(heard)),
+            llm: Arc::new(self.llm.clone()),
+            tts: Arc::new(self.tts.clone()),
+            compute: Arc::clone(&self.compute),
         };
+        let parts = self.parts(brain, Some(Box::new(line)));
+        (spec(id), parts, sent)
+    }
+
+    /// What a session of text called `id` is made of: the model and the
+    /// tool of a call, and nothing that hears or speaks. It has no line.
+    /// What is typed is asked of it, and what it writes is told to
+    /// whoever follows it.
+    #[must_use]
+    pub fn chat(&self, id: SessionId) -> (SessionSpec, Parts) {
+        let brain = Brain::Text {
+            llm: Arc::new(self.llm.clone()),
+        };
+        (spec(id), self.parts(brain, None))
+    }
+
+    /// The parts of a session that thinks with `brain` over `transport`.
+    fn parts(&self, brain: Brain, transport: Option<Box<dyn Transport>>) -> Parts {
         let tools = ScriptedTools::with(|_| ToolReply::Completed("15:10".to_owned()));
         let sink: Arc<dyn EventSink> = Arc::clone(&self.watch) as Arc<dyn EventSink>;
-        let parts = Parts {
-            brain: Brain::Cascaded {
-                stt: Arc::new(ScriptedStt::new(heard)),
-                llm: Arc::new(self.llm.clone()),
-                tts: Arc::new(self.tts.clone()),
-                compute: Arc::clone(&self.compute),
-            },
-            transport: Some(Box::new(line)),
+        Parts {
+            brain,
+            transport,
             tools: Arc::new(tools),
             journal: Arc::new(Forgetful),
             sink: Some(sink),
             taps: Vec::new(),
-        };
-        (spec, parts, sent)
+        }
+    }
+}
+
+/// A session of one agent that has one tool.
+fn spec(id: SessionId) -> SessionSpec {
+    SessionSpec {
+        kernel: KernelConfig {
+            agents: vec![AgentSpec {
+                tools: vec![ToolId(0)],
+            }],
+            tools: vec![ToolSpec::new(Effect::Pure)],
+            ..KernelConfig::default()
+        },
+        tools: vec![ToolDef {
+            name: "get_time".to_owned(),
+            description: "The time of day.".to_owned(),
+            parameters: "{}".to_owned(),
+        }],
+        ..SessionSpec::new(id, INSTRUCTIONS)
     }
 }
 

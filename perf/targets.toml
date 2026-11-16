@@ -52,6 +52,15 @@ stopping = { target_p50_ms = 10.0, target_p99_ms = 30.0, held_p50_ms = 0.0, held
 [memory]
 idle = { target_p50_kb = 480, target_p99_kb = 600, held_pcm_kb = 537, held_opus_kb = 478 }
 active = { target_p50_kb = 1500, target_p99_kb = 4000, held_pcm_kb = 549, held_opus_kb = 489 }
+# A session of text has no line and no audio. Between two messages it
+# holds its kernel, parked, the conversation, and the last 128 of its
+# records for whoever follows it. So it grows with what was written: a
+# little over half a kilobyte for a short question and an answer of
+# thirty words, until the 128 records are there. The usual chat is taken
+# to be one of ten messages and is held to the target for the usual
+# session, and one of a hundred to the target for 99 in a hundred.
+# With nothing typed yet a session holds 10 KB.
+text = { target_p50_kb = 64, target_p99_kb = 150, held_usual_kb = 23, held_long_kb = 75 }
 
 # How much of one thread a session takes: fifty calls at once on one shard
 # of the runtime, in real time, on lines that carry Opus, with an agent
