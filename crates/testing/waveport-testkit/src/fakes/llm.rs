@@ -150,6 +150,9 @@ pub struct ScriptedLlm {
     pub first: Duration,
     /// How long it takes over each piece after the first.
     pub each: Duration,
+    /// Whether it keeps no record of what it was asked: for a run so
+    /// long that the record would be most of what the run holds.
+    pub forgets: bool,
     respond: Arc<Respond>,
     asked: Arc<Mutex<Vec<Asked>>>,
 }
@@ -173,6 +176,7 @@ impl ScriptedLlm {
             },
             first: Duration::from_millis(200),
             each: Duration::from_millis(20),
+            forgets: false,
             respond: Arc::new(respond),
             asked: Arc::default(),
         }
@@ -228,10 +232,12 @@ impl Llm for ScriptedLlm {
             max_output_tokens: request.max_output_tokens,
         };
         let steps = (self.respond)(&asked);
-        self.asked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(asked);
+        if !self.forgets {
+            self.asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(asked);
+        }
         let (first, each) = (self.first, self.each);
         Box::pin(async move {
             let rx = stream::events(move |mut events| async move {
