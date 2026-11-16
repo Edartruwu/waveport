@@ -57,8 +57,12 @@ tolerance = 0.25
 # What `cargo xtask perf check` holds a machine to, against its own
 # record in perf/baselines.
 [local]
-# How much worse than its record a number may be, as a share of it.
-tolerance = 0.15
+# How much worse than its record a number may be, as a share of it. On
+# one processor of the machine this was written on (`perf record --cpu`)
+# the share of a thread moves by about 2% from run to run; on whatever
+# processor the system picks, by about 10%, which is why a check that
+# fails measures again and keeps the better measurement.
+tolerance = 0.10
 # The numbers that are held to their record. Less is better for each.
 # How long a session takes to start is not among them: it is a fraction
 # of a millisecond and moves by a third from one run to the next. It is

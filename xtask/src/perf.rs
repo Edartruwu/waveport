@@ -9,11 +9,17 @@
 //!
 //! The measuring is done by a test of the benchmarks package, which
 //! prints each number on a line that begins with `PERF`.
+//!
+//! A thread that the system moves from one core to another measures the
+//! cores as much as the code, most of all where the cores are not alike.
+//! So a record can be made with the measurement kept on one processor,
+//! `--cpu <n>`, and a check is then made on the same one. That needs
+//! `taskset`, which Linux has.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use crate::args::Args;
 use crate::error::{Context, Error, Result};
@@ -51,6 +57,14 @@ const TARGETS: &str = "perf/targets.toml";
 pub(crate) fn run(args: &[String]) -> Result<bool> {
     let mut args = Args::new(args);
     let named = args.value("--host")?;
+    let cpu = match args.value("--cpu")? {
+        Some(cpu) => Some(cpu.parse::<u32>().ok().ok_or_else(|| {
+            Error::new(format!(
+                "`--cpu` takes the number of a processor, not `{cpu}`"
+            ))
+        })?),
+        None => None,
+    };
     let rest = args.finish()?;
     let workspace = meta::load(&LoadOptions::default())?;
     let machine = match named {
@@ -63,13 +77,13 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
         .join(format!("{machine}.toml"));
     match rest.as_slice() {
         [what] if what == "record" => {
-            let measured = measure(&workspace.root)?;
+            let measured = measure(&workspace.root, cpu)?;
             steady(&measured, &rules(&workspace.root)?)?;
             if let Some(folder) = file.parent() {
                 std::fs::create_dir_all(folder)
                     .context(format!("could not make {}", folder.display()))?;
             }
-            std::fs::write(&file, written(&machine, &measured))
+            std::fs::write(&file, written(&machine, cpu, &measured))
                 .context(format!("could not write {}", file.display()))?;
             println!(
                 "perf: recorded {} numbers in {}",
@@ -79,9 +93,22 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
             Ok(true)
         }
         [what] if what == "check" => {
-            let recorded = recorded(&file)?;
+            let (pinned, recorded) = recorded(&file)?;
+            if cpu.is_some() && cpu != pinned {
+                // A check on another processor than the record's, or on
+                // one when the record was made on any, compares two
+                // different things.
+                return Err(Error::new(format!(
+                    "a check is made the way its record was, and {} says: {}",
+                    file.display(),
+                    pinned.map_or_else(
+                        || "on no processor in particular".to_owned(),
+                        |cpu| format!("on processor {cpu}")
+                    )
+                )));
+            }
             let rules = rules(&workspace.root)?;
-            let mut measured = measure(&workspace.root)?;
+            let mut measured = measure(&workspace.root, pinned)?;
             steady(&measured, &rules)?;
             let mut tries = 1;
             loop {
@@ -102,14 +129,14 @@ pub(crate) fn run(args: &[String]) -> Result<bool> {
                 // the better of the two is kept. A change that costs
                 // something costs it every time.
                 println!("perf: worse than the record allows, so once more");
-                let again = measure(&workspace.root)?;
+                let again = measure(&workspace.root, pinned)?;
                 steady(&again, &rules)?;
                 measured = better(measured, again);
                 tries += 1;
             }
         }
         _ => Err(Error::new(
-            "usage: cargo xtask perf <record|check> [--host <name>]",
+            "usage: cargo xtask perf <record|check> [--host <name>] [--cpu <n>]",
         )),
     }
 }
@@ -167,10 +194,29 @@ fn number(value: &toml::Value) -> Option<f64> {
     value.as_float().or(whole)
 }
 
-/// Runs the test that measures, and returns the numbers it printed.
-fn measure(root: &Path) -> Result<BTreeMap<String, f64>> {
-    println!("perf: measuring, which takes about a minute once it is built");
-    let output = meta::cargo()
+/// The command that measures: `cargo`, kept on the processor `cpu` by
+/// `taskset` where one is named.
+fn command(cpu: Option<u32>) -> Command {
+    let cargo = meta::cargo();
+    let Some(cpu) = cpu else {
+        return cargo;
+    };
+    let mut pinned = Command::new("taskset");
+    pinned
+        .arg("-c")
+        .arg(cpu.to_string())
+        .arg(cargo.get_program());
+    pinned
+}
+
+/// Runs the test that measures, on the processor `cpu` where one is
+/// named, and returns the numbers it printed.
+fn measure(root: &Path, cpu: Option<u32>) -> Result<BTreeMap<String, f64>> {
+    match cpu {
+        Some(cpu) => println!("perf: measuring on processor {cpu}, which takes about a minute"),
+        None => println!("perf: measuring, which takes about a minute once it is built"),
+    }
+    let output = command(cpu)
         .current_dir(root)
         // Not the gate of the nightly run: the numbers are judged here.
         .env_remove("WAVEPORT_PERF_GATE")
@@ -178,7 +224,10 @@ fn measure(root: &Path) -> Result<BTreeMap<String, f64>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
-        .context("could not run `cargo test`")?;
+        .context(match cpu {
+            Some(_) => "could not run `taskset`, which `--cpu` needs",
+            None => "could not run `cargo test`",
+        })?;
     let printed = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         return Err(Error::new(format!("the measurement failed:\n{printed}")));
@@ -227,20 +276,28 @@ fn better(one: BTreeMap<String, f64>, other: BTreeMap<String, f64>) -> BTreeMap<
 }
 
 /// The record of a machine, as it is written.
-fn written(machine: &str, measured: &BTreeMap<String, f64>) -> String {
+fn written(machine: &str, cpu: Option<u32>, measured: &BTreeMap<String, f64>) -> String {
     let mut text = format!(
         "# The numbers of one machine, recorded by `cargo xtask perf record`.\n\
          # `cargo xtask perf check` holds the same machine to them.\n\
-         machine = \"{machine}\"\n\n[measured]\n"
+         machine = \"{machine}\"\n"
     );
+    if let Some(cpu) = cpu {
+        let _ = writeln!(
+            text,
+            "# The processor the measurement was kept on, and a check is kept on.\ncpu = {cpu}"
+        );
+    }
+    text.push_str("\n[measured]\n");
     for (name, value) in measured {
         let _ = writeln!(text, "\"{name}\" = {value}");
     }
     text
 }
 
-/// Reads the record of a machine.
-fn recorded(file: &Path) -> Result<BTreeMap<String, f64>> {
+/// Reads the record of a machine: the processor its measurement was
+/// kept on, if it was kept on one, and the numbers.
+fn recorded(file: &Path) -> Result<(Option<u32>, BTreeMap<String, f64>)> {
     let text = std::fs::read_to_string(file).context(format!(
         "{} is not there (`cargo xtask perf record` makes it)",
         file.display()
@@ -250,10 +307,15 @@ fn recorded(file: &Path) -> Result<BTreeMap<String, f64>> {
     let measured = table.get("measured").and_then(toml::Value::as_table);
     let measured =
         measured.ok_or_else(|| Error::new(format!("{} has no [measured]", file.display())))?;
-    Ok(measured
+    let cpu = table
+        .get("cpu")
+        .and_then(toml::Value::as_integer)
+        .and_then(|cpu| u32::try_from(cpu).ok());
+    let measured = measured
         .iter()
         .filter_map(|(name, value)| Some((name.clone(), number(value)?)))
-        .collect())
+        .collect();
+    Ok((cpu, measured))
 }
 
 /// Holds what was measured against the record and the targets. Returns
@@ -352,7 +414,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use super::{Rules, better, compare, parse, recorded, rules_from, slug, steady, written};
+    use super::{
+        Rules, better, command, compare, parse, recorded, rules_from, slug, steady, written,
+    };
 
     fn numbers(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
         pairs
@@ -404,8 +468,11 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("waveport-perf-{}", std::process::id()));
         let file = folder.join("core-ultra-7-155h.toml");
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(&file, written("core-ultra-7-155h", &measured)).unwrap();
-        assert_eq!(recorded(&file).unwrap(), measured);
+        std::fs::write(&file, written("core-ultra-7-155h", None, &measured)).unwrap();
+        assert_eq!(recorded(&file).unwrap(), (None, measured.clone()));
+        // And with the processor it was measured on.
+        std::fs::write(&file, written("core-ultra-7-155h", Some(6), &measured)).unwrap();
+        assert_eq!(recorded(&file).unwrap(), (Some(6), measured));
         let _ = std::fs::remove_dir_all(&folder);
 
         // A machine that was never recorded is told how to be.
@@ -445,6 +512,16 @@ mod tests {
         // A number that is only printed is held to nothing.
         let measured = numbers(&[("poll.longest_ms", 99.0)]);
         assert!(compare(&BTreeMap::new(), &measured, &rules()).1);
+    }
+
+    #[test]
+    fn a_measurement_is_kept_on_a_processor_by_taskset() {
+        let free = command(None);
+        assert_ne!(free.get_program(), "taskset");
+        let pinned = command(Some(6));
+        assert_eq!(pinned.get_program(), "taskset");
+        let args: Vec<_> = pinned.get_args().collect();
+        assert_eq!(args, ["-c".as_ref(), "6".as_ref(), free.get_program()]);
     }
 
     #[test]

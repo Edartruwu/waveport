@@ -40,11 +40,14 @@ Gates:
   bench-ir       Run instruction-count benchmarks: [--base <rev>]
 
 Measurements of this machine:
-  perf record    Measure what a session takes of a thread and how long one
-                 takes to start, and record it in perf/baselines:
+  perf record    Measure what a session takes of a thread, how long one
+                 takes to start and how long the parts of a turn take, and
+                 record it in perf/baselines:
                  [--host <name>] names the machine, otherwise its processor does
-  perf check     Measure again, and hold the machine to its record and to
-                 the targets in perf/targets.toml: [--host <name>]
+                 [--cpu <n>] keeps the measurement on one processor (Linux)
+  perf check     Measure again, the way the record was made, and hold the
+                 machine to its record and to the targets in
+                 perf/targets.toml: [--host <name>]
 
 Setup:
   fetch-assets   Download the model files pinned in assets/assets.lock.toml
