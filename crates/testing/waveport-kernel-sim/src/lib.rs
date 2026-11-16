@@ -40,6 +40,17 @@
 //! final transcript follows speech by 200 ms, and so on. The figures are in
 //! the `world` module and are part of what scenarios rely on.
 //!
+//! A [`Setup`] also says what kind of session the story is told in. In a
+//! session of [text](Setup::text) the caller [types](Sim::types), nothing
+//! is synthesised or played, and what the agent writes is with the reader
+//! as it is written. In a session whose [words follow](Setup::words_follow)
+//! nobody transcribes while the caller speaks.
+//!
+//! Some of what a scenario can say, the kernel cannot be told yet: a
+//! [key](Sim::presses), and words that [arrive](Sim::words_arrive) after
+//! their turn. The world keeps those to itself, and the scenario fails
+//! where it expects the kernel to have acted on them.
+//!
 //! Two more modules look at the kernel from other sides:
 //!
 //! - [`invariants`] holds a monitor that checks the kernel's invariants
@@ -65,7 +76,7 @@ mod sim;
 pub mod trace;
 mod world;
 
-pub use expect::{Ending, Line, cut_off, spoke, user};
+pub use expect::{Ending, Line, cut_off, pressed, spoke, user};
 pub use explore::{Explored, Lab, explore};
 pub use failure::{Failure, Verdict};
 pub use script::{Script, say};
@@ -80,7 +91,7 @@ pub mod prelude {
 
     pub use crate::Ending::{Complete, Truncated};
     pub use crate::{
-        Call, Lab, Line, Person, Reply, Script, Setup, Sim, Timer, Turn, Verdict, cut_off, say,
-        spoke, user,
+        Call, Lab, Line, Person, Reply, Script, Setup, Sim, Timer, Turn, Verdict, cut_off, pressed,
+        say, spoke, user,
     };
 }

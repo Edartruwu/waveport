@@ -17,7 +17,7 @@ use crate::explore::Chooser;
 use crate::failure::{Failure, Verdict};
 use crate::invariants::Monitor;
 use crate::script::Script;
-use crate::setup::{Names, Setup};
+use crate::setup::{Names, Setup, Ways};
 use crate::world::{Arrival, Manner, Ms, Timer, World};
 
 /// How long an expectation waits, in virtual time, before it gives up.
@@ -102,10 +102,13 @@ pub struct Sim {
     pub(crate) closed_at: Option<Ms>,
     /// Calls the scenario said must never be cancelled.
     pub(crate) protected: Vec<Call>,
+    /// What kind of session this is.
+    ways: Ways,
 }
 
 impl Sim {
     pub(crate) fn new(setup: Setup, chooser: Rc<RefCell<Chooser>>) -> Self {
+        let ways = setup.ways();
         let built = setup.build().and_then(|(config, policies, names)| {
             let kernel = Kernel::new(config, policies).map_err(|error| error.to_string())?;
             Ok((kernel, names))
@@ -119,7 +122,7 @@ impl Sim {
             kernel,
             out: Out::new(),
             now: 0,
-            world: World::new(names),
+            world: World::new(names, ways),
             chooser,
             seen: Vec::new(),
             log: Vec::new(),
@@ -128,6 +131,7 @@ impl Sim {
             last_seq: 0,
             closed_at: None,
             protected: Vec::new(),
+            ways,
         };
         if let Some(fault) = fault {
             sim.world.blame(fault);
@@ -171,6 +175,26 @@ impl Sim {
         if let Some(started) = self.world.utter(self.now, who.0, text, manner) {
             self.deliver(&started);
         }
+    }
+
+    /// `who` types `text`. Typed text takes the floor: the agent is
+    /// stopped as at a barge-in and the text is then handed over, which is
+    /// how the runtime gives a session what somebody typed.
+    pub fn types(&mut self, who: Person, text: &str) {
+        if let Some(typed) = self.world.types(self.now, who.0, text) {
+            self.deliver(&Event::Control(ControlInput::Interrupt));
+            self.deliver(&typed);
+        }
+    }
+
+    /// `who` presses these keys of a telephone one after the other, the
+    /// first at once and each of the others 250 ms after the one before.
+    pub fn presses(&mut self, who: Person, keys: &str) {
+        self.world.presses(who.0);
+        let name = self.world.names.person(who.0).to_owned();
+        self.note(&format!(
+            "-- {name} presses {keys}, and the kernel has no event for a key"
+        ));
     }
 
     /// Lets this much time pass.
@@ -262,6 +286,57 @@ impl Sim {
     pub fn adapters_go_silent(&mut self) {
         self.world.go_silent();
         self.note("-- every adapter goes silent");
+    }
+
+    /// From now on the words of a turn arrive only when the scenario says
+    /// so, with [`words_arrive`](Self::words_arrive). It is for sessions
+    /// whose [words follow](Setup::words_follow) their turns; otherwise
+    /// they arrive by themselves once the turn is over.
+    pub fn words_wait(&mut self) {
+        self.world.hold_words();
+    }
+
+    /// The words of the oldest turn of `who` that has none become known.
+    pub fn words_arrive(&mut self, who: Person) {
+        let name = self.world.names.person(who.0).to_owned();
+        if !self.world.holds_words() {
+            self.world.blame(format!(
+                "the scenario has words of {name} arrive without having said that words wait"
+            ));
+            return;
+        }
+        match self.world.next_words(who.0) {
+            Some(words) => self.note(&format!(
+                "-- the words \"{words}\" of {name} are known, and the kernel has no event for them"
+            )),
+            None => self.world.blame(format!(
+                "the scenario has words of {name} arrive, and none are waiting"
+            )),
+        }
+    }
+
+    /// The line to the caller drops: a connection is lost, a browser is
+    /// closed, a train goes into a tunnel. Nobody hears the agent from now
+    /// on, and the session is told that its line is gone.
+    pub fn line_drops(&mut self) {
+        self.flush_playout();
+        self.world.line_drops(self.now);
+        match self.ways.detach_wait {
+            Some(wait) => self.note(&format!(
+                "-- the line drops; the session is to wait {} ms for it",
+                wait.as_millis()
+            )),
+            None => self.note("-- the line drops"),
+        }
+        self.step(&Event::Control(ControlInput::Detached));
+        self.world.schedule_tick(self.now);
+    }
+
+    /// The line to the caller is back, and the session is told.
+    pub fn line_returns(&mut self) {
+        self.world.line_returns();
+        self.note("-- the line is back");
+        self.deliver(&Event::Control(ControlInput::Attached));
     }
 
     /// The application asks the session to close.
