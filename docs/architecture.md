@@ -1,6 +1,6 @@
 # Waveport architecture and technical spec
 
-**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the session kernel (section 4) exists: it takes turns, speaks, keeps the conversation, runs tool calls, lets a second agent answer a call or take the floor, closes, and is rebuilt from its journal after a crash. Nothing around it exists yet: no media path, no adapter, no runtime. All six of its scenarios (section 14) pass, and its ten invariants (section 13) are checked on random sessions and on every path through small ones in every test run. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
+**Status (15 November 2026):** design spec. The workspace, the gates in section 2 and the test and benchmark harnesses exist. Of the product, the session kernel (section 4) exists: it takes turns, speaks, keeps the conversation, runs tool calls, lets a second agent answer a call or take the floor, closes, and is rebuilt from its journal after a crash. The audio path (`waveport-media`) exists too: Opus and G.711, the change of rate, the inbound path and the outbound path of sections 4.6 and 5, with no allocation per frame. Nothing joins the two yet: no port, no adapter, no runtime. All six of the kernel's scenarios (section 14) pass, and its ten invariants (section 13) are checked on random sessions and on every path through small ones in every test run. Every latency and memory figure is a design target to be validated by benchmark, not a measurement. The density figures in section 12 are the exception: the phase 1 spike measured them.
 
 See also the [roadmap](../ROADMAP.md) and the [ecosystem inventory](ecosystem.md).
 
@@ -172,7 +172,8 @@ No priority lanes are needed. Pipecat has them because slow work sits in line; h
 - The runtime delivers the latest report to the kernel ahead of any other event, so an interruption is decided on what had been heard by then. A final position sent after the stop would carry the tag of a response that is no longer live, and be dropped.
 - On completion or interruption the kernel commits exactly one assistant item: the planned text cut at the heard offset, flagged `truncated` when cut. A response of which nothing was heard commits nothing.
 - LLM deltas never touch the context. They pass through the kernel, which releases text to synthesis by the chunking policy and the credit rule of section 5, so committed text is a prefix of released text by construction.
-- `Playout::push(tag, chunk)` drops chunks whose tag is not current, so an adapter that keeps sending after a cancel is harmless.
+- `Playout::push(tag, now, chunk)` refuses audio whose tag is not that of the newest response there has been, so an adapter that keeps sending after a cancel is harmless. Audio for the newest response is taken before the kernel allows its playback to start as well as after, because the two can arrive in either order.
+- What playback reports never goes back: not the audio played, and not the text heard. A transport cannot acknowledge more than it was handed.
 - When a speech-to-speech provider supports truncation it receives the same cut point. When it does not, the divergence between its server-side context and the kernel's is recorded explicitly.
 
 ### 4.7 Barge-in
@@ -223,7 +224,7 @@ The principle is: **audio drops, text blocks, control coalesces.**
 
 | Link | Bound | On overflow |
 |---|---|---|
-| Transport → reorder buffer | Adaptive 0–60 ms, maximum 200 ms | Drop late packets; codec concealment for gaps up to 60 ms |
+| Transport → reorder buffer | A wait of 0–60 ms that adapts; 10 packets (200 ms) held at most | A late packet is dropped. A gap is made up by the codec for 60 ms, then filled with silence up to 1 s. A longer one breaks the stream off, and it begins anew when the next packet arrives |
 | Ingress → voice-activity batcher | About 100 ms ring | Drop the frame, hold the last state, count it |
 | Ingress → speech-to-text | 2 s ring | Drop oldest, mark the session degraded, fail over |
 | Adapter → kernel mailbox | 256 events | The sender awaits, so pressure reaches the provider socket |
@@ -234,7 +235,9 @@ The principle is: **audio drops, text blocks, control coalesces.**
 
 - High-rate signals (playback position, audio levels, interim transcripts) are latest-value slots, not queues.
 - The 3-second credit caps wasted text-to-speech spend at about 3 seconds per interruption.
-- Pacing uses absolute deadlines from one timer tick per shard; the first frame of an utterance goes out immediately.
+- The reorder buffer holds nothing back to smooth the pace, because the listeners are machines. A packet is waited for only when a later one has overtaken it. The wait starts at nothing, grows by 20 ms each time a packet arrives after it was given up, and shrinks by 20 ms after 10 s in which none did.
+- Filling a gap keeps the stream's length, so the media clock follows the sender's timestamps for as long as the stream is unbroken. It is set by the session clock again each time the stream begins anew. A sender whose clock drifts is not corrected for in phase 1.
+- Pacing uses absolute deadlines from one timer tick per shard; the first frame of an utterance goes out immediately. When the audio runs out in the middle of a response, or a tick comes more than 100 ms late, the pace starts again from that moment: what was due in between is not sent in a burst.
 - On transports that cannot clear a remote buffer, the send-ahead (20 ms by default) is already on the wire when the server stops or ducks.
 
 ## 6. One model for every session shape
@@ -457,6 +460,8 @@ All are design targets, each enforced by a benchmark gate from phase 1.
 
 **Density.** The phase 1 spike measured one active cascaded session at 1.17% of a core ([decision 0001](decisions/0001-density-spike.md)): 0.45% on the shard thread, most of it the Opus encoder, 0.14% for voice-activity inference and 0.57% for end-of-turn inference at one inference every ten seconds. That is 85 sessions per core with nothing to spare. The planning figure is 60 active voice sessions per core, which keeps a core at 75% and allows a tenth for the work the spike did not model, and about 900 per 16-core node. One shard thread holds its timing up to about 150 sessions; inference is what limits the core count. The earlier estimate of 0.7 to 1% and target of 100 per core left out end-of-turn inference and assumed batching would make inference 2 to 4 times cheaper; the measured gain is 1.9 times. The measurement has limits, listed in the decision record: one laptop core at turbo frequency, with the rest of the machine nearly idle. Not measured: local neural noise suppression, which the earlier figures put at about 1.5% of a core per session, and text-only sessions, estimated at more than 5,000 per core. For comparison, LiveKit's own guidance is 10 to 25 jobs per 4 cores.
 
+**Media path.** The work of one 20 ms frame is counted in instructions (`benches/ir/media.rs`), because a count is the same from run to run and a time is not. A packet in costs about 234,000 instructions as Opus, 49,000 as G.711 and 107,000 as plain samples at 48 kHz. A frame out costs about 565,000 as Opus, 56,000 as G.711 and 143,000 at 48 kHz. The Opus figures are libopus at 32 kbit/s and its highest complexity; the other two are the change of rate. The path itself (reordering, the window, the queue, pacing, the ledger) is under 1,500 instructions either way. A pull request that makes any of them grow by more than 2% fails. These are counts on x86-64 and not times: the times in the table are checked once the runtime exists. The buffers of a voice session are reserved when it is set up, about 490 KB on the Rust heap with the settings of section 5 (8 s to look back on, 2 s for speech recognition, 3 s of speech) besides what libopus keeps for itself. That is inside the target for an active session and above the one for an idle session, so whether an idle session reserves them later is decided with the memory gate at the end of phase 1.
+
 ## 13. Invariants
 
 These ten are stated formally and checked in simulation.
@@ -484,6 +489,7 @@ Invariants 1 to 5 close the incumbents' race classes by construction. General ro
 | Property tests | The ten invariants over arbitrary interleavings |
 | Small-scope model check | Every order in which the events of a small session can arrive: speech, transcripts and estimates, model text and tool requests, synthesis and playback, tool results, timers, an interruption, a close and the death of the process, with the same monitor checking each step. One session with all of that would be too large, so there are several, each without what another has: up to 2 participants, 3 turns, 2 tools and 2 calls. Every test run tries about 200,000 states, and the nightly run about 6 million |
 | Replay | A session is written down as the events its kernel was given, a line each. Five such traces are kept with what the kernel emitted for every line, and each test run gives a new kernel the same events and compares: a change in what the kernel does shows as the first line that differs. A path on which the model check or the simulation fails can be written down and run again in the same way. Flight-recorder traces from the runtime will use the format |
+| Random networks | A seed makes up the network between a sender and the inbound path: jitter, loss, repeats, outages, bursts, and packets that arrive together. Rules are checked on what comes out: one unbroken timeline, each packet once and in order, never more than 60 ms made up in a row, every deadline in the future, and counters that add up. 500 networks in every test run. The outbound path, the codecs and the change of rate have exact tests of their own: a tone must come through the filter at its level, and one above the band must be 55 dB down |
 | Fuzzing | `step` with structured events; every wire parser (SIP, SDP, RTP, client protocol); journal decode with snapshot round trip |
 | Concurrency checking | The few lock-free structures (rings, batcher) |
 | Port conformance kit | Each adapter's declared capabilities tested nightly against the live provider |
@@ -545,7 +551,7 @@ Versions and licences were checked against crates.io on 14 November 2026.
 | LiveKit interop | `livekit` 0.11.0 | Optional adapter only; pulls a prebuilt C++ libwebrtc |
 | SIP | `rsipstack` 0.8.5 | `rvoip` 0.4.0 is the fallback |
 | RTP, SRTP, SDP | `rtp` and `rtcp` 0.17.3, `webrtc-srtp` 0.17.3, `sdp-types` 0.3.2 | Packet types only; sessions are written in-repo |
-| Codecs and DSP | `opus` 0.4.0 (libopus), `ezk-g722` 0.1.2, `rubato` 5.1.0, `nnnoiseless` 0.5.2, `rtrb` 0.4.1, `bytes` 1.12.1 | G.711 written in-repo. DeepFilterNet is a later candidate (git dependency only) |
+| Codecs and DSP | `opus` 0.4.0 (libopus), `ezk-g722` 0.1.2, `nnnoiseless` 0.5.2, `rtrb` 0.4.1, `bytes` 1.12.1 | libopus is built from its source by `cmake` and a C compiler, and linked in. G.711 and the change of rate are written in-repo. Audio is at 8, 16, 24 or 48 kHz, so every change is by a small whole ratio, and a fixed filter with whole-number coefficients does it: the same samples on every platform, which `rubato` 5.1.0, in floating point, does not promise. Opus decodes and encodes at the rate wanted, so the main path changes no rate at all. DeepFilterNet is a later candidate (git dependency only) |
 | Local inference | `ort` 2.0.0-rc.15 (ONNX Runtime 1.31) | Chosen over `tract` 0.23.10 by the phase 1 spike ([decision 0001](decisions/0001-density-spike.md)): `tract` cannot load the standard Silero export, and on Smart Turn it is 2.6 times slower and its outputs differ. `ort` inference needs exclusive access to a session, so each compute thread owns one |
 | Bundled models | Silero VAD v6.2.3 (MIT, 2.3 MB); Smart Turn v3.2 (BSD-2, 8.7 MB) | Pinned by address and SHA-256 in `assets/assets.lock.toml` and fetched by `cargo xtask fetch-assets`; never committed. LiveKit's turn detector cannot be used: its licence restricts it to LiveKit Agents |
 | Local speech (optional) | `sherpa-onnx` 2.0.1 | Local LLMs run out of process behind the OpenAI-compatible adapter |
