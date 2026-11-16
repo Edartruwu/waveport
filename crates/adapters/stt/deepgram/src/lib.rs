@@ -9,29 +9,35 @@
 //! for, which is what a session does when it has decided that a turn is
 //! over.
 //!
-//! **This adapter was written from the provider's documentation as it
-//! stood on 15 November 2026, and has not yet been held against the
-//! provider.** The tests replay messages in the documented shapes, made
-//! up here; none of them was recorded. The tests named `live_*` are the
-//! ones that will tell, once there is a key to run them with.
+//! **This adapter was written from the provider's documentation, and
+//! was held against the provider on 16 November 2026**, with the model
+//! `nova-3`. It needed no change. What the provider said then is in
+//! `tests/fixtures`, and tests replay it. The tests named `live_*` ask
+//! the provider again.
 //!
-//! What the documentation says, and the adapter is built around:
+//! What the adapter is built around, as the documentation has it and as
+//! the provider did:
 //!
 //! - What the session asks for is in the address: the model, the
 //!   language, the rate of the audio. A request the provider will not
 //!   serve is refused as the connection is made.
 //! - Times are counted in the audio that was sent, not on any clock: a
 //!   stretch in which nothing was sent does not move them. They are
-//!   brought to the session's clock here.
+//!   brought to the session's clock here. For a word that begins 0.3 s
+//!   into the audio the provider said 0.32 s when it was told the
+//!   language, and 0.4 s to 0.48 s when it was left to tell the language
+//!   by itself.
 //! - A transcript that is not final is everything heard in a stretch so
 //!   far, and the next one replaces it. A final one closes its stretch,
 //!   and the next begins where it ended.
-//! - The provider answers a request for a final transcript in most
-//!   cases, and says that it does not promise to when it has little left
-//!   to write down. So a request is answered here: by the transcript
-//!   that reaches the end of the audio, whether or not the provider says
-//!   it is the answer, and by an empty one when none has come in a short
-//!   while.
+//! - The provider settles the words by itself when the speaker pauses,
+//!   which is before a session asks it to. Asked for a final transcript
+//!   after that, it answered with one of no words that reaches the end
+//!   of the audio. Its documentation says that it does not promise an
+//!   answer when it has little left to write down. So a request is
+//!   answered here: by the transcript that reaches the end of the audio,
+//!   whether or not the provider says it is the answer, and by an empty
+//!   one when none has come in a short while.
 //! - A connection that is sent nothing for ten seconds is closed. While
 //!   no audio is sent the adapter says every few seconds that the
 //!   connection is still wanted.

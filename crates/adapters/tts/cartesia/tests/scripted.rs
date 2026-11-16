@@ -1,15 +1,16 @@
 //! The adapter against a server on this machine that speaks as the
-//! provider's documentation says the provider does, and, when asked,
-//! against the provider.
+//! provider does, and, when asked, against the provider.
 //!
-//! Nothing here was recorded. The messages are made up in the shapes the
-//! documentation of 15 November 2026 gives, with a tone for audio. They
-//! hold the adapter to its own reading of that documentation, and to the
-//! rules of the port, which are the same ones the fakes keep. Whether
-//! the reading is right is for the tests named `live_*` to say. Those
-//! talk to the provider, are ignored unless asked for, and need
-//! `CARTESIA_API_KEY`, and a voice in `CARTESIA_VOICE` to use another
-//! than the one named here:
+//! `tests/fixtures/two_sentences.jsonl` is what the provider sent for
+//! two sentences on 16 November 2026, but for the audio itself. The
+//! other messages here are made up in the shape of those, with a tone
+//! for audio. They hold the adapter to the rules of the port, which are
+//! the same ones the fakes keep. What the provider does when it fails
+//! has not been seen, and is as its documentation has it.
+//!
+//! The tests named `live_*` talk to the provider, are ignored unless
+//! asked for, and need `CARTESIA_API_KEY`, and a voice in
+//! `CARTESIA_VOICE` to use another than the one named here:
 //!
 //! ```sh
 //! cargo test -p waveport-tts-cartesia -- --ignored live_
@@ -94,6 +95,32 @@ fn hello(context: &str) -> String {
         done(context),
     ]
     .join("\n")
+}
+
+/// What the provider sent for [`SENTENCES`] when it was recorded, as a
+/// script: every message as it came, but for its audio, which is silence
+/// of the recorded length here, and for the name of the context, which
+/// is the one this adapter gives its first.
+fn recorded() -> String {
+    let lines = include_str!("fixtures/two_sentences.jsonl").lines();
+    let said = lines
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| {
+            let mut message: serde_json::Value = serde_json::from_str(line).unwrap();
+            let fields = message.as_object_mut().unwrap();
+            if let Some(bytes) = fields.remove("data_bytes") {
+                let bytes = usize::try_from(bytes.as_u64().unwrap()).unwrap();
+                let mut data = String::new();
+                write_base64(&vec![0_i16; bytes / 2], &mut data);
+                fields.insert("data".to_owned(), serde_json::Value::String(data));
+            }
+            fields.insert("context_id".to_owned(), "test-1".into());
+            format!("< {message}")
+        });
+    core::iter::once(UNTIL_FINISHED.to_owned())
+        .chain(said)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A server whose connections follow these scripts, one after the other.
@@ -422,6 +449,38 @@ async fn a_stream_says_the_language_and_the_rate_it_was_opened_with() {
 
 // ---------------------------------------------------------------------
 // Against the provider
+#[tokio::test]
+async fn two_sentences_are_marked_in_the_audio_as_the_provider_sent_them() {
+    let server = server(&[&recorded()]).await;
+    let tts = adapter(&server);
+    let seen = tts_utterance(&tts, Rate::Hz24000, &SENTENCES)
+        .await
+        .unwrap();
+    // 157,440 bytes of audio in sixteen pieces: 3.28 s.
+    assert_eq!(seen.samples.len(), 157_440 / 2);
+    assert_eq!(seen.length, MediaDur::from_millis(3_280));
+    // A mark where each of the twelve words ends, in the text and in the
+    // audio. The provider says the words one or a few at a time, apart
+    // from the audio they are in, and counts through the speech.
+    assert_eq!(
+        seen.marks,
+        [
+            mark(2, 280),
+            mark(5, 520),
+            mark(9, 840),
+            mark(14, 1_240),
+            mark(20, 1_720),
+            mark(23, 2_120),
+            mark(29, 2_280),
+            mark(38, 2_520),
+            mark(43, 2_680),
+            mark(45, 2_760),
+            mark(49, 2_920),
+            mark(53, 3_160),
+        ]
+    );
+}
+
 // ---------------------------------------------------------------------
 
 fn live() -> CartesiaTts {
