@@ -1,0 +1,30 @@
+| Browser | Run | DTLS | SRTP profile | First check in | ClientHello in | Our first flight out | Endpoint connected | Page connected | Endpoint: channel open | Page: channel open | Page: first message of ours | Endpoint: first message of the page | CPU of the handshake µs | Costliest datagram µs | DTLS datagrams in / out until connected |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| chrome | basic-1 | DTLS1_2 | SRTP_AEAD_AES_256_GCM | -1 | -0 | 61 | 62 | 62 | - | - | - | - | 496 | 306 | 5 / 3 |
+| chrome | basic-2 | DTLS1_2 | SRTP_AEAD_AES_256_GCM | -1 | -0 | 55 | 56 | 56 | - | - | - | - | 683 | 457 | 5 / 3 |
+| chrome | basic-3 | DTLS1_2 | SRTP_AEAD_AES_256_GCM | -1 | -0 | 48 | 50 | 50 | - | - | - | - | 666 | 512 | 3 / 2 |
+| chrome | dtls13 | DTLS1_3 | SRTP_AES128_CM_HMAC_SHA1_80 | -1 | -0 | 48 | 50 | 49 | - | - | - | - | 1415 | 1113 | 3 / 2 |
+| chrome | dtls-auto | DTLS1_3 | SRTP_AES128_CM_HMAC_SHA1_80 | -3 | -2 | 47 | 48 | 48 | - | - | - | - | 1069 | 502 | 3 / 2 |
+| chrome | dc-inband | DTLS1_2 | SRTP_AEAD_AES_256_GCM | -2 | -1 | 54 | 56 | 57 | 62 | 62 | 62 | 62 | 1540 | 1184 | 5 / 3 |
+| chrome | dc-negotiated | DTLS1_2 | SRTP_AEAD_AES_256_GCM | -1 | 0 | 56 | 57 | 58 | 60 | 61 | 61 | 61 | 994 | 536 | 5 / 3 |
+| chrome | tcp-only-candidate | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 114 | 114 | 175 | 176 | 176 | - | - | - | - | 404 | 247 | 5 / 3 |
+| chrome | tcp-udp-ignored | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 249 | 250 | 312 | 313 | 313 | - | - | - | - | 408 | 249 | 5 / 3 |
+| chrome | rtt100-dc-inband | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 49 | 151 | 169 | 271 | 321 | 580 | 530 | 630 | 580 | 874 | 564 | 3 / 2 |
+| chrome | rtt100-dc-negotiated | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 49 | 152 | 169 | 271 | 322 | 476 | 527 | 527 | 577 | 866 | 508 | 3 / 2 |
+| chrome | rtt100-dtls13-dc-negotiated | DTLS1_3 | SRTP_AES128_CM_HMAC_SHA1_80 | 46 | 149 | 172 | 275 | 226 | 379 | 430 | 431 | 482 | 919 | 416 | 3 / 2 |
+| chrome | rtt100-dtls-auto-dc-negotiated | DTLS1_3 | SRTP_AES128_CM_HMAC_SHA1_80 | 49 | 150 | 162 | 263 | 212 | 365 | 416 | 416 | 466 | 716 | 391 | 3 / 2 |
+| chrome | rtt100-tcp | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 164 | 265 | 287 | 390 | 440 | 594 | 644 | 644 | 695 | 712 | 530 | 3 / 2 |
+| firefox | basic-1 | DTLS1_2 | SRTP_AEAD_AES_256_GCM | -0 | 21 | 21 | 23 | 32 | - | - | - | - | 729 | 508 | 2 / 2 |
+| firefox | basic-2 | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 1 | 22 | 22 | 24 | 29 | - | - | - | - | 785 | 555 | 2 / 2 |
+| firefox | basic-3 | DTLS1_2 | SRTP_AEAD_AES_256_GCM | -0 | 21 | 21 | 22 | 27 | - | - | - | - | 356 | 215 | 2 / 2 |
+| firefox | dtls13 | DTLS1_3 | SRTP_AEAD_AES_128_GCM | 1 | 22 | 22 | 23 | 27 | - | - | - | - | 495 | 260 | 2 / 2 |
+| firefox | dtls-auto | DTLS1_3 | SRTP_AEAD_AES_128_GCM | 1 | 21 | 22 | 23 | 27 | - | - | - | - | 539 | 316 | 2 / 2 |
+| firefox | dc-inband | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 1 | 22 | 22 | 23 | 28 | 30 | 29 | 29 | 30 | 485 | 292 | 2 / 2 |
+| firefox | dc-negotiated | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 0 | 21 | 21 | 23 | 29 | 30 | 30 | 30 | 30 | 464 | 309 | 2 / 2 |
+| firefox | tcp-only-candidate | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 28 | 100 | 100 | 105 | 120 | - | - | - | - | 399 | 251 | 2 / 2 |
+| firefox | tcp-udp-ignored | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 37 | 70 | 70 | 76 | 86 | - | - | - | - | 464 | 292 | 2 / 2 |
+| firefox | rtt100-dc-inband | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 51 | 273 | 273 | 376 | 431 | 684 | 734 | 734 | 785 | 825 | 529 | 3 / 3 |
+| firefox | rtt100-dc-negotiated | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 51 | 273 | 273 | 375 | 433 | 585 | 635 | 635 | 687 | 834 | 572 | 3 / 3 |
+| firefox | rtt100-dtls13-dc-negotiated | DTLS1_3 | SRTP_AEAD_AES_128_GCM | 51 | 273 | 274 | 376 | 330 | 482 | 531 | 531 | 583 | 811 | 382 | 3 / 3 |
+| firefox | rtt100-dtls-auto-dc-negotiated | DTLS1_3 | SRTP_AEAD_AES_128_GCM | 50 | 272 | 272 | 374 | 331 | 482 | 532 | 533 | 583 | 877 | 400 | 3 / 3 |
+| firefox | rtt100-tcp | DTLS1_2 | SRTP_AEAD_AES_256_GCM | 53 | 489 | 489 | 594 | 650 | 803 | 852 | 852 | 904 | 584 | 335 | 3 / 3 |

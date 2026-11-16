@@ -1,0 +1,9 @@
+warning[unmatched-skip]: skipped crate 'getrandom = =0.2' was not encountered
+   ┌─ spikes/webrtc/../../deny.toml:48:16
+   │
+48 │     { crate = "getrandom@0.2", reason = "ring 0.17 has not moved to a newer getrandom" },
+   │                ━━━━━━━━━━━━━             ──────────────────────────────────────────── reason
+   │                │                          
+   │                unmatched skip configuration
+
+advisories ok, bans ok, licenses ok, sources ok

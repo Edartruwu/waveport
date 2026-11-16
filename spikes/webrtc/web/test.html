@@ -1,0 +1,207 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>webrtc spike: one call</title>
+<pre id="log"></pre>
+<audio id="out" autoplay></audio>
+<script>
+// One call, driven by the query. What the page saw goes to /report, where the
+// endpoint adds its own side. Query keys the page reads itself:
+//   exp        name of the report (the browser's name is put in front)
+//   dur        seconds to run
+//   src        tones | speech: what the page sends (made with Web Audio, no microphone)
+//   munge_nack 1: add `a=rtcp-fb:<opus> nack` to the offer
+//   dc         none | inband | negotiated (with dcid=<n>, which the endpoint reads too)
+//   dtmf       digits to send with RTCDTMFSender after 2 s
+//   server_dtmf digits the endpoint sends after 3 s
+//   stop_at    ms after connecting at which the endpoint stops sending (and starts 1.5 s later)
+//   restart_at ms after connecting at which the page restarts ICE
+//   whip       1: signal with POST /whip (application/sdp, 201, Location)
+// Everything else is passed on to POST /offer.
+const q = new URLSearchParams(location.search);
+const log = (...a) => { document.getElementById('log').textContent += a.join(' ') + '\n'; };
+const wall = () => performance.timeOrigin + performance.now();
+const browser = navigator.userAgent.includes('Firefox') ? 'firefox' : (navigator.userAgent.includes('Chrome') ? 'chrome' : 'other');
+const report = { exp: q.get('exp') || 'basic', browser, ua: navigator.userAgent, query: location.search, marks: {}, states: [], ssrc: [], stats: [], heard: [], dc: [], notes: [] };
+const mark = (k) => { report.marks[k] = wall(); };
+
+async function uplink(ctx, seconds) {
+  const dest = ctx.createMediaStreamDestination();
+  if (q.get('src') === 'speech') {
+    const bytes = await (await fetch('/speech.wav')).arrayBuffer();
+    const buf = await ctx.decodeAudioData(bytes);
+    const node = ctx.createBufferSource();
+    node.buffer = buf; node.loop = true; node.connect(dest); node.start();
+  } else {
+    const g = ctx.createGain(); g.gain.value = 0.25; g.connect(dest);
+    const lo = ctx.createOscillator(), hi = ctx.createOscillator();
+    lo.connect(g); hi.connect(g);
+    const t0 = ctx.currentTime + 0.05;
+    for (let n = 0; n < seconds * 10 + 50; n++) {
+      lo.frequency.setValueAtTime(800 + 200 * (n % 16), t0 + n * 0.1);
+      hi.frequency.setValueAtTime(4400 + 200 * (Math.floor(n / 16) % 16), t0 + n * 0.1);
+    }
+    lo.start(); hi.start();
+  }
+  return dest.stream;
+}
+
+function munge(sdp) {
+  if (q.get('munge_nack') !== '1') return sdp;
+  const m = sdp.match(/a=rtpmap:(\d+) opus\/48000/);
+  if (!m) return sdp;
+  return sdp.replace(new RegExp(`(a=rtpmap:${m[1]} opus/48000[^\\r\\n]*\\r\\n)`), `$1a=rtcp-fb:${m[1]} nack\r\n`);
+}
+
+function pick(s, keys) { const o = {}; for (const k of keys) if (s[k] !== undefined) o[k] = s[k]; return o; }
+
+async function main() {
+  const dur = Number(q.get('dur') || 8);
+  const ctx = new AudioContext({ sampleRate: 48000 });
+  await ctx.resume();
+  report.ctx = { state: ctx.state, sampleRate: ctx.sampleRate, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency };
+  await ctx.audioWorklet.addModule('detector.js');
+  const stream = await uplink(ctx, dur);
+
+  const pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
+  window.pc = pc;
+  for (const ev of ['iceconnectionstatechange', 'connectionstatechange', 'signalingstatechange', 'icegatheringstatechange']) {
+    pc.addEventListener(ev, () => {
+      report.states.push([wall(), ev, pc.iceConnectionState, pc.connectionState, pc.signalingState]);
+      if (pc.connectionState === 'connected' && !report.marks.connected) mark('connected');
+    });
+  }
+  const sender = pc.addTrack(stream.getAudioTracks()[0], stream);
+
+  let channel = null;
+  const mode = q.get('dc') || 'none';
+  if (mode === 'negotiated') channel = pc.createDataChannel('events', { negotiated: true, id: Number(q.get('dcid') || 4) });
+  if (mode === 'inband') channel = pc.createDataChannel('events');
+  if (channel) {
+    channel.onopen = () => { mark('dc_open'); channel.send(JSON.stringify({ type: 'ping', t: wall() })); };
+    channel.onmessage = (e) => {
+      if (!report.marks.dc_first_message) mark('dc_first_message');
+      const m = JSON.parse(e.data);
+      if (m.type === 'echo' && !report.marks.dc_echo) mark('dc_echo');
+      if (report.dc.length < 20) report.dc.push([wall(), m]);
+    };
+  }
+
+  let receiver = null;
+  pc.ontrack = (e) => {
+    mark('track');
+    receiver = e.receiver;
+    const remote = new MediaStream([e.track]);
+    const el = document.getElementById('out');
+    el.srcObject = remote;
+    el.play().catch((err) => report.notes.push('play: ' + err));
+    const node = new AudioWorkletNode(ctx, 'detector');
+    ctx.createMediaStreamSource(remote).connect(node);
+    const quiet = ctx.createGain(); quiet.gain.value = 0; node.connect(quiet); quiet.connect(ctx.destination);
+    node.port.onmessage = (m) => {
+      // The worklet stamps blocks with the frame of the context's clock; this
+      // turns a frame into wall time with the context's own pair of the two.
+      const ts = ctx.getOutputTimestamp ? ctx.getOutputTimestamp() : null;
+      const now = wall();
+      for (const [frame, a, b] of m.data) {
+        let at = now;
+        if (ts && ts.contextTime > 0) at = performance.timeOrigin + ts.performanceTime + (frame / ctx.sampleRate - ts.contextTime) * 1000;
+        report.heard.push([Math.round(at * 10) / 10, a, typeof b === 'number' ? Number(b.toExponential(2)) : b, Math.round(now * 10) / 10]);
+      }
+    };
+  };
+
+  mark('start');
+  const offer = await pc.createOffer();
+  offer.sdp = munge(offer.sdp);
+  await pc.setLocalDescription(offer);
+  mark('offer_set');
+  report.offer = offer.sdp;
+  const pass = new URLSearchParams(location.search);
+  pass.set('label', `${browser}-${report.exp}`);
+  let id, answerSdp;
+  if (q.get('whip') === '1') {
+    const r = await fetch('/whip?' + pass, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: offer.sdp });
+    report.whip = { status: r.status, location: r.headers.get('Location'), etag: r.headers.get('ETag'), type: r.headers.get('Content-Type') };
+    answerSdp = await r.text();
+    id = Number((r.headers.get('Location') || '').split('/').pop());
+  } else {
+    const r = await fetch('/offer?' + pass, { method: 'POST', body: offer.sdp });
+    if (!r.ok) throw new Error('offer refused: ' + await r.text());
+    ({ id, sdp: answerSdp } = await r.json());
+  }
+  mark('answer');
+  report.answer = answerSdp;
+  report.id = id;
+  await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+  mark('answer_set');
+
+  const control = (cmd, extra = '') => fetch(`/control?id=${id}&cmd=${cmd}${extra}`, { method: 'POST' }).then(r => r.json()).then(j => { report.notes.push(JSON.stringify(j)); return j; });
+
+  // What the receiver says it played, every 10 ms, and the statistics every 100 ms.
+  const sample = setInterval(() => {
+    if (!receiver) return;
+    const s = receiver.getSynchronizationSources ? receiver.getSynchronizationSources()[0] : null;
+    if (s) report.ssrc.push([Math.round(wall() * 10) / 10, s.rtpTimestamp, Math.round((performance.timeOrigin + s.timestamp) * 10) / 10, s.audioLevel === undefined ? null : Number(s.audioLevel.toFixed(4))]);
+    else if (report.ssrc.length < 5 || report.ssrc[report.ssrc.length - 1][1] !== null) report.ssrc.push([Math.round(wall() * 10) / 10, null]);
+  }, 10);
+  const stats = setInterval(async () => {
+    const at = wall();
+    const entry = { at };
+    (await pc.getStats()).forEach((s) => {
+      if (s.type === 'inbound-rtp' && s.kind === 'audio') entry.inbound = pick(s, ['packetsReceived', 'packetsLost', 'packetsDiscarded', 'jitter', 'jitterBufferDelay', 'jitterBufferEmittedCount', 'jitterBufferTargetDelay', 'jitterBufferMinimumDelay', 'totalSamplesReceived', 'concealedSamples', 'silentConcealedSamples', 'concealmentEvents', 'insertedSamplesForDeceleration', 'removedSamplesForAcceleration', 'totalSamplesDuration', 'totalAudioEnergy', 'audioLevel', 'fecPacketsReceived', 'fecPacketsDiscarded', 'nackCount', 'bytesReceived', 'headerBytesReceived', 'lastPacketReceivedTimestamp', 'estimatedPlayoutTimestamp', 'totalProcessingDelay', 'delayedPacketOutageSamples', 'relativePacketArrivalDelay', 'retransmittedPacketsReceived', 'playoutId', 'timestamp']);
+      if (s.type === 'outbound-rtp' && s.kind === 'audio') entry.outbound = pick(s, ['packetsSent', 'bytesSent', 'headerBytesSent', 'nackCount', 'retransmittedPacketsSent', 'retransmittedBytesSent', 'targetBitrate', 'totalPacketSendDelay']);
+      if (s.type === 'remote-inbound-rtp' && s.kind === 'audio') entry.remoteInbound = pick(s, ['packetsLost', 'fractionLost', 'roundTripTime', 'jitter']);
+      if (s.type === 'media-playout') entry.playout = pick(s, ['synthesizedSamplesDuration', 'synthesizedSamplesEvents', 'totalSamplesDuration', 'totalPlayoutDelay', 'totalSamplesCount']);
+      if (s.type === 'candidate-pair' && (s.nominated || s.selected)) { entry.pair = pick(s, ['state', 'currentRoundTripTime', 'bytesSent', 'bytesReceived', 'localCandidateId', 'remoteCandidateId']); entry.pairIds = [s.localCandidateId, s.remoteCandidateId]; }
+      if (s.type === 'transport') entry.transport = pick(s, ['dtlsState', 'tlsVersion', 'dtlsCipher', 'srtpCipher', 'selectedCandidatePairId', 'dtlsRole', 'iceRole', 'iceState']);
+      if (s.type === 'local-candidate' || s.type === 'remote-candidate') { entry.cands = entry.cands || {}; entry.cands[s.id] = pick(s, ['candidateType', 'protocol', 'address', 'port', 'tcpType', 'relayProtocol']); }
+      if (s.type === 'codec' && /audio/.test(s.mimeType || '')) { entry.codecs = entry.codecs || []; entry.codecs.push(pick(s, ['payloadType', 'mimeType', 'sdpFmtpLine', 'codecType'])); }
+    });
+    report.stats.push(entry);
+  }, 100);
+
+  const until = (pred, ms) => new Promise((res) => { const t0 = Date.now(); const i = setInterval(() => { if (pred() || Date.now() - t0 > ms) { clearInterval(i); res(pred()); } }, 20); });
+  await until(() => report.marks.connected, 8000);
+  if (!report.marks.connected) report.notes.push('never connected');
+  const connected = report.marks.connected || wall();
+  const after = (ms, f) => setTimeout(f, Math.max(0, connected + ms - wall()));
+
+  if (q.get('dtmf')) after(2000, () => {
+    const d = sender.dtmf;
+    report.notes.push('dtmf sender: ' + (d ? 'canInsertDTMF=' + d.canInsertDTMF : 'none'));
+    if (d) { d.ontonechange = (e) => report.notes.push(`tonechange ${JSON.stringify(e.tone)} at ${wall()}`); try { d.insertDTMF(q.get('dtmf'), 160, 80); } catch (err) { report.notes.push('insertDTMF: ' + err); } }
+  });
+  if (q.get('server_dtmf')) after(3000, () => control('dtmf', '&digits=' + encodeURIComponent(q.get('server_dtmf')) + (q.get('ts48') ? '&ts48=1' : '')));
+  if (q.get('stop_at')) {
+    const at = Number(q.get('stop_at'));
+    after(at, async () => { mark('stop_asked'); await control('stop'); mark('stop_done'); });
+    after(at + 1500, async () => { await control('start'); mark('start_done'); });
+  }
+  if (q.get('loss_at')) after(Number(q.get('loss_at')), () => control('loss', `&in=${q.get('later_loss_in') || 0}&out=${q.get('later_loss_out') || 0}&fec=${q.get('later_fec') || 0}`));
+  if (q.get('restart_at')) after(Number(q.get('restart_at')), async () => {
+    mark('restart_start');
+    const o = await pc.createOffer({ iceRestart: true });
+    await pc.setLocalDescription(o);
+    const r = await fetch(`/offer?id=${id}&label=${browser}-${report.exp}-restart`, { method: 'POST', body: o.sdp });
+    if (!r.ok) { report.notes.push('restart refused: ' + await r.text()); return; }
+    const j = await r.json();
+    report.restart = { offer: o.sdp, answer: j.sdp };
+    await pc.setRemoteDescription({ type: 'answer', sdp: j.sdp });
+    mark('restart_answer_set');
+  });
+
+  await new Promise((r) => setTimeout(r, dur * 1000));
+  clearInterval(sample); clearInterval(stats);
+  mark('end');
+  const name = `${browser}-${report.exp}`;
+  await fetch(`/report?name=${encodeURIComponent(name)}&id=${id}`, { method: 'POST', body: JSON.stringify(report) });
+  log('done', name);
+  document.title = 'done';
+}
+main().catch(async (e) => {
+  log('failed', e);
+  report.error = String(e && e.stack || e);
+  await fetch(`/report?name=${encodeURIComponent(browser + '-' + report.exp + '-FAILED')}`, { method: 'POST', body: JSON.stringify(report) });
+  document.title = 'failed';
+});
+</script>

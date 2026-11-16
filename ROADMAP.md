@@ -125,20 +125,30 @@ Gaps closed: ordering races and shutdown hangs; no backpressure; one process per
 
 Build:
 
-- WebRTC direct endpoint on `str0m` with HTTP signalling and an adaptive jitter buffer.
+- WebRTC direct endpoint on `str0m` with HTTP signalling and an adaptive jitter buffer ([decision 0005](docs/decisions/0005-webrtc-endpoint.md): `str0m` with a crypto provider of our own, so that no C enters the tree; redundant audio where a browser offers it and Opus's own in both directions; ICE over TCP for networks that block UDP; and the jitter buffer is the reorder buffer of phase 1, given the redundancy).
 - Carrier media-stream transports: Twilio, Telnyx, Plivo, Vonage, Exotel, jambonz.
-- Client protocol v1 with an RTVI-compatible gateway, a JavaScript SDK and a playground.
+- Client protocol v1 with an RTVI-compatible gateway, a JavaScript SDK and a playground ([decision 0006](docs/decisions/0006-rtvi-gateway.md): an application on Pipecat's JavaScript client connects by changing an address, and is held to that by the stock client in every test run).
 - Text-only sessions over HTTP with server-sent events and over WebSocket (done: the session itself, which has a language model and its tools and nothing that hears or speaks, on the same kernel with nothing changed in it, and `waveport chat`, which is one at a terminal. Not yet: over HTTP and over WebSocket, which come with the daemon).
-- Two speech-to-speech adapters with opposite capability profiles (OpenAI Realtime and Gemini Live) and the realtime driver.
+- Two speech-to-speech adapters with opposite capability profiles (OpenAI Realtime and Gemini Live) and the realtime driver ([decision 0007](docs/decisions/0007-speech-to-speech-port.md): a port of intents, measured against OpenAI and read against Gemini, for which there was no key. With it comes the part of phase 4's re-session that a call needs to outlive a provider's connection: Gemini ends one after about ten minutes).
 - The first tier of provider adapters (listed in the ecosystem document).
 - `waveportd`, the server daemon, with HTTP and gRPC APIs, and with the number of shards and the processors their threads are pinned to as settings ([decision 0003](docs/decisions/0003-shard-pinning.md)).
 - DTMF, provider failover, and a nightly conformance kit that tests each adapter's declared capabilities against the live API.
+
+Added on 16 November 2026, when the plan for the phase was held against what the leading frameworks ship. Each can be struck without the others:
+
+- Text sessions in the two protocols chat front ends speak: OpenAI's chat completions as a stream, and AG-UI 1.0.
+- Speech recognisers that report turns (Deepgram Flux, and AssemblyAI's model for agents), with a provider's word on a turn taken as an estimate by the kernel's own decision.
+- Replies begun before the turn is certain, and held until it is ([decision 0004](docs/decisions/0004-session-shapes.md)). Off unless an agent asks for it, and not on a speech-to-speech model, whose responses cannot be held.
+
+What the kernel learns in this phase, and how sessions of other shapes are run, is in [decision 0004](docs/decisions/0004-session-shapes.md).
 
 Exit criteria:
 
 - One agent definition answers a browser call, a phone call through a carrier and a text-only chat.
 - The conformance kit runs nightly against every shipped provider.
 - Spoken-prefix accuracy is measured against client-side recordings on WebRTC and on one carrier.
+
+Where the criteria stand on 16 November 2026: none is shown yet. Three things they need are not in the repository's hands. Two criteria ask for a call through a real carrier, and there is no account with one: the carrier transports are written from the carriers' documentation and held against simulators, and say so. The nightly kit asks for keys for Anthropic and for Gemini among the repository's secrets, and the half of decision 0007 that is about Gemini waits for the same key.
 
 Gaps closed: no non-WebRTC media transport; room-less text agents; self-hosted carrier connector.
 
@@ -176,7 +186,7 @@ Build:
 - Structured output; context summarisation with pinned and excluded messages.
 - Knowledge retrieval and long-term memory.
 - Text-to-speech cache; declarative agent files.
-- Seamless re-session for speech-to-speech providers with a session time limit.
+- Seamless re-session for speech-to-speech providers with a session time limit (the part a call needs to outlive a provider's connection is in phase 2, with the realtime driver; what is left here is a change of provider or of settings in the middle of a call).
 
 Exit criteria:
 

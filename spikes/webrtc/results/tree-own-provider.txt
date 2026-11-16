@@ -1,0 +1,30 @@
+# spike-provider: str0m 0.25.0 (default-features = false) + own provider (dimpl "rust-crypto", no "rcgen")
+
+$ cargo tree -p spike-provider -i aws-lc-sys
+error: package ID specification `aws-lc-sys` did not match any packages
+
+$ cargo tree -p spike-provider -i aws-lc-rs
+error: package ID specification `aws-lc-rs` did not match any packages
+
+$ cargo tree -p spike-provider -i openssl-sys
+error: package ID specification `openssl-sys` did not match any packages
+
+$ cargo tree -p spike-provider -i ring
+error: package ID specification `ring` did not match any packages
+
+help: a package with a similar name exists: `rand`
+
+$ cargo tree -p spike-provider -i rcgen
+error: package ID specification `rcgen` did not match any packages
+
+$ cargo tree -p spike-provider -i cc
+error: package ID specification `cc` did not match any packages
+
+help: a package with a similar name exists: `ccm`
+
+$ cargo tree -p spike-provider -i cmake
+error: package ID specification `cmake` did not match any packages
+
+help: a package with a similar name exists: `cmov`
+
+packages in lockfile: 118

@@ -1,0 +1,5 @@
+# `cargo deny check` in the scratch copy of the product workspace, with its own deny.toml unchanged,
+# after adding crates/adapters/transport/webrtc (str0m 0.25.0 + own provider). 16 November 2026.
+# Also run there: cargo xtask arch-check, tier-check, lint-sync: each "ok (27 workspace packages)".
+
+advisories ok, bans ok, licenses ok, sources ok
