@@ -47,6 +47,8 @@ use waveport_ports::stt::{SttFinalize, SttTiming};
 use waveport_ports::tool::{ToolExecutor, ToolReply, ToolRequest};
 use waveport_ports::transport::{AudioCaps, KeysOut, RemoteBuffer, Transport, TransportCaps};
 use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
+use waveport_protocol::client::v1 as shown;
+use waveport_protocol::journal as wire;
 use waveport_runtime::codec;
 use waveport_runtime::compute::Compute;
 use waveport_runtime::session::{
@@ -375,6 +377,9 @@ pub(crate) struct Tally {
     pub states: u64,
     /// Lives that began from a stored state.
     pub from_state: u64,
+    /// Stored states that were held against what a client is shown of
+    /// the facts before them.
+    pub shown: u64,
 }
 
 impl Tally {
@@ -412,6 +417,7 @@ impl Tally {
             (&mut self.frames, other.frames),
             (&mut self.states, other.states),
             (&mut self.from_state, other.from_state),
+            (&mut self.shown, other.shown),
         ];
         for (sum, more) in pairs {
             *sum += more;
@@ -664,6 +670,60 @@ async fn drive(
     tokio::time::timeout_at(until, running)
         .await
         .unwrap_or(Drove::Time)
+}
+
+/// What a client is shown of a journal adds up: every state the session
+/// stored, as a client is shown it, is what the facts before it come to
+/// as a client is shown them. So a client that comes back to a state
+/// and the facts after it holds what one holds that was sent every
+/// fact. Returns how many states were held against their facts.
+fn shown_adds_up(plan: &Plan, journal: &MemoryJournal) -> Result<u64, Broken> {
+    // What a client is shown depends on what it asked for and on what
+    // the server lets out, so the sessions differ in both.
+    let show = shown::Show {
+        tools: !plan.seed.is_multiple_of(3),
+        tool_text: plan.seed.is_multiple_of(2),
+    };
+    let names: Vec<String> = plan
+        .spec
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    let mut sent = Vec::new();
+    for bytes in journal.records(SESSION) {
+        let record: wire::Record<'_> = serde_json::from_slice(&bytes)
+            .map_err(|error| Broken(format!("a record is not one: {error}")))?;
+        if let Some(fact) = shown::Fact::shown(&record.fact, &names, show) {
+            sent.push(shown::FromServer::Fact {
+                seq: record.seq,
+                fact,
+            });
+        }
+    }
+    let states = journal.snapshots(SESSION);
+    for snapshot in &states {
+        let stored: wire::State<'_> = serde_json::from_slice(&snapshot.state)
+            .map_err(|error| Broken(format!("a stored state is not one: {error}")))?;
+        let told = shown::State::shown(&stored, &names, show);
+        let mut held = shown::View::new();
+        for message in &sent {
+            if matches!(message, shown::FromServer::Fact { seq, .. } if *seq <= stored.upto) {
+                let _ = held.apply(message);
+            }
+        }
+        // The last fact before the state may be one no client is shown.
+        let mut added_up = held.state().clone();
+        added_up.upto = stored.upto;
+        if added_up != told {
+            return broken(format!(
+                "the state as of fact #{} is shown to a client as\n{told:?}\nand the facts up \
+                 to it, as a client is shown them, add up to\n{added_up:?}",
+                stored.upto
+            ));
+        }
+    }
+    Ok(states.len() as u64)
 }
 
 /// The facts of a journal, and their text.
@@ -1004,6 +1064,8 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
     // the session: one rebuilt from it holds what this one holds.
     journal.go_on();
     let (facts, text) = decoded(&journal.records(SESSION))?;
+    tally.shown = shown_adds_up(plan, &journal)
+        .map_err(|Broken(what)| Broken(format!("{what}\n{}", tail(&log))))?;
     let whole = !died && !matches!(ended, Some(Ended::Lost(_)));
     if whole {
         let held = session.snapshot();

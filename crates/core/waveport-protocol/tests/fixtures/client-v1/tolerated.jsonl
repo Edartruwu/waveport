@@ -1,0 +1,19 @@
+{"from":"server","given":{"type":"metrics","cpu":0.5,"nested":{"deep":[1,2,3]}},"is":{"type":"unknown"}}
+{"from":"server","given":{"type":"fact","seq":9,"kind":"turn_transcribed","turn":2,"text":"later"},"is":{"type":"fact","seq":9,"kind":"unknown"}}
+{"from":"server","given":{"type":"told","kind":"audio_level","who":1,"level":0.25},"is":{"type":"told","kind":"unknown"}}
+{"from":"server","given":{"type":"state","upto":3,"lifecycle":"parked","closed_for":"moved","agent":0,"participants":[],"items":[{"kind":"image","url":"x"}]},"is":{"type":"state","upto":3,"lifecycle":"unknown","closed_for":"unknown","agent":0,"participants":[],"items":[{"kind":"unknown"}]}}
+{"from":"server","given":{"type":"bye","reason":"maintenance"},"is":{"type":"bye","reason":"unknown"}}
+{"from":"server","given":{"type":"error","code":"quota","message":"no more today"},"is":{"type":"error","code":"unknown","message":"no more today"}}
+{"from":"server","given":{"type":"fact","seq":4,"kind":"cut_off","cause":"moderation"},"is":{"type":"fact","seq":4,"kind":"cut_off","cause":"unknown"}}
+{"from":"server","given":{"type":"fact","seq":5,"kind":"turn_dismissed","turn":1,"who":1,"reason":"muted"},"is":{"type":"fact","seq":5,"kind":"turn_dismissed","turn":1,"who":1,"reason":"unknown"}}
+{"from":"server","given":{"type":"fact","seq":6,"kind":"tool_finished","call":1,"outcome":"deferred"},"is":{"type":"fact","seq":6,"kind":"tool_finished","call":1,"outcome":"unknown"}}
+{"from":"server","given":{"type":"told","kind":"agent","agent":0,"activity":"searching"},"is":{"type":"told","kind":"agent","agent":0,"activity":"unknown"}}
+{"from":"server","given":{"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"hola","addressed":true,"language":"es"},"is":{"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"hola","addressed":true}}
+{"from":"server","given":{"grace_ms":30000,"next_seq":1,"resumed":false,"life":1,"session":"0000000000000000000000000000002a","v":1,"region":"eu","type":"welcome"},"is":{"type":"welcome","v":1,"session":"0000000000000000000000000000002a","life":1,"resumed":false,"next_seq":1,"grace_ms":30000}}
+{"from":"server","given":{"kind":"said","text":"Yes.","generation":2,"type":"told","voice":"a"},"is":{"type":"told","kind":"said","generation":2,"text":"Yes."}}
+{"from":"client","given":{"type":"send_file","name":"a.pdf"},"is":{"type":"unknown"}}
+{"from":"client","given":{"samples":10,"run":1,"type":"played","at":12},"is":{"type":"played","run":1,"samples":10}}
+{"from":"client","given":{"type":"hello","v":1,"features":["said","video"],"locale":"es-PE"},"is":{"type":"hello","v":1,"features":["said","video"]}}
+{"from":"client","given":{"type":"hello","v":1,"audio":{"rate":16000,"codec":"pcm16","channels":1}},"is":{"type":"hello","v":1,"audio":{"codec":"pcm16","rate":16000}}}
+{"from":"client","given":{"type":"played_rtp","ts":960},"is":{"type":"played_rtp","ts":960,"delay_ms":0}}
+{"from":"server","given":{"type":"mark","run":1,"generation":1,"end":false},"is":{"type":"mark","run":1,"generation":1}}

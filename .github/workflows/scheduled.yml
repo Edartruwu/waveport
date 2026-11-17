@@ -88,6 +88,27 @@ jobs:
           echo "seeds ${WAVEPORT_SIM_SEEDS}"
           cargo test --release --locked -p waveport-store-journal --test power
 
+  # The parsers of the wire formats against text made up from a seed, and
+  # a client that comes back against one that was there all along: a
+  # million of each, other ones every night. No text may make a parser
+  # panic, and what a client holds after a state and the facts that follow
+  # it has to be what all the facts add up to. A failure prints its seed,
+  # and `WAVEPORT_SIM_SEED=<seed>` runs that one alone.
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: cargo test --release -p waveport-protocol --test garbage --test client_v1
+        run: |
+          first=$(( GITHUB_RUN_NUMBER * 1000000 ))
+          export WAVEPORT_SIM_SEEDS="${first}..$(( first + 1000000 ))"
+          echo "seeds ${WAVEPORT_SIM_SEEDS}"
+          cargo test --release --locked -p waveport-protocol --test garbage --test client_v1
+
   # Every path through sessions small enough to try them all, the larger
   # ones included: millions of states, each step checked.
   model-check:

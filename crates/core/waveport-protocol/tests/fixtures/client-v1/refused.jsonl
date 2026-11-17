@@ -1,0 +1,13 @@
+{"given":{"type":"hello","v":2},"why":"version","code":"version"}
+{"given":{"type":"hello","v":0},"why":"version","code":"version"}
+{"given":{"type":"hello","v":1,"audio":{"codec":"pcm16","rate":44100}},"why":"rate","code":"unsupported"}
+{"given":{"type":"hello","v":1,"token":"not-a-token"},"why":"token","code":"token"}
+{"given":{"type":"hello","v":1,"token":"wpc1_"},"why":"token","code":"token"}
+{"given":{"type":"hello","v":1,"resume":{"token":"wpc1_madeup","life":1,"seen":3}},"why":"token","code":"token"}
+{"given":{"type":"text","text":""},"why":"text","code":"malformed"}
+{"given":{"type":"text","text":" \n\t"},"why":"text","code":"malformed"}
+{"given":{"type":"dtmf","keys":""},"why":"keys","code":"malformed"}
+{"given":{"type":"dtmf","keys":"12E"},"why":"keys","code":"malformed"}
+{"given":{"type":"dtmf","keys":"12 3"},"why":"keys","code":"malformed"}
+{"given":{"type":"dtmf","keys":"111111111111111111111111111111111"},"why":"keys","code":"malformed"}
+{"given":{"type":"send_file","name":"a.pdf"},"why":"unknown","code":"unknown_message"}

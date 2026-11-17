@@ -1,0 +1,38 @@
+{"type":"welcome","v":1,"session":"0000000000000000000000000000002a","life":1,"resumed":false,"resume_token":"wpr1_madeup","audio":{"codec":"pcm16","rate":24000},"features":["said","hearing"],"next_seq":1,"grace_ms":30000}
+{"type":"welcome","v":1,"session":"0000000000000000000000000000002a","life":3,"resumed":true,"next_seq":42,"grace_ms":30000}
+{"type":"mark","run":3,"generation":5}
+{"type":"mark","run":3,"generation":5,"end":true}
+{"type":"clear","run":3}
+{"type":"fact","seq":1,"kind":"participant_joined","who":1}
+{"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true}
+{"type":"fact","seq":3,"kind":"turn_committed","turn":2,"who":2,"text":"She said \"wait\" — then:\n\t¿qué hora es? 🙂 \\","addressed":false}
+{"type":"fact","seq":4,"kind":"utterance_progress","generation":1,"agent":0,"heard":"We close at "}
+{"type":"fact","seq":5,"kind":"cut_off","cause":"barge_in"}
+{"type":"fact","seq":6,"kind":"utterance_committed","generation":1,"agent":0,"text":"We close at ","truncated":true}
+{"type":"fact","seq":7,"kind":"keys_committed","turn":3,"who":1,"keys":"4071"}
+{"type":"fact","seq":8,"kind":"turn_dismissed","turn":4,"who":1,"reason":"backchannel"}
+{"type":"fact","seq":9,"kind":"tool_called","call":1,"tool":"get_time","generation":2}
+{"type":"fact","seq":9,"kind":"tool_called","call":1,"tool":"get_time","generation":2,"args":"{\"zone\":\"Europe/Madrid\"}"}
+{"type":"fact","seq":11,"kind":"tool_sent","call":1,"attempt":0}
+{"type":"fact","seq":12,"kind":"tool_finished","call":1,"outcome":"completed"}
+{"type":"fact","seq":12,"kind":"tool_finished","call":1,"outcome":"in_doubt","result":"the tool did not answer in time"}
+{"type":"fact","seq":14,"kind":"agent_activated","agent":1}
+{"type":"fact","seq":15,"kind":"participant_left","who":1}
+{"type":"fact","seq":16,"kind":"lifecycle_changed","to":"draining"}
+{"type":"fact","seq":17,"kind":"lifecycle_changed","to":"closing","reason":"abandoned"}
+{"type":"fact","seq":18,"kind":"lifecycle_changed","to":"closed"}
+{"type":"told","kind":"user_speaking","who":1,"turn":4,"speaking":true}
+{"type":"told","kind":"agent","agent":0,"activity":"listening"}
+{"type":"told","kind":"agent","agent":0,"generation":3,"activity":"thinking"}
+{"type":"told","kind":"agent","agent":0,"generation":3,"activity":"speaking"}
+{"type":"told","kind":"said","generation":3,"text":"We close at six on Sundays."}
+{"type":"told","kind":"hearing","who":1,"text":"what time do you"}
+{"type":"gap","resumes":120}
+{"type":"state","upto":119,"lifecycle":"running","agent":0,"participants":[1],"items":[{"kind":"turn","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},{"kind":"utterance","generation":1,"agent":0,"text":"We close at six on Sundays.","truncated":false},{"kind":"keys","turn":2,"who":1,"keys":"4071"},{"kind":"tool_call","call":1,"tool":"get_time","generation":2},{"kind":"tool_result","call":1,"outcome":"completed"},{"kind":"tool_call","call":2,"tool":"take_note","generation":4,"args":"{\"note\":\"call back\"}"},{"kind":"tool_result","call":2,"outcome":"failed","result":"the file cannot be written"}],"speech":{"generation":5,"agent":0,"heard":"It is "}}
+{"type":"state","upto":3,"lifecycle":"closing","closed_for":"requested","agent":1,"participants":[],"items":[]}
+{"type":"error","code":"busy","message":"the session has too much waiting for it already"}
+{"type":"error","code":"version","message":"version 2 of the protocol is not spoken here"}
+{"type":"bye","reason":"ended"}
+{"type":"bye","reason":"replaced"}
+{"type":"bye","reason":"going_away"}
+{"type":"bye","reason":"refused"}

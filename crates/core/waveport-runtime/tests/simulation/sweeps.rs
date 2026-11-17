@@ -401,9 +401,11 @@ fn calm() {
     assert!(tally.continuations >= tally.runs / 3, "{tally:?}");
     assert_eq!(tally.lives, tally.runs, "{tally:?}");
     // Three sessions in four keep their state as they go, and none was
-    // rebuilt from one, because none died.
+    // rebuilt from one, because none died. Every state that was stored
+    // was held against what a client is shown of the facts before it.
     assert!(tally.states >= tally.runs, "{tally:?}");
     assert_eq!(tally.from_state, 0, "{tally:?}");
+    assert_eq!(tally.shown, tally.states, "{tally:?}");
 }
 
 #[test]

@@ -432,6 +432,7 @@ mod tests {
                 "cargo test --release --locked -p waveport-domain --test simulation",
                 "cargo test --release --locked -p waveport-runtime --test simulation",
                 "cargo test --release --locked -p waveport-store-journal --test power",
+                "cargo test --release --locked -p waveport-protocol --test garbage --test client_v1",
                 "WAVEPORT_SIM_SEEDS=",
                 "cargo test --release --locked -p waveport-domain --test model -- --include-ignored",
                 "cargo test --release --locked -p waveport-benches --test memory -- --ignored",

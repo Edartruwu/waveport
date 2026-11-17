@@ -177,7 +177,7 @@ WAVEPORT_SIM_SEEDS=200000 cargo test --release -p waveport-domain --test simulat
 WAVEPORT_BLESS=1 cargo nextest run -p waveport-domain --test replay
 ```
 
-**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile, 1,000 of the runtime per story and profile and 20,000 power cuts in the middle of a commit of the journal (see below), other ones each night, and the larger sessions of `tests/model.rs`. It also runs a thousand calls of a minute each on the session actor, which have to give back every byte they took, and measures how much of a thread a session takes (see "Performance gates" below). The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
+**Every night.** The `scheduled` workflow runs 200,000 random sessions of the kernel per profile, 1,000 of the runtime per story and profile, 20,000 power cuts in the middle of a commit of the journal (see below) and a million damaged texts through the parsers of the wire formats, other ones each night, and the larger sessions of `tests/model.rs`. It also runs a thousand calls of a minute each on the session actor, which have to give back every byte they took, and measures how much of a thread a session takes (see "Performance gates" below). The `live` workflow runs the tests that talk to the providers (see "Provider adapters" below).
 
 **Kernel cost.** `tests/no_alloc.rs` lists the steps a session takes most often and fails if one of them calls the allocator. `benches/ir/kernel.rs` counts the instructions of single steps and of rebuilding a session from its journal, and `cargo xtask bench-ir` fails a change that makes one more than 2% more expensive.
 
@@ -213,6 +213,19 @@ WAVEPORT_SIM_SEEDS=2000 cargo test --release -p waveport-store-journal --test po
 The test prints how often the commit that was cut was found whole and how often not at all. Both have to happen, or it tests nothing: a cut that always lands before the commit proves only that an empty file opens.
 
 **The journal's format.** What a record and a stored state look like is in `waveport-protocol` (`journal.rs`), whose first lines say when a change needs a new version: a new kind of fact does. A record is written in the first version that has what it holds, so the facts there were before are written as they were. `crates/core/waveport-runtime/tests/fixtures/` keeps a journal for each version before the newest, written by the build before the change and not by hand, and a test in `codec.rs` reads it, writes it again byte for byte and restores a session from it. A new version adds the journal of the one before it there, in the same pull request.
+
+**The client protocol.** What a client and a session say to each other, and the bodies of the control API, are in `waveport-protocol` (`client/v1.rs`, `control/v1.rs`). `crates/core/waveport-protocol/tests/fixtures/` is the protocol as it is promised: every message as it is written, byte for byte (`from_client.jsonl`, `from_server.jsonl`, `bodies.jsonl`), what a reader has to tolerate (`tolerated.jsonl`), what is refused (`refused.jsonl`), and what a client holds after what it was sent (`views.json`). The clients in other languages read the same files, so a change to one is a change for all of them.
+
+- A new kind of message, fact, news or item gets a line in the fixtures. The tests name every kind in a `match` that does not compile without the new one, next to the list the fixtures have to cover.
+- A reader skips what it does not know, so a field or a kind that old readers can do without is no new version. Anything a reader would misread without noticing is.
+- What a client is shown of a record of the journal is decided in `Fact::shown`, which has a case for every kind of record. Text that a tool was given or answered is shown only where `Show` says so, and the tests look for it where it must not be.
+- A token in a fixture is made up and short (`wpc1_madeup`). `xtask`'s scan for keys knows how both kinds of token begin, and fails on one that is long enough to be real.
+- `tests/garbage.rs` gives every parser text made up from a seed: 20,000 texts in every test run and a million every night, other ones each night. A failure names the seed that `WAVEPORT_SIM_SEED` runs alone. A new parser is added to it. Run more after a change to a parser or to what a client holds:
+
+  ```sh
+  WAVEPORT_SIM_SEEDS=1000000 cargo test --release -p waveport-protocol --test garbage --test client_v1
+  ```
+- That a stored state, shown to a client, is what the facts before it add up to is not something the protocol crate can know: it has no kernel. The simulation of the runtime checks it on every state every session stores (`shown_adds_up` in `tests/simulation/world.rs`). Check that it can fail: show a client an item it is not shown as a fact, and the first seed fails.
 
 **Threads.** A session never leaves its thread, and the listening models run on others. Everything the two sides share is in `src/handoff.rs` of the runtime, and its tests try every way the threads of a small case can take turns, with [loom](https://docs.rs/loom). They are in a build of their own, which the gate `loom` makes:
 

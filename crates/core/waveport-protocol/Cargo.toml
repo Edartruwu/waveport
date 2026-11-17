@@ -20,6 +20,8 @@ bench = false
 serde = { workspace = true, features = ["derive", "std"] }
 
 [dev-dependencies]
+waveport-sim = { workspace = true }
+
 serde_json = { workspace = true, features = ["std"] }
 
 [lints]

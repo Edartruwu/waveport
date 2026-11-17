@@ -1,0 +1,12 @@
+{"type":"hello","v":1}
+{"type":"hello","v":1,"token":"wpc1_madeup","audio":{"codec":"pcm16","rate":24000},"features":["said","hearing","tools"]}
+{"type":"hello","v":1,"audio":{"codec":"opus","rate":48000},"resume":{"token":"wpr1_madeup","life":2,"seen":41}}
+{"type":"played","run":3,"samples":28800}
+{"type":"played_rtp","ts":4132500,"delay_ms":60}
+{"type":"played_rtp","emitted":912000,"concealed":2880,"delay_ms":45}
+{"type":"text","text":"What time do you close on Sundays?"}
+{"type":"text","text":"She said \"wait\" — then:\n\t¿qué hora es? 🙂 \\"}
+{"type":"dtmf","keys":"4071#"}
+{"type":"dtmf","keys":"0123456789*#ABCD"}
+{"type":"interrupt"}
+{"type":"bye"}
