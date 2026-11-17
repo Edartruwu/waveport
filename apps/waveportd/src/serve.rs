@@ -32,7 +32,11 @@ async fn connection(stream: TcpStream, router: Router, mut stopped: watch::Recei
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(HEAD_WITHIN);
-    let serving = http.serve_connection(TokioIo::new(stream), TowerToHyperService::new(router));
+    // A client's line begins as a request, and is handed over by the
+    // answer to it.
+    let serving = http
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router))
+        .with_upgrades();
     tokio::pin!(serving);
     tokio::select! {
         // A connection that failed is one that is over.

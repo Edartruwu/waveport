@@ -364,6 +364,12 @@ impl Link {
     /// holds this has let go of it, or after a moment: so what is told
     /// last is told before the goodbye.
     ///
+    /// A goodbye that is told here ([`FromServer::Bye`]) is the last
+    /// thing the connection carries, and ends it and not the session:
+    /// the transport closes the connection, and the session is told
+    /// that its line dropped. That is how a server that is going away
+    /// lets go of a client whose session is kept.
+    ///
     /// # Errors
     ///
     /// The connection is over, and the message was not sent.
@@ -703,10 +709,7 @@ impl Far {
                     }
                     After::Goes
                 }
-                Next::Told(Some(message)) => match &mut here {
-                    Some(here) => sent(here.conn.send_text(wire::write(&message)).await),
-                    None => After::Goes,
-                },
+                Next::Told(Some(message)) => told(&mut here, message).await,
                 Next::Heard(Ok(Some(message))) => match &mut here {
                     Some(here) => self.hear(here, message, &mut events).await,
                     None => After::Goes,
@@ -990,6 +993,23 @@ async fn refused(here: &mut Here, code: ErrorCode, why: &str) -> After {
         message: why.to_owned(),
     };
     sent(here.conn.send_text(wire::write(&error)).await)
+}
+
+/// Tells the client that is there what whoever serves it has to say. A
+/// goodbye is the last thing a connection is told: it is closed, and the
+/// session, which goes on, has no line.
+async fn told(here: &mut Option<Here>, message: FromServer) -> After {
+    let Some(there) = here else {
+        return After::Goes;
+    };
+    let done = sent(there.conn.send_text(wire::write(&message)).await);
+    if done != After::Goes || !matches!(message, FromServer::Bye { .. }) {
+        return done;
+    }
+    if let Some(parted) = here.take() {
+        parted.conn.close_and_wait(None, LAST_WORDS).await;
+    }
+    After::Dropped
 }
 
 /// Tells a client that another took its place, and closes its

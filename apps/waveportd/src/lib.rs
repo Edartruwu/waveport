@@ -6,12 +6,19 @@
 //! together once, and runs their sessions for whoever asks over the
 //! control API ([`waveport_protocol::control::v1`]). The far end of a
 //! session speaks the client protocol
-//! ([`waveport_protocol::client::v1`]): what the server says of it is a
-//! stream of server-sent events, and what the client says is posted.
+//! ([`waveport_protocol::client::v1`]), in one of two ways.
 //!
-//! Here a session is one of text: it is followed and written to, and is
-//! on no line. The same session, begun over a line that carries audio,
-//! hears and speaks, and the lines are what comes next.
+//! - **On no line.** What the server says is a stream of server-sent
+//!   events, and what the client says is posted. Such a session reads
+//!   and writes.
+//! - **On a line.** The far end is on a WebSocket (`GET /v1/client`)
+//!   that carries the whole protocol, and audio if its hello names any.
+//!   Such a session hears and speaks if its agent does either, and
+//!   reads and writes over the line otherwise. A client whose
+//!   connection drops comes back and is on the line again.
+//!
+//! Which of the two a session is, is decided by how its far end first
+//! comes, and holds for all of its lives.
 //!
 //! # Who may ask
 //!
@@ -27,6 +34,9 @@
 //! - A **resume token** is what the far end is given as it connects. It
 //!   lets its holder follow that session and write to it, from then on
 //!   and after the daemon was started again.
+//!
+//! A client on a WebSocket says its token in its first message, the
+//! hello, and never in the address it asks for.
 //!
 //! A daemon that listens on this machine alone may be given no control
 //! key, and then lets in whoever is on the machine. It still looks at
@@ -58,6 +68,7 @@ pub mod config;
 mod daemon;
 mod events;
 mod http;
+mod line;
 mod serve;
 mod threads;
 

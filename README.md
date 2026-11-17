@@ -45,7 +45,7 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/adapters/store/journal` | A journal in a file on this machine, from which a session goes on after its process died |
 | `apps/waveport-assembly` | What an agent is made of, as one definition, and a session put together from it. Whatever runs agents does it here |
 | `apps/waveport-cli` | The `waveport` command: an agent defined on a command line, at this machine's sound devices, over a WebSocket or in writing |
-| `apps/waveportd` | The `waveportd` daemon: agents defined in a file, and sessions of them for whoever asks over HTTP |
+| `apps/waveportd` | The `waveportd` daemon: agents defined in a file, and sessions of them for whoever asks over HTTP or comes on a WebSocket |
 | `crates/testing/waveport-sim` | Deterministic simulation: seeded runs with a virtual clock |
 | `crates/testing/waveport-kernel-sim` | The session kernel under test: scenarios explored along every path, random sessions, every path through small sessions, and recorded sessions replayed, with the invariants checked at every step |
 | `crates/testing/waveport-alloc-counter` | Counting allocator, to prove a code path does not allocate |
@@ -114,7 +114,7 @@ The agent then knows what was said before, is told that something was lost, and 
 
 ## Running the daemon
 
-`waveportd` runs the agents a file defines and is asked for sessions over HTTP. So far a session of the daemon is one of text: it is written to and followed, and nothing carries audio to it yet.
+`waveportd` runs the agents a file defines and is asked for sessions over HTTP. A session is written to and followed, as below, or its far end is on a WebSocket and speaks or writes there.
 
 ```toml
 # waveportd.toml
@@ -151,6 +151,17 @@ curl -s -X POST "localhost:7070/v1/sessions/$SESSION/input" \
 ```
 
 The stream is the server's half of client protocol v1 (the [architecture](docs/architecture.md), sections 8.6 and 8.7). A stream that was cut is come back to with the resume token and the `id` of the last event (`Last-Event-ID`), and the client is sent what it missed. That holds across daemons too: stop this one (Ctrl-C lets an answer end first; `kill -9` does not), start it again, and connect as before. The session goes on, in its next life, and the client is told what it has come to.
+
+A far end can be on a line instead: a WebSocket at `/v1/client` that speaks the whole of the protocol. Its first message is a hello with the client token, and with the audio it sends and takes, as plain samples or as Opus. With no audio in its hello it writes. A session that is started this way hears and speaks if its agent can, which its definition says:
+
+```toml
+assets = "target/assets"         # the models that listen: cargo xtask fetch-assets
+
+[agents.front-desk.speech]       # OpenAI hears and Cartesia speaks, unless it says otherwise
+language = "en"
+```
+
+A client whose connection drops comes back with the resume token and is on the line again, and the session, which waited, goes on. The token is never in the address: a request for a line with anything after a `?` is refused. The client for a browser and a page to try it on are the next step of the [roadmap](ROADMAP.md); until then a client is a program that speaks the protocol, as the tests in `apps/waveportd/tests/served/` do with the client of `waveport-transport-websocket`.
 
 A daemon that listens on this machine alone asks for no key, and still refuses a page from elsewhere. One that listens anywhere else needs a control key, which the file names and never holds:
 

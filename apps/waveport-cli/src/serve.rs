@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use waveport_assembly::ResumeToken;
-use waveport_assembly::shown::{Asked, Follower, Position};
+use waveport_assembly::shown::{self, Asked, Follower, Position};
 use waveport_domain::ids::ParticipantId;
 use waveport_ports::control::SessionInput;
 use waveport_ports::journal::SessionId;
-use waveport_protocol::client::v1::{self as client, ErrorCode, FromClient, FromServer, Resume};
+use waveport_protocol::client::v1::{ErrorCode, FromClient, Resume};
 use waveport_transport_websocket::{
     Caller, GREETING_TIMEOUT, Handle, Knock, Link, Listener, Welcome,
 };
@@ -382,16 +382,7 @@ async fn tells(
                     return;
                 };
                 // How the call ended is the last thing there is to tell.
-                let last = matches!(
-                    &message,
-                    FromServer::Fact {
-                        fact: client::Fact::LifecycleChanged {
-                            to: client::Lifecycle::Closed,
-                            ..
-                        },
-                        ..
-                    }
-                );
+                let last = shown::closes(&message);
                 if link.tell(message).await.is_err() || last {
                     return;
                 }

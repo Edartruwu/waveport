@@ -133,6 +133,13 @@ pub struct SessionSpec {
     pub edges: EdgeConfig,
     /// When the session's state is stored in its journal.
     pub states: StateRule,
+    /// What the agent says to the far end of the session's line when it
+    /// joins: before anything the far end says is taken, so that a far
+    /// end that speaks at once is greeted and then answered, and not
+    /// answered and then talked over. A session that goes on after its
+    /// process died has greeted, and one on no line has nobody join it:
+    /// whoever starts that one asks it to say what it should.
+    pub greeting: Option<String>,
 }
 
 /// When a session has its journal store its state, so that the session
@@ -184,6 +191,7 @@ impl SessionSpec {
             language: None,
             edges: EdgeConfig::default(),
             states: StateRule::default(),
+            greeting: None,
         }
     }
 }
@@ -504,6 +512,8 @@ pub struct Session<P: Policies = DefaultPolicies> {
 
     transport: Box<dyn Transport>,
     line: Line,
+    /// What is still to be said to the far end when it joins.
+    greeting: Option<String>,
     /// Keys the session was asked to press while nobody was there to
     /// hear them.
     unpressed: u64,
@@ -636,6 +646,7 @@ impl<P: Policies> Session<P> {
             } else {
                 Line::None
             },
+            greeting: spec.greeting.filter(|_| rebuilt.is_none()),
             unpressed: 0,
             transport: parts.transport.unwrap_or_else(|| Box::new(Gone)),
             llm,
@@ -1075,6 +1086,13 @@ impl<P: Policies> Session<P> {
                     let most = self.kernel.config().limits.participants;
                     self.driver.joined(who, most);
                     self.queue.push(Event::Control(ControlInput::Join { who }));
+                    // The far end is there to be greeted, and is, before
+                    // anything it says: whatever follows on the line
+                    // follows this.
+                    if let Some(text) = self.greeting.take() {
+                        let text = text.into();
+                        self.queue.push(Event::Control(ControlInput::Say { text }));
+                    }
                 }
                 Some(TransportEvent::Left { who }) => {
                     self.queue.push(Event::Control(ControlInput::Leave { who }));
@@ -1253,6 +1271,12 @@ impl<P: Policies> Session<P> {
                     self.recent.push_back((stamped.seq, record.clone()));
                     let seq = stamped.seq;
                     self.last_fact = seq;
+                    // Whoever is told of a fact, and asks at once how
+                    // far the session has come, finds the fact counted.
+                    if let Some(standing) = &self.standing {
+                        let next = seq.get().saturating_add(1);
+                        standing.next_seq.store(next, Ordering::Relaxed);
+                    }
                     self.tell(&SessionEvent::Fact { seq, record });
                 }
                 match stamped.fact {

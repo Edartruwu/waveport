@@ -7,12 +7,14 @@
 //! they are kept in, and the next daemon goes on with one when its far
 //! end comes back.
 
+use core::time::Duration;
+
 use serde_json::json;
 use waveport_protocol::client::v1::View;
 use waveport_testkit::servers::HttpServer;
 
 use crate::far_end::Event;
-use crate::{ANSWER, Served, answer, config, desk, is_fact, viewed};
+use crate::{ANSWER, Served, answer, config, desk, is_fact, slow_answer, viewed};
 
 /// Where the sessions of these daemons are kept.
 const KEPT: &str = "[journal]\nfile = \"sessions.redb\"\n";
@@ -37,10 +39,6 @@ fn conversation(view: &View) -> Vec<String> {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_daemon_that_is_told_to_stop_lets_an_answer_end_and_says_that_it_goes() {
-    use core::time::Duration;
-
-    use crate::slow_answer;
-
     // An answer that takes a while to be written: long enough for a
     // machine that is slow today to ask the daemon three things before
     // it has ended.
@@ -79,6 +77,10 @@ async fn a_daemon_that_is_told_to_stop_lets_an_answer_end_and_says_that_it_goes(
     let refused = daemon.ask("POST", "/v1/sessions", make).await;
     assert_eq!((refused.status, refused.code().as_str()), (503, "busy"));
     assert_eq!(refused.header("retry-after"), Some("1"));
+    // Nor is a client given a line: one that comes back is to try the
+    // daemon that is started next.
+    let line = crate::lined::asks_for_a_line(&daemon, "/v1/client", &[]).await;
+    assert_eq!((line.status, line.code().as_str()), (503, "busy"));
 
     // The answer comes to its end. Then whoever follows is told that
     // the daemon goes, and the stream ends.
@@ -111,11 +113,7 @@ async fn a_daemon_that_is_told_to_stop_lets_an_answer_end_and_says_that_it_goes(
     // The daemon that is started next has the session, which does not
     // run until its far end comes back.
     let daemon = Served::start(&desk, &config(&llm, KEPT), &[]).await;
-    let errors = daemon.errors();
-    assert!(
-        errors.contains("1 session is kept, and is gone on with"),
-        "{errors}"
-    );
+    daemon.noted("1 session is kept, and is gone on with").await;
     let broken = json!({"session": name, "agent": "desk", "state": "broken"});
     let listed = daemon.ask("GET", "/v1/sessions?state=broken", None).await;
     assert_eq!(listed.json(), json!({"sessions": [broken]}));
@@ -219,8 +217,11 @@ async fn the_turns_of_a_session_are_traced_under_its_name() {
     reason = "one session from its beginning to its end, told in the order it happens"
 )]
 async fn a_session_goes_on_in_the_daemon_that_is_started_after_one_was_killed() {
+    // The first answer takes a while to be written. The journal takes
+    // what waits for it together: an answer that is written at once
+    // could be stored with the question it answers.
     let script = vec![
-        answer(&ANSWER, None),
+        slow_answer(&ANSWER, Duration::from_millis(25)),
         answer(&["Half past", " three."], None),
         answer(&["You are", " welcome."], None),
     ];
@@ -341,10 +342,7 @@ async fn a_session_goes_on_in_the_daemon_that_is_started_after_one_was_killed() 
             .iter()
             .any(|item| item.contains(&first))
     );
-    assert_eq!(
-        back.idles_for(core::time::Duration::from_millis(200)).await,
-        0
-    );
+    assert_eq!(back.idles_for(Duration::from_millis(200)).await, 0);
 
     // The session goes on from there.
     daemon.types(&name, &resume, "Thank you.").await;
