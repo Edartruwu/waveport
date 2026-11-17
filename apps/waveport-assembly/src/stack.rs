@@ -2,6 +2,7 @@
 //! session begun.
 
 use core::pin::Pin;
+use core::time::Duration;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use waveport_domain::ids::Seq;
 use waveport_domain::policy::DefaultPolicies;
 use waveport_llm_openai_compat::OpenAiCompat;
-use waveport_ports::control::{EventRx, SessionControl, SessionInput};
+use waveport_ports::control::{ControlError, EventRx, SessionControl, SessionInput};
 use waveport_ports::journal::SessionId;
 use waveport_ports::plan::SessionPlan;
 use waveport_ports::stt::Stt;
@@ -18,7 +19,7 @@ use waveport_ports::transport::Transport;
 use waveport_ports::tts::Tts;
 use waveport_runtime::compute::Compute;
 use waveport_runtime::session::{Brain, Ended, Parts, Rebuilt, SessionSpec, StateRule};
-use waveport_runtime::shard::{Exit, Runtime, RuntimeConfig, Started};
+use waveport_runtime::shard::{Exit, Runtime, RuntimeConfig, Started, Status};
 use waveport_runtime::tools::Registry;
 use waveport_telemetry_otel::{Config as OtelConfig, Otel};
 
@@ -119,6 +120,15 @@ impl Call {
         &self.started.plan
     }
 
+    /// Which of its lives the session is in. The number goes up each
+    /// time a session is gone on with after it broke off, and whoever
+    /// was told of it in an earlier life was told of what this one may
+    /// never have done.
+    #[must_use]
+    pub const fn life(&self) -> u64 {
+        self.started.lease.0
+    }
+
     /// How the session ends.
     pub async fn exit(self) -> Exit {
         self.started.exit().await
@@ -153,9 +163,11 @@ impl Stack {
         // before anything is waited for.
         let (kept, mut notes) = Kept::open(&spec.keeps, &spec.named, &halt, resuming)?;
         notes.extend(kept.earlier().await);
-        let runtime = Arc::new(
-            Runtime::new(RuntimeConfig::default()).with(|| "no session can run".to_owned())?,
-        );
+        let config = RuntimeConfig {
+            shards: spec.shards,
+            ..RuntimeConfig::default()
+        };
+        let runtime = Arc::new(Runtime::new(config).with(|| "no session can run".to_owned())?);
         let mut registry = Registry::new();
         let sessions: Weak<Runtime> = Arc::downgrade(&runtime);
         let takes_notes = spec.notes.clone().map(|file| Notes {
@@ -403,10 +415,47 @@ impl Stack {
         self.runtime.subscribe(id, from).ok()
     }
 
+    /// Follows the session `id` from what it is now: its state first,
+    /// and then what happens from there. For whoever cannot go on from
+    /// what they hold of it.
+    #[must_use]
+    pub fn follow_from_state(&self, id: SessionId) -> Option<Told> {
+        self.runtime.subscribe_from_state(id).ok()
+    }
+
     /// Asks `input` of the session `id`. Returns whether it was taken.
     #[must_use]
     pub fn ask(&self, id: SessionId, input: SessionInput) -> bool {
         self.runtime.send(id, input).is_ok()
+    }
+
+    /// Asks `input` of the session `id`.
+    ///
+    /// # Errors
+    ///
+    /// The session does not run here, or has too much waiting for it.
+    pub fn send(&self, id: SessionId, input: SessionInput) -> Result<(), ControlError> {
+        self.runtime.send(id, input)
+    }
+
+    /// Where the session `id` stood when it last ran, if it runs here.
+    #[must_use]
+    pub fn status(&self, id: SessionId) -> Option<Status> {
+        self.runtime.status(id)
+    }
+
+    /// Whether every session that runs here has nothing under way.
+    #[must_use]
+    pub fn at_rest(&self) -> bool {
+        self.runtime.at_rest()
+    }
+
+    /// Starts no session from now on, and waits until the ones that run
+    /// have ended, for as long as `patience`. Returns how many still
+    /// run: they stop where they are when the stack is let go of, and
+    /// can be gone on with if they are kept where that can be done.
+    pub async fn drain(&self, patience: Duration) -> usize {
+        self.runtime.drain(patience).await
     }
 
     /// The name of the session to run: the one `resume` says to go on

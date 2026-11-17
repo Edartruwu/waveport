@@ -97,11 +97,15 @@ pub struct SessionInfo {
     /// far end is run as the line allows that the far end comes on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
-    /// Which of its lives it is in: the number goes up each time it is
-    /// rebuilt from what was stored of it, after its process died.
-    pub life: u64,
-    /// The number the next fact gets that comes about in it.
-    pub next_seq: u64,
+    /// Which of its lives it is in, while it runs: the number goes up
+    /// each time it is rebuilt from what was stored of it, after its
+    /// process died.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub life: Option<u64>,
+    /// The number the next fact gets that comes about in it, while it
+    /// runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_seq: Option<u64>,
 }
 
 /// What a server says of its sessions.

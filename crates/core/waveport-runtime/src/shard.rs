@@ -12,10 +12,15 @@
 //!
 //! A session that panics ends, and is said to have. The shard and its
 //! other sessions go on.
+//!
+//! A runtime that is to stop is drained first: it starts no session
+//! from then on, and whoever stops it waits for the ones it has. What
+//! still runs when the runtime is dropped stops where it is, and what it
+//! had stored is in its journal.
 
 use core::fmt;
 use core::pin::Pin;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::BTreeMap;
@@ -23,14 +28,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use tokio::runtime::{Builder, LocalOptions};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use waveport_domain::ids::Seq;
 use waveport_domain::policy::Policies;
 use waveport_ports::control::{ControlError, EventRx, SessionControl, SessionEvent, SessionInput};
-use waveport_ports::journal::SessionId;
+use waveport_ports::journal::{Lease, SessionId};
 use waveport_ports::plan::SessionPlan;
 
-use crate::session::{Ended, Parts, Rebuilt, Request, Session, SessionSpec, StartError};
+use crate::session::{Ended, Parts, Rebuilt, Request, Session, SessionSpec, Standing, StartError};
 pub use crate::watch::ShardStats;
 use crate::watch::{Counters, Watched};
 
@@ -91,7 +96,8 @@ pub enum SpawnError {
     Start(StartError),
     /// It panicked while it was made ready.
     Panicked,
-    /// The runtime has stopped.
+    /// The runtime has stopped, or is being drained and starts nothing
+    /// more.
     Stopped,
 }
 
@@ -128,6 +134,9 @@ pub struct Started {
     pub plan: SessionPlan,
     /// What it was rebuilt from, if it goes on after an earlier life.
     pub rebuilt: Option<Rebuilt>,
+    /// The lease it writes its journal with, which says which of its
+    /// lives this is: the number goes up each time it is taken over.
+    pub lease: Lease,
     exit: oneshot::Receiver<Exit>,
 }
 
@@ -147,8 +156,20 @@ struct Shard {
     thread: Option<JoinHandle<()>>,
 }
 
-/// The sessions that run here, and how each is reached.
-type Directory = Mutex<BTreeMap<SessionId, mpsc::Sender<Request>>>;
+/// The sessions that run here, how each is reached, and where each says
+/// where it stands.
+type Sessions = BTreeMap<SessionId, (mpsc::Sender<Request>, Arc<Standing>)>;
+type Directory = Mutex<Sessions>;
+
+/// Where a session stood when it last ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Status {
+    /// The number its next fact gets.
+    pub next_seq: Seq,
+    /// Whether it has nothing under way: it can be stopped and gone on
+    /// with later without anyone noticing more than the wait.
+    pub at_rest: bool,
+}
 
 /// Shards, and the sessions that run on them.
 ///
@@ -157,6 +178,10 @@ pub struct Runtime {
     config: RuntimeConfig,
     shards: Vec<Shard>,
     directory: Arc<Directory>,
+    /// Whether it starts nothing more.
+    draining: AtomicBool,
+    /// Told each time a session has gone.
+    gone: Arc<Notify>,
 }
 
 impl Runtime {
@@ -178,7 +203,33 @@ impl Runtime {
             config,
             shards,
             directory: Arc::default(),
+            draining: AtomicBool::new(false),
+            gone: Arc::default(),
         })
+    }
+
+    /// Starts no session from now on, and waits until the ones that run
+    /// here have ended, for as long as `patience`. Returns how many
+    /// still run.
+    ///
+    /// Nothing is asked of the sessions: whoever drains a runtime says
+    /// what is to become of them, before or meanwhile. One that still
+    /// runs when the runtime is dropped stops where it is, and can be
+    /// gone on with from its journal.
+    pub async fn drain(&self, patience: Duration) -> usize {
+        self.draining.store(true, Ordering::Relaxed);
+        let until = tokio::time::Instant::now() + patience;
+        loop {
+            // Asked for before the count is read, so that a session
+            // that goes in between is not missed.
+            let gone = self.gone.notified();
+            tokio::pin!(gone);
+            gone.as_mut().enable();
+            let left = self.sessions();
+            if left == 0 || tokio::time::timeout_at(until, gone).await.is_err() {
+                return self.sessions();
+            }
+        }
     }
 
     /// Starts a session on the shard that has the fewest, and returns
@@ -198,6 +249,9 @@ impl Runtime {
         P: Policies + Send + 'static,
     {
         let id = spec.id;
+        if self.draining.load(Ordering::Relaxed) {
+            return Err(SpawnError::Stopped);
+        }
         let Some(shard) = self
             .shards
             .iter()
@@ -206,12 +260,13 @@ impl Runtime {
             return Err(SpawnError::Stopped);
         };
         let (requests, inbox) = mpsc::channel(self.config.inbox);
+        let standing = Arc::<Standing>::default();
         {
             let mut directory = lock(&self.directory);
             if directory.contains_key(&id) {
                 return Err(SpawnError::Running);
             }
-            directory.insert(id, requests);
+            directory.insert(id, (requests, Arc::clone(&standing)));
         }
         shard.counters.sessions.fetch_add(1, Ordering::Relaxed);
 
@@ -219,6 +274,7 @@ impl Runtime {
         let (exited, exit) = oneshot::channel();
         let counters = Arc::clone(&shard.counters);
         let directory = Arc::clone(&self.directory);
+        let gone = Arc::clone(&self.gone);
         let budget = self.config.poll_budget;
         let job: Job = Box::new(move || {
             let run = async move {
@@ -230,7 +286,9 @@ impl Runtime {
                     }
                 };
                 session.listen_to(inbox);
-                let _ = ready.send(Ok((session.plan().clone(), session.rebuilt())));
+                session.report_to(standing);
+                let begun = (session.plan().clone(), session.rebuilt(), session.lease());
+                let _ = ready.send(Ok(begun));
                 Some(session.run().await)
             };
             let watched = Watched::new(run, Arc::clone(&counters), budget);
@@ -246,6 +304,7 @@ impl Runtime {
                 };
                 lock(&directory).remove(&id);
                 counters.sessions.fetch_sub(1, Ordering::Relaxed);
+                gone.notify_waiters();
                 if let Some(exit) = exit {
                     let _ = exited.send(exit);
                 }
@@ -258,10 +317,11 @@ impl Runtime {
         }
 
         match started.await {
-            Ok(Ok((plan, rebuilt))) => Ok(Started {
+            Ok(Ok((plan, rebuilt, lease))) => Ok(Started {
                 id,
                 plan,
                 rebuilt,
+                lease,
                 exit,
             }),
             Ok(Err(error)) => Err(SpawnError::Start(error)),
@@ -280,6 +340,26 @@ impl Runtime {
         lock(&self.directory).len()
     }
 
+    /// Where the session `session` stood when it last ran, if it runs
+    /// here.
+    #[must_use]
+    pub fn status(&self, session: SessionId) -> Option<Status> {
+        let directory = lock(&self.directory);
+        let (_, standing) = directory.get(&session)?;
+        Some(Status {
+            next_seq: standing.next_seq(),
+            at_rest: standing.at_rest(),
+        })
+    }
+
+    /// Whether every session that runs here has nothing under way.
+    #[must_use]
+    pub fn at_rest(&self) -> bool {
+        lock(&self.directory)
+            .values()
+            .all(|(_, standing)| standing.at_rest())
+    }
+
     /// What has run on each shard.
     #[must_use]
     pub fn stats(&self) -> Vec<ShardStats> {
@@ -291,7 +371,7 @@ impl Runtime {
 
     fn reach(&self, session: SessionId, request: Request) -> Result<(), ControlError> {
         let directory = lock(&self.directory);
-        let requests = directory.get(&session).ok_or(ControlError::NoSuchSession)?;
+        let (requests, _) = directory.get(&session).ok_or(ControlError::NoSuchSession)?;
         requests.try_send(request).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => ControlError::Behind,
             // It has just ended.
@@ -312,6 +392,15 @@ impl SessionControl for Runtime {
     ) -> Result<Pin<Box<dyn EventRx>>, ControlError> {
         let (to, following) = mpsc::channel(self.config.follower_room);
         self.reach(session, Request::Follow { from, to })?;
+        Ok(Box::pin(Following(following)))
+    }
+
+    fn subscribe_from_state(
+        &self,
+        session: SessionId,
+    ) -> Result<Pin<Box<dyn EventRx>>, ControlError> {
+        let (to, following) = mpsc::channel(self.config.follower_room);
+        self.reach(session, Request::FollowFromState { to })?;
         Ok(Box::pin(Following(following)))
     }
 }
@@ -351,9 +440,7 @@ impl EventRx for Following {
     }
 }
 
-fn lock(
-    directory: &Directory,
-) -> std::sync::MutexGuard<'_, BTreeMap<SessionId, mpsc::Sender<Request>>> {
+fn lock(directory: &Directory) -> std::sync::MutexGuard<'_, Sessions> {
     directory.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

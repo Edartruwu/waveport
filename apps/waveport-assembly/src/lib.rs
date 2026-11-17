@@ -33,6 +33,8 @@ pub mod tools;
 
 use core::fmt;
 
+pub use waveport_store_journal::ResumeToken;
+
 pub use crate::kept::{Kept, Resume};
 pub use crate::spec::{AgentSpec, Keeps, Named, StackSpec};
 pub use crate::stack::{Agent, Call, Settled, Stack, Told};

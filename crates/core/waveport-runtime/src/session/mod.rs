@@ -47,6 +47,7 @@ mod write;
 
 use core::fmt;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::VecDeque;
@@ -70,7 +71,7 @@ use waveport_media::ingress::Packet;
 use waveport_ports::audio::Rate;
 pub use waveport_ports::control::{SessionEvent, SessionInput};
 use waveport_ports::error::{BoxFuture, Full};
-use waveport_ports::journal::{Journal, JournalError, Recovered, SessionId};
+use waveport_ports::journal::{Journal, JournalError, Lease, Recovered, SessionId};
 use waveport_ports::llm::Llm;
 use waveport_ports::plan::{AgentNeeds, BrainProfile, PlanError, SessionPlan, plan};
 use waveport_ports::stt::Stt;
@@ -247,6 +248,43 @@ impl fmt::Debug for Parts {
     }
 }
 
+/// Where a session stands, kept where another thread can read it
+/// without asking the session: whoever runs sessions wants to know of
+/// all of them at once, and often.
+#[derive(Debug)]
+pub struct Standing {
+    next_seq: AtomicU64,
+    at_rest: AtomicBool,
+}
+
+impl Default for Standing {
+    /// A session that has made no fact and has yet to say that it
+    /// rests.
+    fn default() -> Self {
+        Self {
+            next_seq: AtomicU64::new(1),
+            at_rest: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Standing {
+    /// The number the session's next fact gets.
+    #[must_use]
+    pub fn next_seq(&self) -> Seq {
+        Seq(self.next_seq.load(Ordering::Relaxed))
+    }
+
+    /// Whether the session has nothing under way: no answer owed, asked
+    /// for, written or being said, no tool call out, and nothing waiting
+    /// to be stored. It is where a session can be stopped and gone on
+    /// with later without anyone noticing more than the wait.
+    #[must_use]
+    pub fn at_rest(&self) -> bool {
+        self.at_rest.load(Ordering::Relaxed)
+    }
+}
+
 /// What reaches a session from outside it while it runs.
 #[derive(Debug)]
 pub enum Request {
@@ -259,6 +297,12 @@ pub enum Request {
         from: Seq,
         /// Where to. A follower that has no room for what it is told is
         /// let go, and comes back for what it missed.
+        to: mpsc::Sender<SessionEvent>,
+    },
+    /// Someone wants to be told what the session is now, and what
+    /// happens in it from there.
+    FollowFromState {
+        /// Where to.
         to: mpsc::Sender<SessionEvent>,
     },
 }
@@ -511,6 +555,11 @@ pub struct Session<P: Policies = DefaultPolicies> {
     /// What the session was rebuilt from, if it goes on after an earlier
     /// life.
     rebuilt: Option<Rebuilt>,
+    lease: Lease,
+    /// The number of the last fact the session made, or took over.
+    last_fact: Seq,
+    /// Where the session says where it stands, if anyone reads it.
+    standing: Option<Arc<Standing>>,
 }
 
 impl<P: Policies> Session<P> {
@@ -567,7 +616,9 @@ impl<P: Policies> Session<P> {
         // what its earlier life heard.
         let offset = heard_until.map_or(Duration::ZERO, |heard| since_start(heard) + RESUME_GAP);
         let began = MonoTime::from_nanos(u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX));
-        let store = Store::new(parts.journal, spec.id, recovered.lease, recovered.next);
+        let lease = recovered.lease;
+        let recovered_next = recovered.next;
+        let store = Store::new(parts.journal, spec.id, lease, recovered.next);
         let recent = last_of(recovered.tail, recovered.next);
         Ok(Self {
             id: spec.id,
@@ -613,6 +664,9 @@ impl<P: Policies> Session<P> {
             state_upto: rebuilt.and_then(|from| from.state).unwrap_or(Seq(0)),
             state_at: began,
             rebuilt,
+            lease,
+            last_fact: Seq(recovered_next.get().saturating_sub(1)),
+            standing: None,
         })
     }
 
@@ -634,6 +688,16 @@ impl<P: Policies> Session<P> {
     #[must_use]
     pub const fn rebuilt(&self) -> Option<Rebuilt> {
         self.rebuilt
+    }
+
+    /// The lease the session writes its journal with: which of its lives
+    /// this is. Each time a session is taken over, to be gone on with
+    /// after its process died, the number goes up, so whoever was told
+    /// of the session under another lease was told of another life of
+    /// it, in which it may have done what this one never did.
+    #[must_use]
+    pub const fn lease(&self) -> Lease {
+        self.lease
     }
 
     /// A read-only look at the session.
@@ -669,6 +733,32 @@ impl<P: Policies> Session<P> {
         self.inbox = Some(inbox);
     }
 
+    /// Says where the session stands in `standing`, each time it has
+    /// run.
+    pub fn report_to(&mut self, standing: Arc<Standing>) {
+        self.standing = Some(standing);
+        self.report();
+    }
+
+    /// Whether nothing is under way in the session.
+    fn at_rest(&self) -> bool {
+        let view = self.kernel.view();
+        self.minds.is_empty()
+            && self.calls.is_empty()
+            && self.undoing.is_empty()
+            && self.store.is_idle()
+            && view.owed().is_none()
+            && view.generations().next().is_none()
+    }
+
+    fn report(&self) {
+        if let Some(standing) = &self.standing {
+            let next = self.last_fact.get().saturating_add(1);
+            standing.next_seq.store(next, Ordering::Relaxed);
+            standing.at_rest.store(self.at_rest(), Ordering::Relaxed);
+        }
+    }
+
     /// Tells `to` what happens in the session from now on, after the
     /// facts from the one numbered `from` that it still holds. If it
     /// holds them no longer, `to` is told first where what follows
@@ -693,6 +783,22 @@ impl<P: Policies> Session<P> {
             }
         }
         self.followers.push(to);
+    }
+
+    /// Tells `to` what the session's facts add up to as of the last of
+    /// them, and then what happens in the session from now on.
+    pub fn follow_from_state(&mut self, to: mpsc::Sender<SessionEvent>) {
+        // Every fact the kernel has made has been told to whoever
+        // follows, so nothing lies between this state and what the
+        // follower is told next.
+        let snapshot = self.kernel.snapshot();
+        let upto = Seq(snapshot.next_seq().get().saturating_sub(1));
+        let Ok(state) = codec::encode_state(&snapshot, self.heard_until) else {
+            return;
+        };
+        if to.try_send(SessionEvent::State { upto, state }).is_ok() {
+            self.followers.push(to);
+        }
     }
 
     /// Tells every follower something. One that has no room for it, or
@@ -721,6 +827,12 @@ impl<P: Policies> Session<P> {
 
     /// Runs the session until it has nothing to do or has ended.
     pub fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<Ended> {
+        let polled = self.poll_on(cx);
+        self.report();
+        polled
+    }
+
+    fn poll_on(&mut self, cx: &mut Context<'_>) -> Poll<Ended> {
         for _ in 0..SWEEPS {
             let now = self.now();
             let mut progressed = self.gather(cx, now);
@@ -891,7 +1003,10 @@ impl<P: Policies> Session<P> {
                             self.queue.push(event);
                         }
                     }
-                    Poll::Ready(Some(Request::Follow { from, to })) => follows.push((from, to)),
+                    Poll::Ready(Some(Request::Follow { from, to })) => {
+                        follows.push((Some(from), to));
+                    }
+                    Poll::Ready(Some(Request::FollowFromState { to })) => follows.push((None, to)),
                     Poll::Ready(None) => break false,
                     Poll::Pending => break true,
                 }
@@ -901,7 +1016,10 @@ impl<P: Policies> Session<P> {
             }
         }
         for (from, to) in follows {
-            self.follow(from, to);
+            match from {
+                Some(from) => self.follow(from, to),
+                None => self.follow_from_state(to),
+            }
         }
 
         changed |= self.driver.hear(cx, now, &mut self.queue);
@@ -1134,6 +1252,7 @@ impl<P: Policies> Session<P> {
                     }
                     self.recent.push_back((stamped.seq, record.clone()));
                     let seq = stamped.seq;
+                    self.last_fact = seq;
                     self.tell(&SessionEvent::Fact { seq, record });
                 }
                 match stamped.fact {

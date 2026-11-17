@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use waveport_assembly::Resume;
 use waveport_assembly::spec::{
-    self, ASSETS, AgentSpec, Keeps, LANGUAGE, LLM_KEY_ENV, LLM_MODEL, LLM_URL, LlmSpec, Named,
-    STATE_EVERY, SpeechSpec, StackSpec, SttSpec, TtsSpec,
+    self, ASSETS, AgentSpec, JOURNAL, Keeps, LANGUAGE, LLM_KEY_ENV, LLM_MODEL, LLM_URL, LlmSpec,
+    Named, STATE_EVERY, SpeechSpec, StackSpec, SttSpec, TtsSpec,
 };
 
 /// Who recognises speech.
@@ -125,8 +125,23 @@ pub(crate) enum Command {
     /// A chat is a call in writing: it is kept, gone on with and told as
     /// a call is.
     Chat(Chat),
+    /// List the calls that broke off and are kept.
+    ///
+    /// A call that ended is let go of. One whose command was stopped
+    /// where it was, or died, stays in the file calls are kept in until
+    /// it is gone on with to its end: `--resume last` goes on with the
+    /// one that was begun last, and `--resume FILE` with the one whose
+    /// token the file holds.
+    Calls(Calls),
     /// List the sound devices of this machine.
     Devices,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct Calls {
+    /// The file calls are kept in.
+    #[arg(long, value_name = "FILE", default_value = JOURNAL)]
+    pub journal: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -390,6 +405,7 @@ impl Agent {
             None => Keeps::Usual,
         };
         StackSpec {
+            shards: 1,
             keeps,
             state_every: self.state_every,
             notes: self.notes.clone(),

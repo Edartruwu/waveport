@@ -270,6 +270,50 @@ async fn a_new_token_takes_the_place_of_the_one_before() {
     assert_eq!(soon(journal.admit(&stranger)).await, Ok(false));
 }
 
+#[tokio::test]
+async fn a_label_is_kept_with_its_session_and_let_go_of_with_it() {
+    let path = scratch("labels");
+    let journal = open(&path);
+    let (a, b, c) = (SessionId(1), SessionId(2), SessionId(3));
+    soon(journal.issue(a)).await.unwrap();
+    soon(journal.label(a, b"front-desk")).await.unwrap();
+    soon(journal.acquire(b)).await.unwrap();
+    soon(journal.issue(c)).await.unwrap();
+    soon(journal.label(c, b"first")).await.unwrap();
+    soon(journal.label(c, b"")).await.unwrap();
+    let held = soon(journal.labelled()).await.unwrap();
+    assert_eq!(
+        held,
+        [
+            (a, Some(b"front-desk".to_vec())),
+            (b, None),
+            (c, Some(Vec::new())),
+        ]
+    );
+    // A label does not make a session one that was begun.
+    assert!(soon(journal.acquire(a)).await.unwrap().is_new());
+
+    // It is there for the next process, and goes with its session.
+    drop(journal);
+    let journal = open(&path);
+    assert_eq!(soon(journal.labelled()).await.unwrap(), held);
+    soon(journal.forget(a)).await.unwrap();
+    assert_eq!(
+        soon(journal.labelled()).await.unwrap(),
+        [(b, None), (c, Some(Vec::new()))]
+    );
+    // A session that is begun again after it was forgotten has none.
+    soon(journal.acquire(a)).await.unwrap();
+    let again = soon(journal.labelled()).await.unwrap();
+    assert_eq!(again.first(), Some(&(a, None)));
+
+    // A label is a few words, and more is refused.
+    let long = vec![b'x'; 1025];
+    let refused = soon(journal.label(b, &long)).await.unwrap_err();
+    assert!(refused.to_string().contains("1025 bytes"), "{refused}");
+    assert_eq!(soon(journal.label(b, &long[..1024])).await, Ok(()));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_file_the_journal_makes_is_its_owners_alone() {

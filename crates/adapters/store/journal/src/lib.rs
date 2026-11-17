@@ -63,6 +63,7 @@ use waveport_ports::journal::{
 };
 
 pub use crate::token::{NotAToken, ResumeToken};
+pub use crate::writer::Labelled;
 use crate::writer::{Request, Settings, Writer, prepare};
 
 /// How a journal works.
@@ -530,6 +531,42 @@ impl LocalJournal {
     ) -> impl Future<Output = Result<(), JournalError>> + Send + use<> {
         let (reply, answer) = oneshot::channel();
         let sent = self.send(Request::Forget { session, reply });
+        answered(sent, answer)
+    }
+
+    /// Keeps `label` with `session`, in place of the label before: what
+    /// whoever keeps sessions here has to know of one to go on with it,
+    /// such as which agent it is a session of. The journal does not
+    /// read it, and lets go of it with the session.
+    ///
+    /// # Errors
+    ///
+    /// The label is longer than 1,024 bytes, or the store failed.
+    pub fn label(
+        &self,
+        session: SessionId,
+        label: &[u8],
+    ) -> impl Future<Output = Result<(), JournalError>> + Send + use<> {
+        let (reply, answer) = oneshot::channel();
+        let sent = self.send(Request::Label {
+            session,
+            label: label.to_vec(),
+            reply,
+        });
+        answered(sent, answer)
+    }
+
+    /// The sessions the journal holds anything of, in the order of their
+    /// names, each with the label that is kept with it, if one is.
+    ///
+    /// # Errors
+    ///
+    /// The store failed.
+    pub fn labelled(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Labelled>, JournalError>> + Send + use<> {
+        let (reply, answer) = oneshot::channel();
+        let sent = self.send(Request::Labelled { reply });
         answered(sent, answer)
     }
 

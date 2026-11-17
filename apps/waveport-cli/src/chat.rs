@@ -208,9 +208,13 @@ impl Page {
                 self.begun |= activity != Activity::Listening;
                 self.activity = activity;
             }
-            // Nobody speaks in a chat, and facts that are no longer
-            // held were told when they were made.
-            SessionEvent::Told(_) | SessionEvent::Hearing { .. } | SessionEvent::Gap { .. } => {}
+            // Nobody speaks in a chat, facts that are no longer held
+            // were told when they were made, and the chat is followed
+            // from its facts and never from a state.
+            SessionEvent::Told(_)
+            | SessionEvent::Hearing { .. }
+            | SessionEvent::Gap { .. }
+            | SessionEvent::State { .. } => {}
         }
     }
 

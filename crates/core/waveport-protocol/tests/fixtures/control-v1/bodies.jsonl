@@ -1,10 +1,10 @@
 {"a":"create_session","body":{"agent":"bakery"}}
 {"a":"session_created","body":{"session":"0000000000000000000000000000002a","client_token":"wpc1_madeup","connect_within_ms":60000}}
 {"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"running","mode":"voice","life":1,"next_seq":42}}
-{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"waiting","life":1,"next_seq":1}}
+{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"waiting"}}
 {"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"detached","mode":"voice","life":1,"next_seq":7}}
 {"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"ended","mode":"text","life":1,"next_seq":19}}
-{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"broken","life":1,"next_seq":12}}
+{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"broken"}}
 {"a":"sessions","body":{"sessions":[]}}
 {"a":"sessions","body":{"sessions":[{"session":"0000000000000000000000000000002a","agent":"bakery","state":"running","mode":"voice","life":1,"next_seq":42}]}}
 {"a":"input","body":{"type":"text","text":"What time do you close on Sundays?"}}

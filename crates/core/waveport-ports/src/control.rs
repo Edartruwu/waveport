@@ -21,6 +21,12 @@
 //! death of its process has to be told where the journal stood, and
 //! takes what it was told beyond that as not having happened.
 //!
+//! A follower that cannot go on from what it holds, because the facts it
+//! missed are no longer held or because it was told of an earlier life
+//! of the session, follows from the session's state instead: what the
+//! facts add up to, as of the last of them, and then what happens from
+//! there.
+//!
 //! Starting a session is not here. What a session is made of is decided
 //! where the parts are put together, and a port cannot name that yet.
 
@@ -115,6 +121,16 @@ pub enum SessionEvent {
         /// The number of the first fact that follows.
         resumes: Seq,
     },
+    /// What the session's facts add up to, as of one of them. It is the
+    /// first thing told to a follower that asked for it
+    /// ([`SessionControl::subscribe_from_state`]), and takes the place
+    /// of whatever that follower held.
+    State {
+        /// The number of the last fact the state includes.
+        upto: Seq,
+        /// The state, as the journal holds one.
+        state: Bytes,
+    },
 }
 
 /// Why something could not be asked of a session.
@@ -170,5 +186,19 @@ pub trait SessionControl: Send + Sync + 'static {
         &self,
         session: SessionId,
         from: Seq,
+    ) -> Result<Pin<Box<dyn EventRx>>, ControlError>;
+
+    /// Follows a session from what it is now. The follower is told the
+    /// session's state first ([`SessionEvent::State`]), as of the last
+    /// fact there is, and then what happens from there. It is for a
+    /// follower that cannot go on from what it holds: one that was told
+    /// of a gap, or of an earlier life of the session.
+    ///
+    /// # Errors
+    ///
+    /// The session is not running here, or has no room for the request.
+    fn subscribe_from_state(
+        &self,
+        session: SessionId,
     ) -> Result<Pin<Box<dyn EventRx>>, ControlError>;
 }

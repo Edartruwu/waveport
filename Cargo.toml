@@ -104,6 +104,10 @@ waveport-transport-websocket = { path = "crates/adapters/transport/websocket", v
 waveport-tts-cartesia = { path = "crates/adapters/tts/cartesia", version = "0.1.0" }
 waveport-tts-elevenlabs = { path = "crates/adapters/tts/elevenlabs", version = "0.1.0" }
 
+# The daemon's routes and the bodies of its event streams. Its own
+# server is left out: the daemon serves each connection with hyper, so
+# that it can say how long the head of a request may take to arrive.
+axum = { version = "0.8.9", default-features = false }
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", default-features = false }
@@ -111,6 +115,8 @@ cpal = "0.18.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 # The entropy of the operating system, for a token nobody can guess.
 getrandom = "0.4.3"
+hyper = { version = "1.12.0", default-features = false }
+hyper-util = { version = "0.1.21", default-features = false }
 # The time where the machine is, for a tool that tells it. The time zones
 # are the system's own, and on Windows, which has none of that kind, they
 # come with the crate.

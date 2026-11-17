@@ -160,7 +160,9 @@ async fn sessions_are_started_driven_followed_and_closed() {
             }
             SessionEvent::Told(ClientEvent::Lifecycle(Lifecycle::Closed)) => closed = true,
             SessionEvent::Told(_) | SessionEvent::Said { .. } | SessionEvent::Hearing { .. } => {}
-            SessionEvent::Gap { .. } => panic!("nothing was asked for that is not held"),
+            SessionEvent::Gap { .. } | SessionEvent::State { .. } => {
+                panic!("nothing was asked for that is not held")
+            }
         }
     }
     assert!(closed);
@@ -239,6 +241,158 @@ async fn a_session_that_panics_takes_nothing_else_with_it() {
         facts += usize::from(matches!(event, SessionEvent::Fact { .. }));
     }
     assert!(facts >= 2, "{facts}");
+}
+
+#[tokio::test]
+async fn a_runtime_that_is_drained_starts_nothing_and_waits_for_what_it_has() {
+    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()).unwrap());
+    let (compute, journal) = (compute(), MemoryJournal::new());
+    let tools = ScriptedTools::none;
+    let (a, b) = (SessionId(0xA), SessionId(0xB));
+    let first = runtime
+        .start(
+            spec(0xA),
+            parts(&compute, &journal, tools()),
+            DefaultPolicies::default(),
+        )
+        .await
+        .unwrap();
+    let second = runtime
+        .start(
+            spec(0xB),
+            parts(&compute, &journal, tools()),
+            DefaultPolicies::default(),
+        )
+        .await
+        .unwrap();
+
+    // Each says where it stands: its caller has joined, which is its
+    // first fact, and nothing is under way.
+    let rests = |id| runtime.status(id).is_some_and(|status| status.at_rest);
+    for _ in 0..400 {
+        if runtime.at_rest() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(runtime.at_rest());
+    assert!(rests(a) && rests(b));
+    assert_eq!(runtime.status(a).unwrap().next_seq, Seq(2));
+    assert_eq!(runtime.status(SessionId(0xC)), None);
+    // One is asked something. From then on it has an answer under way,
+    // and the other still rests.
+    let typed = SessionInput::Text {
+        who: CALLER,
+        text: "What is on the list?".to_owned(),
+    };
+    runtime.send(b, typed).unwrap();
+    for _ in 0..400 {
+        if !rests(b) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!rests(b) && rests(a));
+    assert!(!runtime.at_rest());
+    assert!(runtime.status(b).unwrap().next_seq > Seq(2));
+
+    // Nothing ends by itself: when the patience is over, both still run.
+    assert_eq!(runtime.drain(Duration::from_millis(50)).await, 2);
+    // And nothing is started any more.
+    let refused = runtime
+        .start(
+            spec(0xC),
+            parts(&compute, &journal, tools()),
+            DefaultPolicies::default(),
+        )
+        .await;
+    assert!(matches!(refused, Err(SpawnError::Stopped)), "{refused:?}");
+    assert_eq!(runtime.sessions(), 2);
+
+    // Whoever drains says what becomes of the sessions. These are asked
+    // to end while they are waited for, one after the other.
+    let waiting = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.drain(Duration::from_secs(20)).await })
+    };
+    runtime.send(a, SessionInput::Close).unwrap();
+    assert_eq!(exit(first).await, Exit::Ended(Ended::Closed));
+    assert!(!waiting.is_finished(), "one session still runs");
+    runtime.send(b, SessionInput::Close).unwrap();
+    assert_eq!(exit(second).await, Exit::Ended(Ended::Closed));
+    assert_eq!(waiting.await.unwrap(), 0);
+    // A runtime nothing runs on is drained at once.
+    assert_eq!(runtime.drain(Duration::from_secs(20)).await, 0);
+}
+
+#[tokio::test]
+async fn a_session_says_which_of_its_lives_it_is_in_and_is_followed_from_what_it_is() {
+    let (compute, journal) = (compute(), MemoryJournal::new());
+    let id = SessionId(0xE);
+    let runtime = Runtime::new(RuntimeConfig::default()).unwrap();
+    let first = runtime
+        .start(
+            spec(0xE),
+            parts(&compute, &journal, ScriptedTools::none()),
+            DefaultPolicies::default(),
+        )
+        .await
+        .unwrap();
+    assert!(first.rebuilt.is_none());
+    let text = "One moment.".to_owned();
+    runtime.send(id, SessionInput::Say { text }).unwrap();
+    let mut following = runtime.subscribe(id, Seq(1)).unwrap();
+    let mut seen = 0;
+    while seen < 2 {
+        if let Some(SessionEvent::Fact { seq, .. }) = next(&mut following).await {
+            seen = seen.max(seq.get());
+        }
+    }
+    // The runtime stops under the session, as a process that dies does.
+    let before = first.lease;
+    drop(runtime);
+    assert_eq!(exit(first).await, Exit::Stopped);
+
+    // The session is gone on with, by another owner: a later life.
+    let runtime = Runtime::new(RuntimeConfig::default()).unwrap();
+    let second = runtime
+        .start(
+            spec(0xE),
+            parts(&compute, &journal, ScriptedTools::none()),
+            DefaultPolicies::default(),
+        )
+        .await
+        .unwrap();
+    assert!(second.rebuilt.is_some());
+    assert!(second.lease > before, "{:?} after {before:?}", second.lease);
+
+    // Whoever was told of the earlier life follows from what the session
+    // is now: its state first, as the journal holds one, and then every
+    // fact after it and none before.
+    let mut following = runtime.subscribe_from_state(id).unwrap();
+    let Some(SessionEvent::State { upto, state }) = next(&mut following).await else {
+        panic!("a state comes first");
+    };
+    // The state is as of the last fact the session has made, which may
+    // be one its journal does not have yet.
+    assert!(upto.get() >= 1, "{upto}");
+    let (snapshot, _) = waveport_runtime::codec::decode_state(&state).unwrap();
+    assert_eq!(snapshot.next_seq(), upto.next());
+    let text = "Still here.".to_owned();
+    runtime.send(id, SessionInput::Say { text }).unwrap();
+    runtime.send(id, SessionInput::Close).unwrap();
+    assert_eq!(exit(second).await, Exit::Ended(Ended::Closed));
+    let mut numbers = Vec::new();
+    while let Some(event) = next(&mut following).await {
+        match event {
+            SessionEvent::Fact { seq, .. } => numbers.push(seq.get()),
+            SessionEvent::State { .. } | SessionEvent::Gap { .. } => panic!("{event:?}"),
+            _ => {}
+        }
+    }
+    let last = journal.records(id).len() as u64;
+    assert_eq!(numbers, (upto.get() + 1..=last).collect::<Vec<u64>>());
+    assert!(numbers.len() >= 2, "{numbers:?}");
 }
 
 #[tokio::test]

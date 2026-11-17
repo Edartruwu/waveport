@@ -333,19 +333,7 @@ impl AgentSpec {
     /// the text held is not repeated: somebody may have written a key
     /// into it.
     pub fn from_toml(text: &str) -> Result<Self, Failure> {
-        let spec: Self = toml::from_str(text).map_err(|error| {
-            // Only what is wrong and where: the usual message of the
-            // parser quotes the line, and the line may hold a key.
-            let line = error.span().map_or(0, |span| {
-                let before = text.get(..span.start).unwrap_or(text);
-                before.bytes().filter(|byte| *byte == b'\n').count() + 1
-            });
-            Failure(format!(
-                "the agent's definition cannot be read, at line {line}: {}",
-                error.message()
-            ))
-        })?;
-        spec.checked()
+        read_toml::<Self>(text, "the agent's definition")?.checked()
     }
 
     /// The agent, if what it says holds together.
@@ -378,6 +366,28 @@ pub enum Keeps {
     Memory,
 }
 
+/// Reads `text` as the TOML of a `T`, which is called `what` in a
+/// failure.
+///
+/// # Errors
+///
+/// The text is not TOML, or not that of a `T`. The failure says what is
+/// wrong and at which line, and does not repeat what the text held:
+/// somebody may have written a key into it, and the parser's own message
+/// quotes the line.
+pub fn read_toml<T: serde::de::DeserializeOwned>(text: &str, what: &str) -> Result<T, Failure> {
+    toml::from_str(text).map_err(|error| {
+        let line = error.span().map_or(0, |span| {
+            let before = text.get(..span.start).unwrap_or(text);
+            before.bytes().filter(|byte| *byte == b'\n').count() + 1
+        });
+        Failure(format!(
+            "{what} cannot be read, at line {line}: {}",
+            error.message()
+        ))
+    })
+}
+
 /// What the settings of a stack are called where they were given, so
 /// that a failure about one of them says what to change: an option of a
 /// command line, or a line of a file.
@@ -400,6 +410,9 @@ pub struct Named {
 /// and metrics go.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StackSpec {
+    /// How many threads sessions run on. Each session stays on the one
+    /// it was started on.
+    pub shards: usize,
     /// Where sessions are kept.
     pub keeps: Keeps,
     /// How many records of a session are written before all that it has

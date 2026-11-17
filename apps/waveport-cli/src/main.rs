@@ -30,10 +30,12 @@ mod summary;
 use std::process::ExitCode;
 
 use clap::Parser;
-use waveport_assembly::{Context, Failure};
+use waveport_assembly::halt::Halt;
+use waveport_assembly::spec::Keeps;
+use waveport_assembly::{Context, Failure, Kept};
 use waveport_transport_local_audio::{Choice, LocalAudio, Options, devices};
 
-use crate::args::{Cli, Command, Dev, Run};
+use crate::args::{Calls, Cli, Command, Dev, Run, SAID};
 use crate::call::Outcome;
 
 fn main() -> ExitCode {
@@ -62,6 +64,7 @@ async fn command(command: Command) -> Result<Outcome, Failure> {
         Command::Serve(serve) => serve::serve(serve).await,
         Command::Client(client) => client::call(client).await,
         Command::Chat(chat) => chat::chat(chat).await,
+        Command::Calls(calls) => list_calls(&calls).await,
         Command::Devices => list_devices(),
     }
 }
@@ -107,6 +110,33 @@ async fn scripted(run: Run) -> Result<Outcome, Failure> {
         println!("recorded {millis} ms to {}", file.display());
     }
     Ok(outcome)
+}
+
+/// Lists the calls that broke off and are kept.
+async fn list_calls(calls: &Calls) -> Result<Outcome, Failure> {
+    let file = &calls.journal;
+    // A file that is not there holds nothing, and is not made to say
+    // so.
+    if !file.exists() {
+        println!("no call is kept: there is no {}", file.display());
+        return Ok(Outcome::Ended);
+    }
+    let (kept, _) = Kept::open(&Keeps::File(file.clone()), &SAID, &Halt::Nowhere, true)?;
+    let calls = kept.labelled().await?;
+    match calls.len() {
+        0 => println!("no call is kept in {}", file.display()),
+        1 => println!("1 call that broke off is kept in {}", file.display()),
+        many => println!("{many} calls that broke off are kept in {}", file.display()),
+    }
+    for (call, label) in calls {
+        // What is kept with a call says whose it is, where somebody
+        // said: a daemon keeps the name of the agent.
+        match label {
+            Some(label) => println!("{call}  {label}"),
+            None => println!("{call}"),
+        }
+    }
+    Ok(Outcome::Ended)
 }
 
 /// Lists the sound devices of this machine.
