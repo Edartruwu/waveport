@@ -33,6 +33,7 @@ pub mod tools;
 
 use core::fmt;
 
+pub use waveport_runtime::pinning;
 pub use waveport_store_journal::ResumeToken;
 
 pub use crate::kept::{Kept, Resume};

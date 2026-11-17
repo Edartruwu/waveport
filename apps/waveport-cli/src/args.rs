@@ -406,6 +406,7 @@ impl Agent {
         };
         StackSpec {
             shards: 1,
+            pinning: None,
             keeps,
             state_every: self.state_every,
             notes: self.notes.clone(),

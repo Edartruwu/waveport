@@ -29,6 +29,10 @@ serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
+# A shard's thread is kept on a processor on Linux alone (decision 0003).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["std", "thread"] }
+
 [dev-dependencies]
 waveport-kernel-sim = { workspace = true }
 waveport-sim = { workspace = true }

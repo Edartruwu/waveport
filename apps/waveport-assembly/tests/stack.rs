@@ -44,6 +44,7 @@ fn assets() -> PathBuf {
 async fn stack(assets: PathBuf) -> Stack {
     let spec = StackSpec {
         shards: 1,
+        pinning: None,
         keeps: Keeps::Memory,
         state_every: 256,
         notes: None,
@@ -260,6 +261,7 @@ async fn what_cannot_be_had_is_said_as_whoever_gave_the_settings_calls_it() {
     // A collector at an address that is none.
     let spec = StackSpec {
         shards: 1,
+        pinning: None,
         keeps: Keeps::Memory,
         state_every: 256,
         notes: None,

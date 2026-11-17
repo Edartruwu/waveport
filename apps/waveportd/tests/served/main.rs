@@ -19,6 +19,7 @@ mod far_end;
 
 mod asked;
 mod kept;
+mod placed;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;

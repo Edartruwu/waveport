@@ -163,6 +163,15 @@ allowed_origins = ["https://app.example"]  # the pages that may ask from a brows
 key_env = ["WAVEPORTD_KEY"]                # the environment variable that holds the key
 ```
 
+Sessions run on threads of their own, the shards. On Linux each can be given a processor of its own, and every other thread of the daemon is then kept off those:
+
+```toml
+shards = 2
+processors = [2, 3]    # one for each shard, by the system's number for it
+```
+
+Nothing is kept anywhere unless the file says where: only whoever runs the machine knows which processors are whose ([decision 0003](docs/decisions/0003-shard-pinning.md)).
+
 It serves HTTP without TLS, and is to stand behind something that ends TLS. `waveportd --config <file> --check` reads a file and says what is wrong with it.
 
 ## Licence

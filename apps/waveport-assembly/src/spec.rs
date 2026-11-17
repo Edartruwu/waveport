@@ -29,6 +29,7 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use waveport_runtime::pinning::Pinning;
 
 use crate::Failure;
 
@@ -413,6 +414,11 @@ pub struct StackSpec {
     /// How many threads sessions run on. Each session stays on the one
     /// it was started on.
     pub shards: usize,
+    /// The processor each of those threads is kept on, if they are kept
+    /// anywhere, and the processors of the other threads of the process.
+    /// Whoever made it has kept the thread that starts the others off
+    /// the first already ([`Pinning::keep_off`]).
+    pub pinning: Option<Pinning>,
     /// Where sessions are kept.
     pub keeps: Keeps,
     /// How many records of a session are written before all that it has

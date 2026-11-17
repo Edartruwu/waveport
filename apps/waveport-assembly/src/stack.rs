@@ -165,6 +165,7 @@ impl Stack {
         notes.extend(kept.earlier().await);
         let config = RuntimeConfig {
             shards: spec.shards,
+            pinning: spec.pinning.clone(),
             ..RuntimeConfig::default()
         };
         let runtime = Arc::new(Runtime::new(config).with(|| "no session can run".to_owned())?);

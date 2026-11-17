@@ -35,6 +35,16 @@
 //! was pointed at it is not its name. A daemon that listens anywhere
 //! else does not start without a key.
 //!
+//! # Where its threads run
+//!
+//! Sessions run on threads of their own, the shards, and each session
+//! stays on the one it was started on. A daemon can be told a processor
+//! for each shard (`processors`, on Linux). The thread of a shard is
+//! then kept on its processor, and every other thread of the daemon off
+//! all of them ([`Threads`]). Nothing is kept anywhere unless the file
+//! says where: only whoever runs the machine knows which processors are
+//! whose.
+//!
 //! # Stopping
 //!
 //! A daemon that is told to stop starts nothing more, lets the answers
@@ -49,6 +59,8 @@ mod daemon;
 mod events;
 mod http;
 mod serve;
+mod threads;
 
 pub use crate::config::Config;
 pub use crate::daemon::{Daemon, Running};
+pub use crate::threads::Threads;

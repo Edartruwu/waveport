@@ -11,7 +11,9 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use waveport_assembly::stack::name;
-use waveport_assembly::{Agent, Context as _, Failure, ResumeToken, Settled, Stack, Told};
+use waveport_assembly::{
+    Agent, Context as _, Failure, ResumeToken, Settled, Stack, StackSpec, Told,
+};
 use waveport_ports::control::SessionInput;
 use waveport_ports::journal::SessionId;
 use waveport_ports::plan::SessionPlan;
@@ -22,6 +24,7 @@ use waveport_protocol::control::v1::{
 
 use crate::auth::{Gate, Keys, Tickets};
 use crate::config::{Config, Limits};
+use crate::threads::Threads;
 use crate::{http, serve};
 
 /// How long the connections that are open have to close once the daemon
@@ -396,8 +399,16 @@ impl Daemon {
     /// Something `config` names cannot be had: a control key, the file
     /// sessions are kept in, a part of an agent, or the address. A
     /// daemon that is to listen beyond this machine and has no control
-    /// key is not started.
-    pub async fn start(config: &Config) -> Result<Running, Failure> {
+    /// key is not started, and neither is one whose `threads` were
+    /// placed for another configuration.
+    pub async fn start(config: &Config, threads: &Threads) -> Result<Running, Failure> {
+        if !threads.are_of(config) {
+            return Err(Failure(
+                "the threads of the daemon were not placed as `processors` says: that is done \
+                 before any other thread is started"
+                    .to_owned(),
+            ));
+        }
         let keys = Keys::from_env(&config.control.key_env)?;
         if keys.is_empty() && !config.listen.ip().is_loopback() {
             return Err(Failure(format!(
@@ -406,8 +417,13 @@ impl Daemon {
                 config.listen
             )));
         }
-        let stack = Stack::build(&config.stack(), true).await?;
+        let spec = StackSpec {
+            pinning: threads.pinning().cloned(),
+            ..config.stack()
+        };
+        let stack = Stack::build(&spec, true).await?;
         let mut notes = stack.notes.clone();
+        notes.extend(threads.note());
         let mut agents = BTreeMap::new();
         for (name, spec) in &config.agents {
             let agent = stack

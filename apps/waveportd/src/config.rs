@@ -52,6 +52,14 @@ pub struct Config {
     /// How many threads sessions run on.
     #[serde(default = "one")]
     pub shards: usize,
+    /// The processor each of those threads is kept on, one for each in
+    /// their order, by the number the system has for it (as `taskset
+    /// -c` takes it). Every other thread of the daemon is then kept off
+    /// those processors. Left out, the system has the threads where it
+    /// likes. On Linux only: anywhere else a daemon that is told this
+    /// does not start.
+    #[serde(default)]
+    pub processors: Vec<usize>,
     /// Where the models that listen are, for the agents that hear.
     #[serde(default = "assets")]
     pub assets: PathBuf,
@@ -219,7 +227,8 @@ impl Config {
     /// # Errors
     ///
     /// There is no agent, an agent has a name that is none, there are
-    /// more than two control keys, or a number is one that cannot be.
+    /// more than two control keys, a number is one that cannot be, or
+    /// the shards do not have a processor each.
     pub fn checked(mut self) -> Result<Self, Failure> {
         if self.agents.is_empty() {
             return Err(Failure(
@@ -260,14 +269,34 @@ impl Config {
                     .to_owned(),
             ));
         }
+        if !self.processors.is_empty() && self.processors.len() != self.shards {
+            return Err(Failure(format!(
+                "`processors` names {} for {} `shards`: each shard has one",
+                self.processors.len(),
+                self.shards
+            )));
+        }
+        let mut named = self.processors.clone();
+        named.sort_unstable();
+        if let Some(twice) = named.windows(2).find_map(|pair| match pair {
+            [one, other] if one == other => Some(*one),
+            _ => None,
+        }) {
+            return Err(Failure(format!(
+                "`processors` names processor {twice} for two shards"
+            )));
+        }
         Ok(self)
     }
 
-    /// What the agents of the daemon share.
+    /// What the agents of the daemon share. Where its threads run is
+    /// not in it: that is told by whoever placed them
+    /// ([`Threads`](crate::Threads)).
     #[must_use]
     pub fn stack(&self) -> StackSpec {
         StackSpec {
             shards: self.shards,
+            pinning: None,
             keeps: self.journal.file.clone().map_or(Keeps::Memory, Keeps::File),
             state_every: self.journal.state_every,
             notes: None,
@@ -292,6 +321,8 @@ mod tests {
         let config = Config::from_toml("[agents.front-desk]\n").unwrap();
         assert_eq!(config.listen, SocketAddr::from(([127, 0, 0, 1], 7070)));
         assert_eq!(config.shards, 1);
+        // Its threads are left to the system.
+        assert_eq!(config.processors, [] as [usize; 0]);
         assert_eq!(config.control.key_env, [] as [String; 0]);
         assert_eq!(config.limits, Limits::default());
         assert_eq!(config.limits.connect_within_ms, 60_000);
@@ -306,6 +337,7 @@ listen = "0.0.0.0:8443"
 hosts = ["voice.example"]
 allowed_origins = ["https://app.example"]
 shards = 4
+processors = [6, 7, 2, 3]
 assets = "/var/lib/waveport/assets"
 
 [control]
@@ -342,8 +374,11 @@ language = "es"
         assert_eq!(config.control.key_env.len(), 2);
         assert!(config.control.show_tool_text);
         assert_eq!(config.limits.drain_ms, 2_000);
+        // In the order of the shards.
+        assert_eq!(config.processors, [6, 7, 2, 3]);
         let stack = config.stack();
         assert_eq!(stack.shards, 4);
+        assert_eq!(stack.pinning, None);
         assert_eq!(
             stack.keeps,
             Keeps::File(PathBuf::from("/var/lib/waveport/sessions.redb"))
@@ -369,6 +404,19 @@ language = "es"
                 "more than two",
             ),
             ("shards = 0\n[agents.a]\n", "one at least"),
+            (
+                "shards = 2\nprocessors = [3]\n[agents.a]\n",
+                "`processors` names 1 for 2 `shards`",
+            ),
+            (
+                "processors = [3, 4]\n[agents.a]\n",
+                "`processors` names 2 for 1 `shards`",
+            ),
+            (
+                "shards = 3\nprocessors = [3, 1, 3]\n[agents.a]\n",
+                "names processor 3 for two shards",
+            ),
+            ("processors = [-1]\n[agents.a]\n", "at line 1"),
             ("[limits]\nkeep_alive_ms = 0\n[agents.a]\n", "one at least"),
             (
                 "[agents.a]\ninstructions = \"x\"\ninstructions_file = \"y\"\n",
