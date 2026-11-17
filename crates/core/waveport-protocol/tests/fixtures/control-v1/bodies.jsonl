@@ -1,0 +1,20 @@
+{"a":"create_session","body":{"agent":"bakery"}}
+{"a":"session_created","body":{"session":"0000000000000000000000000000002a","client_token":"wpc1_madeup","connect_within_ms":60000}}
+{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"running","mode":"voice","life":1,"next_seq":42}}
+{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"waiting","life":1,"next_seq":1}}
+{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"detached","mode":"voice","life":1,"next_seq":7}}
+{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"ended","mode":"text","life":1,"next_seq":19}}
+{"a":"session_info","body":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"broken","life":1,"next_seq":12}}
+{"a":"sessions","body":{"sessions":[]}}
+{"a":"sessions","body":{"sessions":[{"session":"0000000000000000000000000000002a","agent":"bakery","state":"running","mode":"voice","life":1,"next_seq":42}]}}
+{"a":"input","body":{"type":"text","text":"What time do you close on Sundays?"}}
+{"a":"input","body":{"type":"text","text":"She said \"wait\" — then:\n\t¿qué hora es? 🙂 \\","who":2}}
+{"a":"input","body":{"type":"say","text":"One moment, please."}}
+{"a":"input","body":{"type":"press","keys":"1#"}}
+{"a":"input","body":{"type":"interrupt"}}
+{"a":"input","body":{"type":"handoff","to":1,"context":"full"}}
+{"a":"input","body":{"type":"handoff","to":1,"context":{"summary":"The caller wants a refund."}}}
+{"a":"input","body":{"type":"handoff","to":2,"context":"none"}}
+{"a":"input","body":{"type":"close"}}
+{"a":"problem","body":{"status":404,"title":"Not Found","code":"no_session","detail":"no session of that name is running here"}}
+{"a":"problem","body":{"status":403,"title":"Forbidden","code":"forbidden"}}

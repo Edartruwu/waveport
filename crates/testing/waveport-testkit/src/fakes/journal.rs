@@ -16,6 +16,8 @@ use waveport_ports::journal::{
 struct Stored {
     lease: Lease,
     snapshot: Option<Snapshot>,
+    /// Every snapshot, from the first. A journal would keep the newest.
+    snapshots: Vec<Snapshot>,
     /// Every record, from the one numbered 1. A journal would let go of
     /// those a snapshot covers. This one keeps them for a test to look
     /// at, and gives a new owner only the ones after the snapshot.
@@ -124,6 +126,18 @@ impl MemoryJournal {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&session)
             .map_or_default(|stored| stored.records.clone())
+    }
+
+    /// Every snapshot ever stored of `session`, in order: also the ones
+    /// a later one has replaced, which a journal that is not for tests
+    /// would have let go of.
+    #[must_use]
+    pub fn snapshots(&self, session: SessionId) -> Vec<Snapshot> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&session)
+            .map_or_default(|stored| stored.snapshots.clone())
     }
 
     /// The newest snapshot stored of `session`, and how many records
@@ -240,6 +254,7 @@ impl Journal for MemoryJournal {
                     // an earlier snapshot has already replaced.
                     return Err(JournalError::OutOfOrder { expected: next });
                 }
+                stored.snapshots.push(snapshot.clone());
                 stored.snapshot = Some(snapshot);
                 Ok(())
             })

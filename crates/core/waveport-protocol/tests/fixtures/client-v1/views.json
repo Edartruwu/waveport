@@ -1,0 +1,118 @@
+[
+ {
+  "name": "a call from its first fact",
+  "messages": [
+   {"type":"fact","seq":1,"kind":"participant_joined","who":1},
+   {"type":"told","kind":"agent","agent":0,"activity":"listening"},
+   {"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},
+   {"type":"told","kind":"said","generation":1,"text":"We close at six on Sundays."},
+   {"type":"fact","seq":3,"kind":"utterance_progress","generation":1,"agent":0,"heard":"We close at six "},
+   {"type":"fact","seq":4,"kind":"utterance_progress","generation":1,"agent":0,"heard":"on Sundays."},
+   {"type":"fact","seq":5,"kind":"utterance_committed","generation":1,"agent":0,"text":"We close at six on Sundays.","truncated":false},
+   {"type":"fact","seq":6,"kind":"keys_committed","turn":2,"who":1,"keys":"4071"},
+   {"type":"fact","seq":7,"kind":"tool_called","call":1,"tool":"get_time","generation":2},
+   {"type":"fact","seq":8,"kind":"tool_sent","call":1,"attempt":0},
+   {"type":"fact","seq":9,"kind":"tool_finished","call":1,"outcome":"completed"},
+   {"type":"fact","seq":10,"kind":"utterance_progress","generation":3,"agent":0,"heard":"It is ten "},
+   {"type":"fact","seq":11,"kind":"cut_off","cause":"barge_in"},
+   {"type":"fact","seq":12,"kind":"utterance_committed","generation":3,"agent":0,"text":"It is ten ","truncated":true},
+   {"type":"fact","seq":13,"kind":"turn_dismissed","turn":3,"who":1,"reason":"backchannel"},
+   {"type":"fact","seq":15,"kind":"agent_activated","agent":1},
+   {"type":"fact","seq":16,"kind":"utterance_progress","generation":4,"agent":1,"heard":"Hello, "}
+  ],
+  "view": {"upto":16,"lifecycle":"running","agent":1,"participants":[1],"items":[{"kind":"turn","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},{"kind":"utterance","generation":1,"agent":0,"text":"We close at six on Sundays.","truncated":false},{"kind":"keys","turn":2,"who":1,"keys":"4071"},{"kind":"tool_call","call":1,"tool":"get_time","generation":2},{"kind":"tool_result","call":1,"outcome":"completed"},{"kind":"utterance","generation":3,"agent":0,"text":"It is ten ","truncated":true}],"speech":{"generation":4,"agent":1,"heard":"Hello, "}},
+  "behind": false
+ },
+ {
+  "name": "the same call for a client that was away from the sixth fact to the twelfth",
+  "messages": [
+   {"type":"fact","seq":1,"kind":"participant_joined","who":1},
+   {"type":"told","kind":"agent","agent":0,"activity":"listening"},
+   {"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},
+   {"type":"told","kind":"said","generation":1,"text":"We close at six on Sundays."},
+   {"type":"fact","seq":3,"kind":"utterance_progress","generation":1,"agent":0,"heard":"We close at six "},
+   {"type":"fact","seq":4,"kind":"utterance_progress","generation":1,"agent":0,"heard":"on Sundays."},
+   {"type":"fact","seq":5,"kind":"utterance_committed","generation":1,"agent":0,"text":"We close at six on Sundays.","truncated":false},
+   {"type":"gap","resumes":13},
+   {"type":"state","upto":12,"lifecycle":"running","agent":0,"participants":[1],"items":[{"kind":"turn","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},{"kind":"utterance","generation":1,"agent":0,"text":"We close at six on Sundays.","truncated":false},{"kind":"keys","turn":2,"who":1,"keys":"4071"},{"kind":"tool_call","call":1,"tool":"get_time","generation":2},{"kind":"tool_result","call":1,"outcome":"completed"},{"kind":"utterance","generation":3,"agent":0,"text":"It is ten ","truncated":true}]},
+   {"type":"fact","seq":13,"kind":"turn_dismissed","turn":3,"who":1,"reason":"backchannel"},
+   {"type":"fact","seq":15,"kind":"agent_activated","agent":1},
+   {"type":"fact","seq":16,"kind":"utterance_progress","generation":4,"agent":1,"heard":"Hello, "}
+  ],
+  "view": {"upto":16,"lifecycle":"running","agent":1,"participants":[1],"items":[{"kind":"turn","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},{"kind":"utterance","generation":1,"agent":0,"text":"We close at six on Sundays.","truncated":false},{"kind":"keys","turn":2,"who":1,"keys":"4071"},{"kind":"tool_call","call":1,"tool":"get_time","generation":2},{"kind":"tool_result","call":1,"outcome":"completed"},{"kind":"utterance","generation":3,"agent":0,"text":"It is ten ","truncated":true}],"speech":{"generation":4,"agent":1,"heard":"Hello, "}},
+  "behind": false
+ },
+ {
+  "name": "a fact that is sent again changes nothing",
+  "messages": [
+   {"type":"fact","seq":1,"kind":"participant_joined","who":1},
+   {"type":"told","kind":"agent","agent":0,"activity":"listening"},
+   {"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},
+   {"type":"told","kind":"said","generation":1,"text":"We close at six on Sundays."},
+   {"type":"fact","seq":3,"kind":"utterance_progress","generation":1,"agent":0,"heard":"We close at six "},
+   {"type":"fact","seq":1,"kind":"participant_joined","who":1},
+   {"type":"told","kind":"agent","agent":0,"activity":"listening"},
+   {"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},
+   {"type":"told","kind":"said","generation":1,"text":"We close at six on Sundays."},
+   {"type":"fact","seq":3,"kind":"utterance_progress","generation":1,"agent":0,"heard":"We close at six "},
+   {"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true}
+  ],
+  "view": {"upto":3,"lifecycle":"running","agent":0,"participants":[1],"items":[{"kind":"turn","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true}],"speech":{"generation":1,"agent":0,"heard":"We close at six "}},
+  "behind": false
+ },
+ {
+  "name": "a client that was told of a gap is behind until the state comes",
+  "messages": [
+   {"type":"fact","seq":1,"kind":"participant_joined","who":1},
+   {"type":"told","kind":"agent","agent":0,"activity":"listening"},
+   {"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},
+   {"type":"gap","resumes":13}
+  ],
+  "view": {"upto":2,"lifecycle":"running","agent":0,"participants":[1],"items":[{"kind":"turn","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true}]},
+  "behind": true
+ },
+ {
+  "name": "a session that was rebuilt never did what its client was told last",
+  "messages": [
+   {"type":"fact","seq":1,"kind":"participant_joined","who":1},
+   {"type":"told","kind":"agent","agent":0,"activity":"listening"},
+   {"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},
+   {"type":"told","kind":"said","generation":1,"text":"We close at six on Sundays."},
+   {"type":"fact","seq":3,"kind":"utterance_progress","generation":1,"agent":0,"heard":"We close at six "},
+   {"type":"fact","seq":4,"kind":"utterance_progress","generation":1,"agent":0,"heard":"on Sundays."},
+   {"type":"fact","seq":5,"kind":"utterance_committed","generation":1,"agent":0,"text":"We close at six on Sundays.","truncated":false},
+   {"type":"gap","resumes":4},
+   {"type":"state","upto":3,"lifecycle":"running","agent":0,"participants":[1],"items":[{"kind":"turn","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true}],"speech":{"generation":1,"agent":0,"heard":"We close at six "}},
+   {"type":"fact","seq":4,"kind":"cut_off","cause":"recovery"},
+   {"type":"fact","seq":5,"kind":"utterance_committed","generation":1,"agent":0,"text":"We close at six ","truncated":true}
+  ],
+  "view": {"upto":5,"lifecycle":"running","agent":0,"participants":[1],"items":[{"kind":"turn","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true},{"kind":"utterance","generation":1,"agent":0,"text":"We close at six ","truncated":true}]},
+  "behind": false
+ },
+ {
+  "name": "a session that ends keeps why",
+  "messages": [
+   {"type":"fact","seq":1,"kind":"participant_joined","who":1},
+   {"type":"fact","seq":2,"kind":"participant_joined","who":2},
+   {"type":"fact","seq":3,"kind":"participant_joined","who":1},
+   {"type":"fact","seq":4,"kind":"lifecycle_changed","to":"draining"},
+   {"type":"fact","seq":5,"kind":"participant_left","who":1},
+   {"type":"fact","seq":6,"kind":"lifecycle_changed","to":"closing","reason":"requested"},
+   {"type":"bye","reason":"ended"},
+   {"type":"fact","seq":7,"kind":"lifecycle_changed","to":"closed"}
+  ],
+  "view": {"upto":7,"lifecycle":"closed","closed_for":"requested","agent":0,"participants":[2],"items":[]},
+  "behind": false
+ },
+ {
+  "name": "what a client does not know leaves what it holds as it was",
+  "messages": [
+   {"type":"fact","seq":1,"kind":"participant_joined","who":1},
+   {"type":"fact","seq":2,"kind":"turn_transcribed","turn":1,"text":"later"},
+   {"type":"metrics","cpu":0.5},
+   {"type":"told","kind":"audio_level","who":1,"level":0.25}
+  ],
+  "view": {"upto":2,"lifecycle":"running","agent":0,"participants":[1],"items":[]},
+  "behind": false
+ }
+]

@@ -1,0 +1,6 @@
+{"a":"input","given":{"type":"send_file","name":"a.pdf"},"is":{"type":"unknown"}}
+{"a":"input","given":{"type":"handoff","to":1},"is":{"type":"handoff","to":1,"context":"full"}}
+{"a":"input","given":{"text":"hello","type":"say","voice":"a"},"is":{"type":"say","text":"hello"}}
+{"a":"session_info","given":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"parked","mode":"video","life":2,"next_seq":3,"node":"eu-1"},"is":{"session":"0000000000000000000000000000002a","agent":"bakery","state":"unknown","mode":"unknown","life":2,"next_seq":3}}
+{"a":"create_session","given":{"agent":"bakery","metadata":{"order":7}},"is":{"agent":"bakery"}}
+{"a":"problem","given":{"type":"about:blank","status":429,"title":"Too Many Requests","code":"quota"},"is":{"status":429,"title":"Too Many Requests","code":"unknown"}}

@@ -1,0 +1,6 @@
+{"given":{"type":"text","text":""},"why":"text","code":"malformed"}
+{"given":{"type":"say","text":"  "},"why":"text","code":"malformed"}
+{"given":{"type":"handoff","to":1,"context":{"summary":""}},"why":"text","code":"malformed"}
+{"given":{"type":"press","keys":"one"},"why":"keys","code":"malformed"}
+{"given":{"type":"press","keys":""},"why":"keys","code":"malformed"}
+{"given":{"type":"send_file","name":"a.pdf"},"why":"unknown","code":"unknown_message"}
