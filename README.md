@@ -43,7 +43,8 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/adapters/transport/websocket` | A far end that connects over a WebSocket, and the client for it. For this machine and networks that are trusted |
 | `crates/adapters/store/memory` | A journal that lasts as long as its process |
 | `crates/adapters/store/journal` | A journal in a file on this machine, from which a session goes on after its process died |
-| `apps/waveport-cli` | The `waveport` command, where the parts are put together |
+| `apps/waveport-assembly` | What an agent is made of, as one definition, and a session put together from it. Whatever runs agents does it here |
+| `apps/waveport-cli` | The `waveport` command: an agent defined on a command line, at this machine's sound devices, over a WebSocket or in writing |
 | `crates/testing/waveport-sim` | Deterministic simulation: seeded runs with a virtual clock |
 | `crates/testing/waveport-kernel-sim` | The session kernel under test: scenarios explored along every path, random sessions, every path through small sessions, and recorded sessions replayed, with the invariants checked at every step |
 | `crates/testing/waveport-alloc-counter` | Counting allocator, to prove a code path does not allocate |

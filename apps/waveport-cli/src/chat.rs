@@ -19,6 +19,7 @@ use std::io::{IsTerminal as _, Write as _};
 
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::time::Instant;
+use waveport_assembly::Told;
 use waveport_domain::command::{Activity, ClientEvent};
 use waveport_domain::fact::Fact;
 use waveport_domain::ids::{GenId, Seq};
@@ -32,7 +33,7 @@ use waveport_runtime::shard::Exit;
 
 use crate::Failure;
 use crate::args::Chat;
-use crate::call::{self, Outcome, Stack, Told};
+use crate::call::{self, Outcome, Setup};
 use crate::report::Reporter;
 
 /// How long the agent has to have had nothing to do before a line that
@@ -245,8 +246,8 @@ async fn until(at: Option<Instant>) {
 
 /// Runs a chat with whoever types, and shows it as it goes.
 pub(crate) async fn chat(args: Chat) -> Result<Outcome, Failure> {
-    let stack = Stack::build(&args.agent, None, args.resume.is_some()).await?;
-    for note in &stack.notes {
+    let stack = Setup::build(&args.agent, None, args.resume.is_some()).await?;
+    for note in stack.notes() {
         println!("note: {note}");
     }
     let id = stack.call_to_run(args.resume.as_ref()).await?;
@@ -254,7 +255,7 @@ pub(crate) async fn chat(args: Chat) -> Result<Outcome, Failure> {
     for note in &call.notes {
         println!("note: {note}");
     }
-    println!("{}", call.begins());
+    println!("{}", call::begins(&call));
 
     let typed_here = std::io::stdin().is_terminal();
     let mut page = Page::new(id, stack.tools(), typed_here, call.greeted);

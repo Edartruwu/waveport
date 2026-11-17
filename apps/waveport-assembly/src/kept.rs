@@ -1,11 +1,11 @@
-//! Where the calls of this command are kept.
+//! Where the sessions of a process are kept.
 //!
-//! In a file, unless the command line says otherwise: a call whose
-//! process died, or whose machine did, is gone on with from there. Next
-//! to the file is another that holds the token of the call that was last
-//! begun, which is what `--resume last` reads. A token is the right to
-//! take a call over, so that file is its owner's alone where the system
-//! has such a thing, and nothing prints a token.
+//! In a file, unless it is told otherwise: a session whose process died,
+//! or whose machine did, is gone on with from there. Next to the file is
+//! another that holds the token of the session that was last begun,
+//! which is what [`Resume::Last`] reads. A token is the right to take a
+//! session over, so that file is its owner's alone where the system has
+//! such a thing, and nothing prints a token.
 
 use core::time::Duration;
 use std::io::Write as _;
@@ -17,11 +17,31 @@ use waveport_ports::journal::{Journal, SessionId};
 use waveport_store_journal::{Config, LocalJournal, OpenError, ResumeToken};
 use waveport_store_memory::MemoryJournal;
 
-use crate::args::{Agent, JOURNAL, Resume};
 use crate::halt::Halt;
+use crate::spec::{JOURNAL, Keeps, Named};
 use crate::{Context, Failure};
 
-/// How long the command waits for a journal that another process has
+/// The session to go on with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resume {
+    /// The one that was last begun with the journal.
+    Last,
+    /// The one whose token this file holds.
+    File(PathBuf),
+}
+
+impl core::str::FromStr for Resume {
+    type Err = core::convert::Infallible;
+
+    fn from_str(said: &str) -> Result<Self, Self::Err> {
+        Ok(match said {
+            "last" => Self::Last,
+            file => Self::File(PathBuf::from(file)),
+        })
+    }
+}
+
+/// How long a process waits for a journal that another process has
 /// open, when it cannot do without it. A process that was killed has let
 /// go of the file by the time it is gone on most systems, and a moment
 /// later on some.
@@ -36,8 +56,8 @@ struct InFile {
     last: PathBuf,
 }
 
-/// Where calls are kept.
-pub(crate) struct Kept {
+/// Where sessions are kept.
+pub struct Kept {
     journal: Arc<dyn Journal>,
     file: Option<InFile>,
 }
@@ -86,37 +106,39 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 impl Kept {
-    /// Opens what `agent` says calls are kept in. Returns it, and what
-    /// whoever ran the command should know about it. `needed` is whether
-    /// the command cannot do without the file: it is to go on with a
-    /// call that is in it.
+    /// Opens what `keeps` says sessions are kept in. Returns it, and
+    /// what whoever runs the program should know about it. `needed` is
+    /// whether the program cannot do without the file: it is to go on
+    /// with a session that is in it. `said` is what the settings are
+    /// called, for a failure to say what to change.
     ///
-    /// A file that cannot be read is left as it is: the command stops,
-    /// and says which file it was.
-    pub(crate) fn open(
-        agent: &Agent,
+    /// # Errors
+    ///
+    /// The file cannot be opened. A file that cannot be read is left as
+    /// it is, and the failure says which file it was.
+    pub fn open(
+        keeps: &Keeps,
+        said: &Named,
         halt: &Halt,
         needed: bool,
     ) -> Result<(Self, Vec<String>), Failure> {
-        Self::open_within(agent, halt, needed, PATIENCE)
+        Self::open_within(keeps, said, halt, needed, PATIENCE)
     }
 
     /// As [`open`](Self::open), waiting no longer than `patience` for a
     /// file that another process has open.
     fn open_within(
-        agent: &Agent,
+        keeps: &Keeps,
+        said: &Named,
         halt: &Halt,
         needed: bool,
         patience: Duration,
     ) -> Result<(Self, Vec<String>), Failure> {
-        if agent.no_journal {
-            return Ok((Self::in_memory(), Vec::new()));
-        }
-        let named = agent.journal.is_some();
-        let path = agent
-            .journal
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(JOURNAL));
+        let (named, path) = match keeps {
+            Keeps::Memory => return Ok((Self::in_memory(), Vec::new())),
+            Keeps::File(path) => (true, path.clone()),
+            Keeps::Usual => (false, PathBuf::from(JOURNAL)),
+        };
         if !named && let Some(folder) = path.parent() {
             make_folder(folder).with(|| format!("{} cannot be made", folder.display()))?;
         }
@@ -154,15 +176,18 @@ impl Kept {
             Err(OpenError::InUse) if !named && !needed => {
                 let note = format!(
                     "another waveport has {} open: this one keeps its calls in memory, and one \
-                     that breaks off is gone (--journal names another file)",
-                    path.display()
+                     that breaks off is gone ({} names another file)",
+                    path.display(),
+                    said.journal
                 );
                 Ok((Self::in_memory(), vec![note]))
             }
             Err(error) => Err(Failure(format!(
                 "the calls kept in {} cannot be opened: {error}. The file was left as it is: \
-                 --journal names another, and --no-journal keeps calls in memory",
-                path.display()
+                 {} names another, and {} keeps calls in memory",
+                path.display(),
+                said.journal,
+                said.memory
             ))),
         }
     }
@@ -175,13 +200,18 @@ impl Kept {
     }
 
     /// The journal, for a session to write to.
-    pub(crate) fn journal(&self) -> Arc<dyn Journal> {
+    #[must_use]
+    pub fn journal(&self) -> Arc<dyn Journal> {
         Arc::clone(&self.journal)
     }
 
-    /// The token that lets the call `id` be gone on with, if calls are
-    /// kept where that can be done.
-    pub(crate) async fn issue(&self, id: SessionId) -> Result<Option<ResumeToken>, Failure> {
+    /// The token that lets the session `id` be gone on with, if
+    /// sessions are kept where that can be done.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be written to.
+    pub async fn issue(&self, id: SessionId) -> Result<Option<ResumeToken>, Failure> {
         let Some(file) = &self.file else {
             return Ok(None);
         };
@@ -193,8 +223,12 @@ impl Kept {
         Ok(Some(token))
     }
 
-    /// Makes `token` the one that `--resume last` finds.
-    pub(crate) fn remember(&self, token: &ResumeToken) -> Result<(), Failure> {
+    /// Makes `token` the one that [`Resume::Last`] finds.
+    ///
+    /// # Errors
+    ///
+    /// The file next to the journal cannot be written.
+    pub fn remember(&self, token: &ResumeToken) -> Result<(), Failure> {
         let Some(file) = &self.file else {
             return Ok(());
         };
@@ -203,7 +237,12 @@ impl Kept {
     }
 
     /// The token that `from` names.
-    pub(crate) fn token(&self, from: &Resume) -> Result<ResumeToken, Failure> {
+    ///
+    /// # Errors
+    ///
+    /// Sessions are kept in memory, there is no session to go on with,
+    /// or the file holds something that is not a token.
+    pub fn token(&self, from: &Resume) -> Result<ResumeToken, Failure> {
         let Some(file) = &self.file else {
             return Err(Failure(
                 "calls are kept in memory here, and none can be gone on with".to_owned(),
@@ -233,9 +272,13 @@ impl Kept {
             .with(|| format!("{} holds something else", holds.display()))
     }
 
-    /// The call that `token` lets its holder go on with, if the journal
-    /// has such a call.
-    pub(crate) async fn admit(&self, token: &ResumeToken) -> Result<Option<SessionId>, Failure> {
+    /// The session that `token` lets its holder go on with, if the
+    /// journal has such a session.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read.
+    pub async fn admit(&self, token: &ResumeToken) -> Result<Option<SessionId>, Failure> {
         let Some(file) = &self.file else {
             return Ok(None);
         };
@@ -247,8 +290,13 @@ impl Kept {
         Ok(admitted.then(|| token.session()))
     }
 
-    /// The call to go on with, as `from` names it.
-    pub(crate) async fn resume(&self, from: &Resume) -> Result<SessionId, Failure> {
+    /// The session to go on with, as `from` names it.
+    ///
+    /// # Errors
+    ///
+    /// There is no token as `from` says, or the session it names is not
+    /// in the journal.
+    pub async fn resume(&self, from: &Resume) -> Result<SessionId, Failure> {
         let token = self.token(from)?;
         self.admit(&token).await?.ok_or_else(|| {
             let journal = self
@@ -261,10 +309,10 @@ impl Kept {
         })
     }
 
-    /// What whoever runs the command is told of the calls that broke off
-    /// earlier and are still kept, if there are any: nothing takes them
-    /// out of the file but going on with them to their end.
-    pub(crate) async fn earlier(&self) -> Option<String> {
+    /// What whoever runs the program is told of the sessions that broke
+    /// off earlier and are still kept, if there are any: nothing takes
+    /// them out of the file but going on with them to their end.
+    pub async fn earlier(&self) -> Option<String> {
         let file = self.file.as_ref()?;
         let count = file.journal.sessions().await.ok()?.len();
         let (calls, are) = match count {
@@ -279,29 +327,38 @@ impl Kept {
         ))
     }
 
-    /// Whether a call that broke off here can be gone on with.
-    pub(crate) const fn outlasts_the_command(&self) -> bool {
+    /// Whether a session that broke off here can be gone on with.
+    #[must_use]
+    pub const fn outlasts_the_program(&self) -> bool {
         self.file.is_some()
     }
 
-    /// Lets go of the call `id`, which is over: nobody goes on with it.
-    pub(crate) async fn forget(&self, id: SessionId) {
+    /// Lets go of the session `id`, which is over: nobody goes on with
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// The session could not be taken out of the file. It is no longer
+    /// the one that [`Resume::Last`] finds either way.
+    pub async fn forget(&self, id: SessionId) -> Result<(), Failure> {
         let Some(file) = &self.file else {
-            return;
+            return Ok(());
         };
-        if let Err(error) = file.journal.forget(id).await {
-            eprintln!(
-                "waveport: the call could not be taken out of {}: {error}",
+        let forgotten = file.journal.forget(id).await.map_err(|error| {
+            Failure(format!(
+                "the call could not be taken out of {}: {error}",
                 file.path.display()
-            );
-        }
-        // The call that was last begun is no longer one to go on with.
+            ))
+        });
+        // The session that was last begun is no longer one to go on
+        // with.
         let last = std::fs::read_to_string(&file.last)
             .ok()
             .and_then(|text| text.parse::<ResumeToken>().ok());
         if last.is_some_and(|token| token.session() == id) {
             let _ = std::fs::remove_file(&file.last);
         }
+        forgotten
     }
 }
 
@@ -311,34 +368,34 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use clap::Parser;
     use waveport_ports::journal::SessionId;
 
-    use super::{Kept, last_of, write_private};
-    use crate::args::{Agent, Cli, Command, Resume};
+    use super::{Kept, Resume, last_of, write_private};
     use crate::halt::Halt;
+    use crate::spec::{Keeps, Named};
+
+    /// What a command line calls the settings.
+    const SAID: Named = Named {
+        journal: "--journal",
+        memory: "--no-journal",
+        assets: "--assets",
+        otlp: "--otlp",
+        by: "the command line",
+    };
 
     /// A folder for what a test writes, empty.
     fn folder(name: &str) -> PathBuf {
         let folder = std::env::temp_dir()
-            .join(format!("waveport-cli-{}", std::process::id()))
+            .join(format!("waveport-assembly-{}", std::process::id()))
             .join(name);
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
         folder
     }
 
-    fn agent(arguments: &[&str]) -> Agent {
-        let all = ["waveport", "dev"].iter().chain(arguments).copied();
-        match Cli::try_parse_from(all).unwrap().command {
-            Command::Dev(dev) => dev.agent,
-            _ => panic!("dev is dev"),
-        }
-    }
-
     fn kept_in(journal: &Path) -> Kept {
-        let agent = agent(&["--journal", journal.to_str().unwrap()]);
-        let (kept, notes) = Kept::open(&agent, &Halt::Nowhere, false).unwrap();
+        let file = Keeps::File(journal.to_owned());
+        let (kept, notes) = Kept::open(&file, &SAID, &Halt::Nowhere, false).unwrap();
         assert!(notes.is_empty(), "{notes:?}");
         kept
     }
@@ -357,7 +414,7 @@ mod tests {
         let folder = folder("begun");
         let journal = folder.join("calls.redb");
         let kept = kept_in(&journal);
-        assert!(kept.outlasts_the_command());
+        assert!(kept.outlasts_the_program());
         // Nothing was begun yet.
         assert_eq!(kept.earlier().await, None);
         let Err(none) = kept.resume(&Resume::Last).await else {
@@ -415,13 +472,13 @@ mod tests {
 
         // A call that is over is not one to go on with, and the last
         // call is no longer named once it is over.
-        kept.forget(id).await;
+        kept.forget(id).await.unwrap();
         let Err(over) = kept.resume(&Resume::File(elsewhere)).await else {
             panic!("the call is over");
         };
         assert!(over.0.contains("it ended"), "{}", over.0);
         assert!(last.exists());
-        kept.forget(newer).await;
+        kept.forget(newer).await.unwrap();
         assert!(!last.exists());
         assert_eq!(kept.earlier().await, None);
     }
@@ -447,15 +504,15 @@ mod tests {
 
     #[tokio::test]
     async fn calls_in_memory_are_not_gone_on_with() {
-        let (kept, notes) = Kept::open(&agent(&["--no-journal"]), &Halt::Nowhere, false).unwrap();
-        assert!(notes.is_empty() && !kept.outlasts_the_command());
+        let (kept, notes) = Kept::open(&Keeps::Memory, &SAID, &Halt::Nowhere, false).unwrap();
+        assert!(notes.is_empty() && !kept.outlasts_the_program());
         assert_eq!(kept.earlier().await, None);
         assert_eq!(kept.issue(SessionId(1)).await.unwrap(), None);
         let Err(failure) = kept.resume(&Resume::Last).await else {
             panic!("nothing is kept");
         };
         assert!(failure.0.contains("kept in memory"), "{}", failure.0);
-        kept.forget(SessionId(1)).await;
+        kept.forget(SessionId(1)).await.unwrap();
     }
 
     #[tokio::test]
@@ -464,11 +521,20 @@ mod tests {
         let journal = folder.join("calls.redb");
         let text = "Not a journal: a letter that was saved under the wrong name.\n".repeat(200);
         std::fs::write(&journal, &text).unwrap();
-        let letter = agent(&["--journal", journal.to_str().unwrap()]);
-        let Err(failure) = Kept::open(&letter, &Halt::Nowhere, false).map(|_| ()) else {
+        let letter = Keeps::File(journal.clone());
+        let Err(failure) = Kept::open(&letter, &SAID, &Halt::Nowhere, false).map(|_| ()) else {
             panic!("it is not a journal");
         };
         assert!(failure.0.contains("was left as it is"), "{}", failure.0);
+        // And it says what to change, as whoever gave the settings
+        // calls it.
+        assert!(
+            failure
+                .0
+                .ends_with("--journal names another, and --no-journal keeps calls in memory"),
+            "{}",
+            failure.0
+        );
         assert!(failure.0.contains("calls.redb"), "{}", failure.0);
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), text);
 
@@ -476,11 +542,11 @@ mod tests {
         // is waited for, and not for long.
         let journal = folder.join("busy.redb");
         let first = kept_in(&journal);
-        let named = agent(&["--journal", journal.to_str().unwrap()]);
+        let named = Keeps::File(journal.clone());
         let began = Instant::now();
         let patience = Duration::from_millis(300);
-        let Err(failure) = Kept::open_within(&named, &Halt::Nowhere, false, patience).map(|_| ())
-        else {
+        let opened = Kept::open_within(&named, &SAID, &Halt::Nowhere, false, patience);
+        let Err(failure) = opened.map(|_| ()) else {
             panic!("the file is in use");
         };
         assert!(failure.0.contains("cannot be opened"), "{}", failure.0);
@@ -493,8 +559,9 @@ mod tests {
             drop(first);
         });
         let patience = Duration::from_secs(20);
-        let (kept, notes) = Kept::open_within(&named, &Halt::Nowhere, false, patience).unwrap();
-        assert!(notes.is_empty() && kept.outlasts_the_command());
+        let (kept, notes) =
+            Kept::open_within(&named, &SAID, &Halt::Nowhere, false, patience).unwrap();
+        assert!(notes.is_empty() && kept.outlasts_the_program());
         letting_go.join().unwrap();
     }
 
@@ -507,11 +574,11 @@ mod tests {
         let folder = folder("usual");
         let journal = folder.join("calls.redb");
         let first = kept_in(&journal);
-        let named = agent(&["--journal", journal.to_str().unwrap()]);
+        let named = Keeps::File(journal.clone());
         let none = Duration::ZERO;
         for needed in [false, true] {
-            let Err(failure) = Kept::open_within(&named, &Halt::Nowhere, needed, none).map(|_| ())
-            else {
+            let opened = Kept::open_within(&named, &SAID, &Halt::Nowhere, needed, none);
+            let Err(failure) = opened.map(|_| ()) else {
                 panic!("the file is in use");
             };
             assert!(failure.0.contains("in use"), "{}", failure.0);

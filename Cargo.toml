@@ -82,6 +82,7 @@ allowed = ["waveport-alloc-counter"]
 [workspace.dependencies]
 waveport-adapter-kit = { path = "crates/core/waveport-adapter-kit", version = "0.1.0" }
 waveport-alloc-counter = { path = "crates/testing/waveport-alloc-counter", version = "0.1.0" }
+waveport-assembly = { path = "apps/waveport-assembly", version = "0.1.0" }
 waveport-domain = { path = "crates/core/waveport-domain", version = "0.1.0" }
 waveport-kernel-sim = { path = "crates/testing/waveport-kernel-sim", version = "0.1.0" }
 waveport-llm-openai-compat = { path = "crates/adapters/llm/openai-compat", version = "0.1.0" }

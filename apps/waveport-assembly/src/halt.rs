@@ -1,12 +1,12 @@
-//! A place for the command to stop at, for the test that kills it there.
+//! A place for the program to stop at, for the test that kills it there.
 //!
-//! What a call is after its process died depends on where the process
+//! What a session is after its process died depends on where the process
 //! was, and the places that matter are too brief to hit from outside:
 //! between a record and the commit that stores it, or between what a
 //! tool did and its answer. A test names such a place in the environment
-//! variable `WAVEPORT_TEST_HALT`, and the command stops there: it says
-//! `halted: <place>` and does nothing more of that kind until it is
-//! killed.
+//! variable `WAVEPORT_TEST_HALT`, and the program stops there: it says
+//! `halted: <place>` on its standard output and does nothing more of
+//! that kind until it is killed.
 //!
 //! | Place | Where the command stops |
 //! |---|---|
@@ -18,7 +18,7 @@
 //! A kind is the `kind` of a journal record, such as `turn_committed`.
 //! The journal writes on a thread of its own, so everything else goes
 //! on while it is stopped: the call is where it would be if the commit
-//! took that long. Nothing reads the variable but this, and a command
+//! took that long. Nothing reads the variable but this, and a program
 //! that is not told to stop anywhere does nothing here.
 
 use core::time::Duration;
@@ -31,14 +31,16 @@ const VARIABLE: &str = "WAVEPORT_TEST_HALT";
 
 /// Which side of a commit the journal stops on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Side {
+pub enum Side {
+    /// Before the commit.
     Before,
+    /// Once it has committed.
     After,
 }
 
-/// Where the command is to stop, if anywhere.
+/// Where the program is to stop, if anywhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Halt {
+pub enum Halt {
     /// Nowhere.
     Nowhere,
     /// In the journal, at the commit that holds a record of this kind,
@@ -54,7 +56,7 @@ impl Halt {
     /// # Errors
     ///
     /// The variable names no place there is.
-    pub(crate) fn from_env() -> Result<Self, String> {
+    pub fn from_env() -> Result<Self, String> {
         match std::env::var(VARIABLE) {
             Ok(place) => Self::read(&place)
                 .ok_or_else(|| format!("{VARIABLE} names no place to stop at: {place:?}")),
@@ -78,7 +80,8 @@ impl Halt {
 
     /// What watches the journal's commits for the place, if the place is
     /// in the journal.
-    pub(crate) fn probe(&self) -> Option<Box<dyn Probe>> {
+    #[must_use]
+    pub fn probe(&self) -> Option<Box<dyn Probe>> {
         match self {
             Self::Commit(side, kind) => Some(Box::new(AtCommit {
                 side: *side,
@@ -90,12 +93,13 @@ impl Halt {
     }
 
     /// Whether the tool that takes notes is to stop once it has written.
-    pub(crate) fn in_tool(&self) -> bool {
+    #[must_use]
+    pub fn in_tool(&self) -> bool {
         *self == Self::Tool
     }
 }
 
-/// Says that the command has stopped at `place`, where whoever started
+/// Says that the program has stopped at `place`, where whoever started
 /// it reads it.
 pub(crate) fn say(place: &str) {
     let mut out = std::io::stdout().lock();

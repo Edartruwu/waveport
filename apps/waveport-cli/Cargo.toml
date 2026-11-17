@@ -20,24 +20,14 @@ bench = false
 
 [dependencies]
 waveport-adapter-kit = { workspace = true }
+waveport-assembly = { workspace = true }
 waveport-domain = { workspace = true }
-waveport-llm-openai-compat = { workspace = true }
-waveport-models-onnx = { workspace = true }
 waveport-ports = { workspace = true }
 waveport-runtime = { workspace = true }
-waveport-store-journal = { workspace = true }
-waveport-store-memory = { workspace = true }
-waveport-stt-assemblyai = { workspace = true }
-waveport-stt-deepgram = { workspace = true }
-waveport-stt-openai = { workspace = true }
-waveport-telemetry-otel = { workspace = true }
 waveport-transport-local-audio = { workspace = true }
 waveport-transport-websocket = { workspace = true }
-waveport-tts-cartesia = { workspace = true }
-waveport-tts-elevenlabs = { workspace = true }
 
 clap = { workspace = true, features = ["derive", "env", "error-context", "help", "std", "suggestions", "usage"] }
-jiff = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }
 
