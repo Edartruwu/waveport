@@ -32,7 +32,7 @@ use core::str::FromStr;
 
 use waveport_domain::config::KernelConfig;
 use waveport_domain::event::{
-    CloseReason, ControlInput, Event, Finish, HandoffContext, OpEvent, OverlapVerdict, Part,
+    CloseReason, ControlInput, Event, Finish, HandoffContext, Key, OpEvent, OverlapVerdict, Part,
     RetryClass, TimerId, ToolEvent, VadEdge,
 };
 use waveport_domain::ids::{
@@ -184,6 +184,7 @@ impl fmt::Display for Shown<'_> {
                 write!(f, "overlap {turn} {}", word(&VERDICTS, *verdict))
             }
             Event::TextIn { who, text } => write!(f, "text {who} {}", Quoted(text.as_str())),
+            Event::Key { who, key } => write!(f, "key {who} {}", key.as_char()),
             Event::Op(tag, op) => {
                 write!(f, "op {}/{} ", tag.generation, tag.epoch)?;
                 op_shown(f, op)
@@ -215,6 +216,7 @@ impl fmt::Display for Shown<'_> {
                     TimerId::Drain => f.write_str("drain"),
                     TimerId::Grace => f.write_str("grace"),
                     TimerId::Detach => f.write_str("detach"),
+                    TimerId::Keys(turn) => write!(f, "keys {turn}"),
                 }
             }
             Event::Control(input) => {
@@ -449,6 +451,16 @@ impl<'a> Words<'a> {
                 who: ParticipantId(self.number()?),
                 text: self.text()?.as_str().into(),
             },
+            "key" => {
+                let who = ParticipantId(self.number()?);
+                let written = self.word()?;
+                let mut letters = written.chars();
+                let key = letters.next().and_then(Key::from_char);
+                match (key, letters.next()) {
+                    (Some(key), None) => Event::Key { who, key },
+                    _ => return Err(format!("{written:?} is no key of a telephone")),
+                }
+            }
             "op" => Event::Op(self.tag()?, self.op()?),
             "tool" => Event::Tool(ToolCallId(self.number()?), self.tool()?),
             "timer" => Event::Timer(self.timer()?),
@@ -519,6 +531,7 @@ impl<'a> Words<'a> {
             "drain" => TimerId::Drain,
             "grace" => TimerId::Grace,
             "detach" => TimerId::Detach,
+            "keys" => TimerId::Keys(TurnId(self.number()?)),
             other => return Err(format!("{other:?} is no timer")),
         })
     }
@@ -704,8 +717,8 @@ pub fn replay<P: Policies>(
 mod tests {
     use waveport_domain::config::KernelConfig;
     use waveport_domain::event::{
-        CloseReason, ControlInput, Event, Finish, HandoffContext, OpEvent, OverlapVerdict, Part,
-        RetryClass, TimerId, ToolEvent, VadEdge,
+        CloseReason, ControlInput, Event, Finish, HandoffContext, Key, OpEvent, OverlapVerdict,
+        Part, RetryClass, TimerId, ToolEvent, VadEdge,
     };
     use waveport_domain::ids::{
         AgentId, Epoch, GenId, OpTag, ParticipantId, Prob, Seq, ToolCallId, ToolId, TurnId,
@@ -809,6 +822,7 @@ mod tests {
             TimerId::Drain,
             TimerId::Grace,
             TimerId::Detach,
+            TimerId::Keys(turn),
         ];
         let to = AgentId(2);
         let handoff = |context| ControlInput::Handoff { to, context };
@@ -859,6 +873,7 @@ mod tests {
             },
             Event::Durable(Seq(41)),
         ];
+        events.extend(Key::ALL.map(|key| Event::Key { who, key }));
         events.extend(ops.map(|op| Event::Op(tag, op)));
         events.extend(tools.map(|news| Event::Tool(call, news)));
         events.extend(timers.map(Event::Timer));
@@ -880,6 +895,16 @@ mod tests {
         assert!(text.contains("\n3 transcript 2 4800 52800 interim \"where is my order\"\n"));
         assert!(text.contains("\n4.0015 eou 7 7250\n"), "{text}");
         assert!(text.ends_with("\nrestart 12\n"));
+        assert!(
+            text.contains(" key 2 0\n") && text.contains(" key 2 #\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(" key 2 *\n") && text.contains(" key 2 D\n"),
+            "{text}"
+        );
+        assert!(Trace::parse("7 key 2 E\n").is_err());
+        assert!(Trace::parse("7 key 2 12\n").is_err());
     }
 
     #[test]

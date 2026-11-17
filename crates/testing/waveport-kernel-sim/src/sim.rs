@@ -190,11 +190,11 @@ impl Sim {
     /// `who` presses these keys of a telephone one after the other, the
     /// first at once and each of the others 250 ms after the one before.
     pub fn presses(&mut self, who: Person, keys: &str) {
-        self.world.presses(who.0);
         let name = self.world.names.person(who.0).to_owned();
-        self.note(&format!(
-            "-- {name} presses {keys}, and the kernel has no event for a key"
-        ));
+        self.note(&format!("-- {name} presses {keys}"));
+        if let Some(first) = self.world.presses(self.now, who.0, keys) {
+            self.deliver(&first);
+        }
     }
 
     /// Lets this much time pass.

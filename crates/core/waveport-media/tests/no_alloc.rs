@@ -4,17 +4,20 @@
 //! hands a frame out. Once a session is set up, none of that may call the
 //! allocator: not decoding, not changing the rate, not waiting for a
 //! packet that was overtaken, not making up one that was lost, not pacing,
-//! not lowering the volume, and not saying how far playback has got.
+//! not lowering the volume, not saying how far playback has got, and not
+//! making the tone of a key.
 //!
 //! What is counted is the Rust allocator. libopus has its own memory,
 //! which it takes when a codec is set up and not per frame.
 
 use waveport_alloc_counter::{CountingAllocator, is_installed, measure};
+use waveport_domain::event::Key;
 use waveport_domain::ids::{Epoch, GenId, OpTag};
 use waveport_domain::time::{MediaDur, MonoTime};
 use waveport_media::codec::g711::Law;
 use waveport_media::codec::opus::OpusSettings;
 use waveport_media::codec::{Codec, Decoder, Encoder};
+use waveport_media::dtmf::Dialer;
 use waveport_media::ingress::{Ingress, IngressConfig, Packet};
 use waveport_media::ledger::{Mark, Spread};
 use waveport_media::playout::{Playout, PlayoutConfig};
@@ -218,6 +221,25 @@ fn codecs_and_rate_changes_cost_no_allocation() {
                 resampler.process(&input[..7], &mut out).unwrap();
             });
         }
+    }
+}
+
+#[test]
+fn pressing_keys_costs_no_allocation() {
+    for rate in Rate::ALL {
+        let mut dialer = quiet("setting up a dialer", || Dialer::new(rate));
+        let mut frame = audio(rate.frame());
+        quiet("pressing keys", || {
+            for key in Key::ALL {
+                assert!(dialer.press(key));
+            }
+            // Every tone and every pause, a frame at a time, over audio
+            // that is there already.
+            while !dialer.is_idle() {
+                assert_eq!(dialer.mix(&mut frame), frame.len());
+            }
+            dialer.clear();
+        });
     }
 }
 

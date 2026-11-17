@@ -26,7 +26,9 @@ use waveport_domain::command::{
     Activity, ClientEvent, Command, LlmCause, LlmCmd, PlayoutCmd, SenseCmd, TtsCmd,
 };
 use waveport_domain::config::{KernelConfig, Limits};
-use waveport_domain::event::{CloseReason, ControlInput, Event, OpEvent, Part, TimerId};
+use waveport_domain::event::{
+    CloseReason, ControlInput, Event, Key, OpEvent, Part, TimerId, VadEdge,
+};
 use waveport_domain::fact::{Dismissal, EpochCause, Fact, Lifecycle, Stamped};
 use waveport_domain::ids::{AgentId, Epoch, GenId, OpTag, ParticipantId, Seq, ToolCallId, TurnId};
 use waveport_domain::kernel::{Kernel, Snapshot, View};
@@ -44,7 +46,10 @@ pub enum Rule {
     /// a response that has ended.
     Liveness,
     /// Invariant 2: everything a person says ends in one turn, committed
-    /// with exactly their words or dismissed for a reason that holds.
+    /// with exactly their words or dismissed for a reason that holds, and
+    /// every key they press in one run, committed as the keys that were
+    /// pressed, when it is over. A key stops what is being heard, and a
+    /// person's turns enter the conversation in the order they began.
     Turns,
     /// Invariant 3: a response enters the conversation once, as exactly
     /// the part of its text that was heard.
@@ -292,6 +297,20 @@ struct Heard {
     words: String,
     /// Whether the turn's speech was over the agent's.
     over_agent: bool,
+    /// The keys of the turn, if it is one of keys that are pressed and
+    /// not of speech.
+    keys: Option<Run>,
+}
+
+/// A run of keys, as the monitor has it. The keys themselves are the
+/// words of its turn.
+#[derive(Clone, Copy, Debug, Hash)]
+struct Run {
+    /// When the newest of them was pressed.
+    last: MonoTime,
+    /// Whether no key can follow: the run is a turn, and waits only for
+    /// what whoever pressed it said before.
+    over: bool,
 }
 
 /// A response under way, as the monitor has it.
@@ -417,6 +436,15 @@ pub struct Monitor {
     replied: u32,
     /// Words that arrived in this step and must be a turn of their own.
     arrived: Option<(ParticipantId, String)>,
+    /// A key that was pressed in this step and has no run to join: the
+    /// step begins one with it, unless as many turns were open as may
+    /// be, which is the third value.
+    pressed: Option<(ParticipantId, Key, bool)>,
+    /// A turn of speech that has to end in this step: keys its speaker
+    /// pressed before it were committed while another could follow, which
+    /// only what was said after them having to enter the conversation
+    /// does.
+    forced: Option<TurnId>,
     /// The tool calls, their batches, and who has the floor.
     desk: Desk,
 }
@@ -447,6 +475,9 @@ impl Hash for Monitor {
             owed,
             replied,
             arrived,
+            // Neither outlasts a step.
+            pressed: _,
+            forced: _,
             desk,
         } = self;
         (leased, last_seq, began, entered, epoch, lifecycle, close_by).hash(state);
@@ -487,6 +518,8 @@ impl Monitor {
             owed: 0,
             replied: context,
             arrived: None,
+            pressed: None,
+            forced: None,
         }
     }
 
@@ -545,6 +578,7 @@ impl Monitor {
         });
         self.recovery_began(first)?;
         self.words_arrived(event, out)?;
+        let spoke = self.key_arrived(now, event);
         self.entered = self.epoch;
         // Facts and commands are two lists, so the order between a fact
         // and a command is not known. A turn can begin and end in one
@@ -568,6 +602,7 @@ impl Monitor {
             let text = command.text().map_or("", |text| out.text.get(text));
             self.command(event, command, text, whole)?;
         }
+        self.keys_settled(now, event, view, spoke)?;
         self.settled(now, event, out, view, whole)
     }
 
@@ -707,7 +742,8 @@ impl Monitor {
         ensure(!typed, Rule::Turns, || {
             format!("{who} typed {words:?}, and no turn was committed for it")
         })?;
-        let Some(heard) = self.turns.iter_mut().find(|heard| heard.who == who) else {
+        let spoken = |heard: &&mut Heard| heard.who == who && heard.keys.is_none();
+        let Some(heard) = self.turns.iter_mut().find(spoken) else {
             return Err(Violation {
                 rule: Rule::Turns,
                 what: format!(
@@ -786,13 +822,15 @@ impl Monitor {
                 }
                 if let Some(index) = self.turns.iter().position(|heard| heard.turn == turn) {
                     let heard = self.turns.remove(index);
-                    ensure(heard.who == who && heard.words == text, Rule::Turns, || {
+                    let said = heard.keys.is_none() && heard.who == who && heard.words == text;
+                    ensure(said, Rule::Turns, || {
                         format!(
                             "turn {turn} was committed as {who} saying {text:?}; what arrived \
                              for it is {} saying {:?}",
                             heard.who, heard.words
                         )
                     })?;
+                    self.in_its_order(turn, who, index)?;
                 } else {
                     ensure(turn.get() > self.last_turn, Rule::Turns, || {
                         format!("turn {turn} was committed after it had ended")
@@ -810,18 +848,32 @@ impl Monitor {
                     })?;
                 }
             }
+            Fact::KeysCommitted { turn, who, .. } => self.keys_committed(event, turn, who, text)?,
             Fact::TurnDismissed { turn, who, reason } => {
                 let Some(index) = self.turns.iter().position(|heard| heard.turn == turn) else {
-                    return Err(Violation {
-                        rule: Rule::Turns,
-                        what: format!("turn {turn} was dismissed, and it is not open"),
-                    });
+                    // A key may stop the last thing a closing session was
+                    // waiting for: its run begins and is dismissed with
+                    // the session in one step.
+                    let begun = self
+                        .pressed
+                        .take()
+                        .is_some_and(|(by, _, full)| by == who && !full);
+                    let closed = reason == Dismissal::Closed
+                        && self.lifecycle >= Lifecycle::Closing
+                        && turn.get() > self.last_turn;
+                    ensure(begun && closed, Rule::Turns, || {
+                        format!("turn {turn} was dismissed, and it is not open")
+                    })?;
+                    self.last_turn = turn.get();
+                    return Ok(());
                 };
                 let heard = self.turns.remove(index);
+                // Keys are never nothing, and never an aside.
+                let spoken = heard.keys.is_none();
                 let holds = heard.who == who
                     && match reason {
-                        Dismissal::Empty => heard.words.is_empty(),
-                        Dismissal::Backchannel | Dismissal::Noise => heard.over_agent,
+                        Dismissal::Empty => spoken && heard.words.is_empty(),
+                        Dismissal::Backchannel | Dismissal::Noise => spoken && heard.over_agent,
                         Dismissal::Closed => self.lifecycle >= Lifecycle::Closing,
                     };
                 ensure(holds, Rule::Turns, || {
@@ -1042,6 +1094,7 @@ impl Monitor {
                     who,
                     words: String::new(),
                     over_agent: false,
+                    keys: None,
                 });
             }
             Command::Sense(SenseCmd::ClassifyOverlap { turn, .. }) => {
@@ -1434,19 +1487,27 @@ impl Monitor {
             },
         )?;
 
+        // Nobody is in two turns of speech at once, and nobody presses two
+        // runs of keys at once. What somebody said and what they pressed
+        // may both be open.
+        let same = |one: &Heard, other: &Heard| match (one.keys, other.keys) {
+            (None, None) => true,
+            (Some(one), Some(other)) => !one.over && !other.over,
+            _ => false,
+        };
         let alone = self.turns.iter().enumerate().all(|(index, heard)| {
             self.turns
                 .iter()
                 .skip(index + 1)
-                .all(|other| other.who != heard.who)
+                .all(|other| other.who != heard.who || !same(heard, other))
         });
         ensure(alone, Rule::Turns, || {
             let open = self
                 .turns
                 .iter()
-                .map(|heard| (heard.turn.get(), heard.who))
+                .map(|heard| (heard.turn.get(), heard.who, heard.keys.is_some()))
                 .collect::<Vec<_>>();
-            format!("someone has two turns open at once: {open:?}")
+            format!("someone has two turns of one kind open at once: {open:?}")
         })?;
 
         self.desk_settled(view)?;
@@ -1569,16 +1630,249 @@ impl Monitor {
     }
 }
 
+impl Monitor {
+    /// Whether a run of `pressed` keys is complete without a key that
+    /// ends it.
+    fn is_run(&self, pressed: usize) -> bool {
+        let count = self.config.keys.count;
+        count.is_some_and(|count| pressed >= usize::from(count)) || pressed >= self.limits.keys
+    }
+
+    /// A key was pressed, or the time in which one could follow may be
+    /// over. A key joins the run its presser has under way, or the step
+    /// begins one with it. Returns the response that was being heard when
+    /// a key was pressed: a key takes the floor.
+    fn key_arrived(&mut self, now: MonoTime, event: &Event) -> Option<GenId> {
+        let policy = self.config.keys;
+        match *event {
+            Event::Key { who, key } => {
+                let listening = matches!(self.lifecycle, Lifecycle::Running | Lifecycle::Draining);
+                if !listening || !self.people.contains(&who) {
+                    return None;
+                }
+                let ends = policy.terminator == Some(key);
+                let under_way = self
+                    .turns
+                    .iter()
+                    .position(|heard| heard.who == who && heard.keys.is_some_and(|run| !run.over));
+                if let Some(heard) = under_way.and_then(|index| self.turns.get_mut(index)) {
+                    if !ends {
+                        heard.words.push(key.as_char());
+                    }
+                    let pressed = heard.words.len();
+                    let over = ends || self.is_run(pressed);
+                    if let Some(heard) = under_way.and_then(|index| self.turns.get_mut(index)) {
+                        heard.keys = Some(Run { last: now, over });
+                    }
+                } else {
+                    let full = self.turns.len() >= self.limits.open_turns;
+                    self.pressed = Some((who, key, full));
+                }
+                self.voice
+            }
+            Event::Timer(TimerId::Keys(turn)) => {
+                let run = self
+                    .turns
+                    .iter_mut()
+                    .filter(|heard| heard.turn == turn)
+                    .find_map(|heard| heard.keys.as_mut());
+                if let Some(run) = run
+                    && now.since(run.last) >= policy.wait
+                {
+                    run.over = true;
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// A turn that was open entered the conversation. What somebody said
+    /// and what they pressed enter it in the order they began in.
+    fn in_its_order(
+        &self,
+        turn: TurnId,
+        who: ParticipantId,
+        index: usize,
+    ) -> Result<(), Violation> {
+        let before = self
+            .turns
+            .iter()
+            .take(index)
+            .find(|heard| heard.who == who)
+            .map(|heard| heard.turn);
+        ensure(before.is_none(), Rule::Turns, || {
+            format!(
+                "turn {turn} of {who} entered the conversation before their turn {before:?}, \
+                 which began before it"
+            )
+        })
+    }
+
+    /// Keys entered the conversation. They are a run that somebody
+    /// pressed, all of it, and one no key can follow.
+    fn keys_committed(
+        &mut self,
+        event: &Event,
+        turn: TurnId,
+        who: ParticipantId,
+        keys: &str,
+    ) -> Result<(), Violation> {
+        self.context += 1;
+        self.owed = self.context;
+        self.desk.cause = Some(LlmCause::Reply { turn });
+        let Some(index) = self.turns.iter().position(|heard| heard.turn == turn) else {
+            // A run of one key begins and is over in one step.
+            ensure(turn.get() > self.last_turn, Rule::Turns, || {
+                format!("turn {turn} was committed as keys after it had ended")
+            })?;
+            self.last_turn = turn.get();
+            let pressed = self.pressed.take();
+            let accounted = pressed.is_some_and(|(by, key, full)| {
+                let ends = self.config.keys.terminator == Some(key);
+                let alone = keys.chars().eq([key.as_char()]) && (ends || self.is_run(1));
+                by == who && alone && !full
+            });
+            ensure(accounted, Rule::Turns, || {
+                format!(
+                    "turn {turn} was committed as {who} pressing {keys:?}; what was pressed \
+                     and has no run to join is {pressed:?}"
+                )
+            })?;
+            let waits = self.turns.iter().any(|heard| heard.who == who);
+            return ensure(!waits, Rule::Turns, || {
+                format!(
+                    "the keys {keys:?} of {who} entered the conversation before what they began before"
+                )
+            });
+        };
+        let heard = self.turns.remove(index);
+        let pressed = heard.keys.is_some() && heard.who == who && heard.words == keys;
+        ensure(pressed, Rule::Turns, || {
+            format!(
+                "turn {turn} was committed as {who} pressing {keys:?}; what arrived for it is \
+                 {} with {:?}, keys: {}",
+                heard.who,
+                heard.words,
+                heard.keys.is_some()
+            )
+        })?;
+        // Whoever leaves presses no more. And what somebody said after
+        // their keys does not enter the conversation before them: when
+        // they speak anew and that turn has to end, the keys end with it.
+        let left =
+            matches!(event, Event::Control(ControlInput::Leave { who: gone }) if *gone == who);
+        let over = heard.keys.is_some_and(|run| run.over);
+        if !over && !left {
+            let anew = matches!(
+                event,
+                Event::Speech { who: speaker, edge: VadEdge::Start, .. } if *speaker == who
+            );
+            let after = self
+                .turns
+                .iter()
+                .skip(index)
+                .find(|later| later.who == who && later.keys.is_none())
+                .map(|later| later.turn);
+            ensure(anew && after.is_some(), Rule::Turns, || {
+                format!("the keys {keys:?} of {who} were committed while another could follow")
+            })?;
+            self.forced = after;
+        }
+        self.in_its_order(turn, who, index)
+    }
+
+    /// Compares the account of the keys with what the kernel did about
+    /// them in a step. `spoke` is the response that was being heard when
+    /// the step's key was pressed.
+    fn keys_settled(
+        &mut self,
+        now: MonoTime,
+        event: &Event,
+        view: View<'_>,
+        spoke: Option<GenId>,
+    ) -> Result<(), Violation> {
+        // A key that had no run to join began one, unless as many turns
+        // are open as may be.
+        if let Some((who, key, full)) = self.pressed.take() {
+            let begun = view
+                .turns()
+                .find(|open| open.keys && open.who == who && !self.is_open(open.turn))
+                .filter(|_| !full);
+            if let Some(open) = begun {
+                let fresh = open.turn.get() > self.last_turn;
+                ensure(fresh, Rule::Turns, || {
+                    format!(
+                        "turn {} began for the keys of {who}, and it cannot have",
+                        open.turn
+                    )
+                })?;
+                self.last_turn = open.turn.get();
+                let ends = self.config.keys.terminator == Some(key);
+                self.turns.push(Heard {
+                    turn: open.turn,
+                    who,
+                    words: key.as_char().to_string(),
+                    over_agent: false,
+                    keys: Some(Run {
+                        last: now,
+                        over: ends || self.is_run(1),
+                    }),
+                });
+            } else {
+                ensure(full, Rule::Turns, || {
+                    format!("{who} pressed {key:?} on {event:?}, and no turn began for it")
+                })?;
+            }
+        }
+        if let Some(turn) = self.forced.take() {
+            ensure(!self.is_open(turn), Rule::Turns, || {
+                format!(
+                    "keys were committed while another could follow, and turn {turn}, which was \
+                     said after them, did not end"
+                )
+            })?;
+        }
+        // A key is never a noise of agreement: what was being heard when
+        // it was pressed is not heard after it.
+        let heard_on = spoke.filter(|_| self.voice == spoke);
+        ensure(heard_on.is_none(), Rule::Turns, || {
+            format!("a key was pressed over {heard_on:?}, which goes on being heard")
+        })?;
+        // A run that is over is a turn at once, unless what whoever
+        // pressed it began before is still open.
+        let listening = matches!(self.lifecycle, Lifecycle::Running | Lifecycle::Draining);
+        let waiting = self.turns.iter().enumerate().find(|(index, heard)| {
+            heard.keys.is_some_and(|run| run.over)
+                && !self
+                    .turns
+                    .iter()
+                    .take(*index)
+                    .any(|before| before.who == heard.who)
+        });
+        let waiting = waiting.map(|(_, heard)| heard.turn).filter(|_| listening);
+        ensure(waiting.is_none(), Rule::Turns, || {
+            format!(
+                "the keys of turn {waiting:?} are over, and they have not entered the conversation"
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
     use waveport_domain::command::{Command, PlayoutCmd};
     use waveport_domain::event::{
-        CloseReason, ControlInput, Event, Finish, OpEvent, TimerId, VadEdge,
+        CloseReason, ControlInput, Event, Finish, Key, OpEvent, TimerId, VadEdge,
     };
     use waveport_domain::fact::{Fact, Stamped};
     use waveport_domain::ids::{Epoch, GenId, OpTag, ParticipantId, Prob, Seq, TurnId};
+
+    use waveport_domain::config::KernelConfig;
     use waveport_domain::kernel::Kernel;
     use waveport_domain::out::Out;
+    use waveport_domain::policy::DefaultPolicies;
     use waveport_domain::time::{MediaDur, MediaSpan, MediaTime, MonoTime};
 
     use super::{Monitor, Rule, Violation};
@@ -1599,7 +1893,11 @@ mod tests {
 
     impl Watched {
         fn new() -> Self {
-            let kernel = Kernel::default();
+            Self::with(KernelConfig::default())
+        }
+
+        fn with(config: KernelConfig) -> Self {
+            let kernel = Kernel::new(config, DefaultPolicies::default()).unwrap();
             let mut watched = Self {
                 monitor: Monitor::new(kernel.view()),
                 kernel,
@@ -2066,6 +2364,242 @@ mod tests {
         assert!(
             stuck.to_string().contains("the session is stuck"),
             "{stuck}"
+        );
+    }
+
+    fn key(written: char) -> Event {
+        Event::Key {
+            who: ANA,
+            key: Key::from_char(written).unwrap(),
+        }
+    }
+
+    #[test]
+    fn keys_that_are_pressed_and_answered_are_accepted() {
+        let mut watched = Watched::new();
+        for (at, written) in [(1_000, '4'), (1_250, '0'), (1_500, '7'), (1_750, '1')] {
+            assert_eq!(watched.at(at, key(written)), Ok(()));
+        }
+        // Keys that could go on are a turn that has not ended.
+        let open = watched.monitor.at_rest(watched.kernel.view());
+        assert_eq!(open.map_err(|v| v.rule), Err(Rule::Turns));
+        assert_eq!(watched.at(2_000, key('#')), Ok(()));
+        let committed = watched.out.facts.iter().any(
+            |stamped| matches!(stamped.fact, Fact::KeysCommitted { turn, .. } if turn == TurnId(1)),
+        );
+        assert!(committed, "{:?}", watched.out.facts);
+        // And so are keys that only time ends, and the one key that is a
+        // run by itself.
+        assert_eq!(watched.at(9_000, key('5')), Ok(()));
+        let waited = Event::Timer(TimerId::Keys(TurnId(2)));
+        assert_eq!(watched.at(11_999, waited.clone()), Ok(()));
+        assert_eq!(watched.at(12_000, waited), Ok(()));
+        assert_eq!(watched.at(13_000, key('#')), Ok(()));
+        assert_eq!(watched.monitor.context, 3);
+    }
+
+    #[test]
+    fn keys_that_are_not_the_keys_that_were_pressed_are_noticed() {
+        let mut watched = Watched::new();
+        watched.at(1_000, key('4')).unwrap();
+        watched.at(1_250, key('0')).unwrap();
+        let other = |out: &mut Out| {
+            let keys = out.text.push("41");
+            for stamped in &mut out.facts {
+                if let Fact::KeysCommitted { keys: pressed, .. } = &mut stamped.fact {
+                    *pressed = keys;
+                }
+            }
+        };
+        watched.now_ms = 1_500;
+        let checked = watched.tampered(key('#'), other);
+        assert_eq!(rule(checked.clone()), Some(Rule::Turns), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .starts_with("invariant 2 is broken: turn 1 was committed as 1 pressing \"41\"")
+        );
+    }
+
+    #[test]
+    fn keys_that_become_a_turn_while_another_could_follow_are_noticed() {
+        let mut watched = Watched::new();
+        watched.at(1_000, key('4')).unwrap();
+        // The kernel ends the run on a key that does not end one.
+        let checked = watched.shown_as(1_250, &key('#'), &key('0'));
+        assert_eq!(rule(checked), Some(Rule::Turns));
+        // Or before whoever presses has had their time.
+        let mut watched = Watched::new();
+        watched.at(1_000, key('4')).unwrap();
+        let waited = Event::Timer(TimerId::Keys(TurnId(1)));
+        let checked = watched.shown_as(2_000, &key('#'), &waited);
+        assert_eq!(rule(checked.clone()), Some(Rule::Turns), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("while another could follow")
+        );
+    }
+
+    #[test]
+    fn keys_that_are_over_and_are_no_turn_are_noticed() {
+        // The key that ends the run does not.
+        let mut watched = Watched::new();
+        watched.at(1_000, key('4')).unwrap();
+        let checked = watched.shown_as(1_250, &QUIET, &key('#'));
+        assert_eq!(rule(checked.clone()), Some(Rule::Turns), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("they have not entered the conversation")
+        );
+        // Nor does the time in which no key followed.
+        let mut watched = Watched::new();
+        watched.at(1_000, key('4')).unwrap();
+        let waited = Event::Timer(TimerId::Keys(TurnId(1)));
+        let checked = watched.shown_as(4_000, &QUIET, &waited);
+        assert_eq!(rule(checked), Some(Rule::Turns));
+    }
+
+    fn speech(edge: VadEdge, at_ms: u64) -> Event {
+        Event::Speech {
+            who: ANA,
+            edge,
+            at: MediaTime::from_millis(at_ms),
+        }
+    }
+
+    #[test]
+    fn keys_that_end_with_what_was_said_after_them_are_accepted() {
+        let mut config = KernelConfig::default();
+        config.timing.turn_max = Duration::from_secs(6);
+        let mut watched = Watched::with(config);
+        // Ana presses as she speaks, for as long as a turn may last.
+        watched.at(1_000, key('4')).unwrap();
+        watched.at(1_200, speech(VadEdge::Start, 1_200)).unwrap();
+        watched.at(3_500, key('0')).unwrap();
+        watched.at(6_000, key('7')).unwrap();
+        watched.at(7_000, speech(VadEdge::End, 7_000)).unwrap();
+        let ran_out = Event::Timer(TimerId::TurnMax(TurnId(2)));
+        watched.at(7_200, ran_out).unwrap();
+        let said = Event::Transcript {
+            who: ANA,
+            span: MediaSpan::new(MediaTime::from_millis(1_200), MediaTime::from_millis(7_000)),
+            text: "the number is".into(),
+            is_final: true,
+        };
+        watched.at(7_300, said).unwrap();
+        assert_eq!(watched.monitor.context, 0, "her words wait for her keys");
+        // She speaks anew: what she said has to end, and her keys with it.
+        assert_eq!(watched.at(7_500, speech(VadEdge::Start, 7_500)), Ok(()));
+        assert_eq!(watched.monitor.context, 2);
+    }
+
+    #[test]
+    fn keys_that_end_for_speech_that_does_not_are_noticed() {
+        let mut watched = Watched::new();
+        watched.at(1_000, key('4')).unwrap();
+        watched.at(1_200, speech(VadEdge::Start, 1_200)).unwrap();
+        watched.at(1_800, speech(VadEdge::End, 1_800)).unwrap();
+        // The keys become a turn as Ana speaks anew, and what she said
+        // after them stays where it was.
+        let waited = Event::Timer(TimerId::Keys(TurnId(1)));
+        let anew = speech(VadEdge::Start, 4_000);
+        let checked = watched.shown_as(4_000, &waited, &anew);
+        assert_eq!(rule(checked.clone()), Some(Rule::Turns), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("which was said after them, did not end")
+        );
+    }
+
+    #[test]
+    fn a_key_that_begins_no_turn_is_noticed() {
+        let mut watched = Watched::new();
+        let checked = watched.shown_as(1_000, &QUIET, &key('4'));
+        assert_eq!(rule(checked.clone()), Some(Rule::Turns), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("no turn began for it")
+        );
+        // A key of somebody who is not there begins none, and need not.
+        let mut watched = Watched::new();
+        let stranger = Event::Key {
+            who: ParticipantId(7),
+            key: Key::Four,
+        };
+        assert_eq!(watched.at(1_000, stranger), Ok(()));
+    }
+
+    #[test]
+    fn a_key_that_does_not_stop_the_agent_is_noticed() {
+        let mut watched = Watched::new();
+        watched.answering();
+        assert_eq!(watched.step(key('4')), Ok(()));
+
+        let mut watched = Watched::new();
+        watched.answering();
+        // The agent goes on speaking over the key.
+        let now = MonoTime::from_millis(watched.now_ms);
+        let pressed = key('4');
+        watched.kernel.step(now, &pressed, &mut watched.out);
+        watched.out.facts.clear();
+        watched
+            .out
+            .cmds
+            .retain(|command| matches!(command, Command::SetTimer(TimerId::Keys(_), _)));
+        let view = watched.kernel.view();
+        let checked = watched.monitor.observe(now, &pressed, &watched.out, view);
+        assert_eq!(rule(checked.clone()), Some(Rule::Turns), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("goes on being heard")
+        );
+    }
+
+    #[test]
+    fn keys_that_enter_the_conversation_before_what_was_said_before_them_are_noticed() {
+        let mut watched = Watched::new();
+        watched.asking();
+        // Ana presses before her words are in, and the keys are over
+        // first.
+        assert_eq!(watched.step(key('4')), Ok(()));
+        assert_eq!(watched.step(key('#')), Ok(()));
+        // Honestly, the words go first.
+        let mut honest = Watched::new();
+        honest.asking();
+        honest.step(key('4')).unwrap();
+        honest.step(key('#')).unwrap();
+        assert_eq!(honest.step(Watched::words()), Ok(()));
+
+        let swapped = |out: &mut Out| {
+            assert_eq!(out.facts.len(), 2, "{:?}", out.facts);
+            let (first, second) = (out.facts[0], out.facts[1]);
+            out.facts[0] = Stamped {
+                seq: first.seq,
+                fact: second.fact,
+            };
+            out.facts[1] = Stamped {
+                seq: second.seq,
+                fact: first.fact,
+            };
+        };
+        let checked = watched.tampered(Watched::words(), swapped);
+        assert_eq!(rule(checked.clone()), Some(Rule::Turns), "{checked:?}");
+        assert!(
+            checked
+                .unwrap_err()
+                .to_string()
+                .contains("which began before it")
         );
     }
 

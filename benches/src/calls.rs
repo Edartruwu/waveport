@@ -306,6 +306,7 @@ impl Line {
                     remote_buffer: RemoteBuffer::default(),
                 }),
                 text: false,
+                keys: None,
             },
             began: None,
             packets: Arc::clone(packets),

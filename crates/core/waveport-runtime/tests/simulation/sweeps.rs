@@ -4,14 +4,16 @@
 //! and which tools it calls, and what the application asks. A profile
 //! says how the world behaves: calmly, or with parts that fail and a
 //! line that loses packets, or with a process that dies, or with an end
-//! that comes at any moment, or with a line that drops and comes back. Nothing is asked of such a session beyond
-//! what is asked of every session: the checks of `world`.
+//! that comes at any moment, or with a line that drops and comes back,
+//! or with callers who press the keys of their telephones. Little is
+//! asked of such a session beyond what is asked of every session: the
+//! checks of `world`.
 
 use core::time::Duration;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use waveport_domain::config::{AgentSpec, Effect, KernelConfig, ToolSpec};
-use waveport_domain::event::RetryClass;
+use waveport_domain::event::{Key, RetryClass};
 use waveport_domain::ids::{ParticipantId, ToolId};
 use waveport_ports::error::PortError;
 use waveport_ports::stt::{SttFinalize, SttTiming};
@@ -43,6 +45,10 @@ pub(super) enum Profile {
     /// or never. The session waits for it for a second, for five, or not
     /// at all.
     Lines,
+    /// The callers press keys of their telephones, in runs, among what
+    /// they say and over the agent, and the application has the session
+    /// press some. What makes a run differs from session to session.
+    Keys,
 }
 
 pub(super) const WORDS: &[&str] = &[
@@ -345,6 +351,28 @@ fn made_up(profile: Profile, seed: u64) -> Plan {
                 from = back + 200;
             }
         }
+        Profile::Keys => {
+            let rules = &mut plan.spec.kernel.keys;
+            let hash = Some(Key::Hash);
+            rules.terminator = *rng.choose(&[hash, hash, Some(Key::Star), None]).unwrap();
+            rules.count = *rng.choose(&[None, None, Some(1), Some(4)]).unwrap();
+            rules.wait = Duration::from_millis(*rng.choose(&[300, 1_000, 3_000]).unwrap());
+            for caller in 0..plan.callers {
+                for _ in 0..rng.range(1..4) {
+                    let run: String = (0..rng.range(1..7))
+                        .map(|_| rng.choose(&Key::ALL).unwrap().as_char())
+                        .collect();
+                    plan.presses(caller, rng.range(400..last + 3_000), &run);
+                }
+            }
+            for _ in 0..rng.range(1..3) {
+                let keys = (0..rng.range(1..6))
+                    .map(|_| *rng.choose(&Key::ALL).unwrap())
+                    .collect();
+                let press = Doing::Ask(SessionInput::Press { keys });
+                plan.doings.push((rng.range(300..last + 2_000), press));
+            }
+        }
     }
     // Long enough for everything that was begun to be given up on.
     plan.until_ms = last + 200_000;
@@ -471,6 +499,100 @@ fn lines() {
     assert!(tally.cut >= tally.runs / 8, "{tally:?}");
 }
 
+/// The keys a session was asked to press left as its line takes them,
+/// and the keys its callers pressed are in its conversation.
+fn pressed_as_it_should(plan: &Plan, outcome: &Outcome) -> Result<(), String> {
+    let mut asked: Vec<(u64, &[Key])> = plan
+        .doings
+        .iter()
+        .filter_map(|(at, doing)| match doing {
+            Doing::Ask(SessionInput::Press { keys }) => Some((*at, &keys[..])),
+            _ => None,
+        })
+        .collect();
+    asked.sort_by_key(|(at, _)| *at);
+    let asked: Vec<Key> = asked
+        .iter()
+        .flat_map(|(_, keys)| keys.iter().copied())
+        .collect();
+    let [life] = &outcome.lives[..] else {
+        return Err(format!("the session had {} lives", outcome.lives.len()));
+    };
+    let pressed: Vec<Key> = life.wire.pressed.iter().map(|(_, key)| *key).collect();
+    let tones = life.wire.tones.len();
+    let all = u64::try_from(asked.len()).unwrap();
+    let as_it_should = match plan.line {
+        // A sound card has no keys, and the session says so.
+        Line::SoundCard => pressed.is_empty() && tones == 0 && life.unpressed == all,
+        // Tones, of which those that sounded over the agent are in its
+        // frames: ten frames a key at most are of their own.
+        Line::Telephone => pressed.is_empty() && tones <= 10 * asked.len() && life.unpressed == 0,
+        Line::Opus => pressed == asked && tones == 0 && life.unpressed == 0,
+    };
+    if !as_it_should {
+        return Err(format!(
+            "on {:?} the session was asked to press {asked:?}: it had {pressed:?} pressed, sent \
+             {tones} frames of tones and left {} keys",
+            plan.line, life.unpressed
+        ));
+    }
+
+    // Where no key ends a run, every key a caller pressed is a key of a
+    // run, so what is in the conversation is what they pressed.
+    if plan.spec.kernel.keys.terminator.is_none() {
+        for caller in 0..plan.callers {
+            let mut keys: Vec<(u64, char)> = plan
+                .keys
+                .iter()
+                .filter(|(_, who, _)| *who == caller)
+                .flat_map(|(at, _, run)| (*at..).step_by(200).zip(run.chars()))
+                .collect();
+            keys.sort_by_key(|(at, _)| *at);
+            let keys: String = keys.iter().map(|(_, key)| *key).collect();
+            let who = ParticipantId(u16::try_from(caller + 1).unwrap());
+            let kept: String = outcome
+                .keys()
+                .iter()
+                .filter(|(by, _)| *by == who)
+                .map(|(_, keys)| *keys)
+                .collect();
+            // Where a number of keys is a run, somebody who presses
+            // faster than their words come in begins more runs than a
+            // session holds open, and the keys beyond that are not
+            // taken. What is taken is still what was pressed, in order.
+            let mut pressed = keys.chars();
+            let in_order = kept.chars().all(|key| pressed.any(|next| next == key));
+            let all = plan.spec.kernel.keys.count.is_some() || kept == keys;
+            if !in_order || !all {
+                return Err(format!(
+                    "{who} pressed {keys:?}, and the conversation has {kept:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn keys() {
+    let check = pressed_as_it_should;
+    let Some(tally) = told(SEEDS, |seed| made_up(Profile::Keys, seed), check) else {
+        return;
+    };
+    // Several runs of keys to a session, among what is said and over the
+    // agent, which every key stops.
+    assert!(tally.keyed >= 2 * tally.runs, "{tally:?}");
+    assert!(tally.turns >= 2 * tally.runs, "{tally:?}");
+    assert!(tally.barge_ins >= tally.runs / 2, "{tally:?}");
+    assert!(tally.spoken >= tally.runs, "{tally:?}");
+    // And keys that leave in each of the three ways: pressed by the
+    // line, as tones, and not at all.
+    assert!(tally.pressed >= tally.runs / 4, "{tally:?}");
+    assert!(tally.tones >= tally.runs, "{tally:?}");
+    assert!(tally.unpressed >= tally.runs / 4, "{tally:?}");
+    assert_eq!(tally.lives, tally.runs, "{tally:?}");
+}
+
 /// A seed is a session: the same steps at the same moments, every time
 /// it is run. A failure is reported as the seed that made it, which is
 /// worth something only if this holds.
@@ -481,6 +603,7 @@ fn a_seed_tells_the_same_session_every_time() {
         Profile::Crashes,
         Profile::Shutdown,
         Profile::Lines,
+        Profile::Keys,
     ] {
         for seed in [3, 17] {
             let first = run(&made_up(profile, seed), true).unwrap();

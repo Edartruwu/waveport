@@ -69,6 +69,7 @@ impl Reporter {
     fn line(&self, notes: &mut Notes, fact: &Fact, text: &TextArena) -> Option<String> {
         match *fact {
             Fact::TurnCommitted { text: said, .. } => Some(format!("caller: {}", text.get(said))),
+            Fact::KeysCommitted { keys, .. } => Some(format!("caller pressed: {}", text.get(keys))),
             Fact::TurnDismissed { reason, .. } => Some(format!(
                 "(the caller made a sound that was not a turn: {reason:?})"
             )),
@@ -213,6 +214,18 @@ mod tests {
     fn stage(reporter: &Reporter, at_ms: u64, stage: Stage) {
         let at = MonoTime::from_millis(at_ms);
         reporter.stage(SessionId(1), StageMark { at, stage });
+    }
+
+    #[test]
+    fn keys_are_told_as_keys() {
+        let (reporter, mut printed) = reporter();
+        tell(&reporter, "4071", |keys| Fact::KeysCommitted {
+            turn: TurnId(2),
+            who: ParticipantId(0),
+            keys,
+        });
+        assert_eq!(printed.try_recv().unwrap(), "caller pressed: 4071");
+        assert!(printed.try_recv().is_err());
     }
 
     #[test]

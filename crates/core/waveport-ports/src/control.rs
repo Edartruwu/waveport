@@ -30,7 +30,7 @@ use core::task::{Context, Poll};
 
 use bytes::Bytes;
 use waveport_domain::command::ClientEvent;
-use waveport_domain::event::HandoffContext;
+use waveport_domain::event::{HandoffContext, Key};
 use waveport_domain::ids::{AgentId, GenId, ParticipantId, Seq};
 
 use crate::journal::SessionId;
@@ -49,6 +49,16 @@ pub enum SessionInput {
     Say {
         /// What to say.
         text: String,
+    },
+    /// The session is to press these keys of its telephone, one after
+    /// the other, for whoever is at the far end: a menu that asks for a
+    /// number. They leave as the session's transport has them leave, and
+    /// not at all on one that cannot press any, or while the line is
+    /// gone. The conversation does not hold them: whoever asks knows what
+    /// was asked.
+    Press {
+        /// The keys.
+        keys: Vec<Key>,
     },
     /// The agent is to stop speaking.
     Interrupt,

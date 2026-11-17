@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use bytes::Bytes;
 use waveport_domain::command::LlmCause;
-use waveport_domain::event::CloseReason;
+use waveport_domain::event::{CloseReason, Key};
 use waveport_domain::fact::{
     Dismissal, EpochCause, Fact, Lifecycle, NoticeKind, Stamped, ToolOutcome,
 };
@@ -65,10 +65,13 @@ impl core::error::Error for CodecError {}
 /// The record could not be written. That is a fault of this module and not
 /// of the fact.
 pub fn encode(stamped: &Stamped, text: &TextArena) -> Result<Bytes, CodecError> {
+    let fact = to_wire(&stamped.fact, text);
+    // The first version that has the fact, and not the newest there is: a
+    // build that is rolled back reads what it could have written.
     let record = wire::Record {
-        v: wire::VERSION,
+        v: fact.since(),
         seq: stamped.seq.get(),
-        fact: to_wire(&stamped.fact, text),
+        fact,
     };
     serde_json::to_vec(&record)
         .map(Bytes::from)
@@ -117,7 +120,9 @@ fn version_of(written: &[u8]) -> Result<u32, CodecError> {
 /// The state could not be written. That is a fault of this module and not
 /// of the snapshot.
 pub fn encode_state(snapshot: &Snapshot, heard_until: MediaTime) -> Result<Bytes, CodecError> {
-    let state = state_out(&snapshot.parts(), heard_until);
+    let mut state = state_out(&snapshot.parts(), heard_until);
+    // As for a record: the first version that has all of it.
+    state.v = state.since();
     serde_json::to_vec(&state)
         .map(Bytes::from)
         .map_err(|error| CodecError::Malformed(error.to_string()))
@@ -328,6 +333,11 @@ fn item_out<'a>(item: &ItemView<'a>) -> wire::Item<'a> {
             text: Cow::Borrowed(text),
             addressed,
         },
+        ItemView::Keys { turn, who, keys } => wire::Item::Keys {
+            turn: turn.get(),
+            who: who.get(),
+            keys: Cow::Borrowed(keys),
+        },
         ItemView::Utterance {
             generation,
             agent,
@@ -378,6 +388,15 @@ fn item_in<'a>(item: &'a wire::Item<'_>) -> ItemView<'a> {
             who: ParticipantId(who),
             text,
             addressed,
+        },
+        wire::Item::Keys {
+            turn,
+            who,
+            ref keys,
+        } => ItemView::Keys {
+            turn: TurnId(turn),
+            who: ParticipantId(who),
+            keys,
         },
         wire::Item::Utterance {
             generation,
@@ -462,6 +481,11 @@ fn to_wire<'a>(fact: &Fact, text: &'a TextArena) -> wire::Fact<'a> {
             span: [span.start.ticks(), span.end.ticks()],
             text: borrowed(said),
             addressed,
+        },
+        Fact::KeysCommitted { turn, who, keys } => wire::Fact::KeysCommitted {
+            turn: turn.get(),
+            who: who.get(),
+            keys: borrowed(keys),
         },
         Fact::TurnDismissed { turn, who, reason } => wire::Fact::TurnDismissed {
             turn: turn.get(),
@@ -562,6 +586,22 @@ fn from_wire(fact: &wire::Fact<'_>, text: &mut TextArena) -> Result<Fact, CodecE
                 span: MediaSpan::new(MediaTime::from_ticks(start), MediaTime::from_ticks(end)),
                 text: text.push(said),
                 addressed,
+            }
+        }
+        wire::Fact::KeysCommitted {
+            turn,
+            who,
+            ref keys,
+        } => {
+            if keys.is_empty() || keys.chars().any(|key| Key::from_char(key).is_none()) {
+                return Err(CodecError::Malformed(format!(
+                    "{keys:?} are not keys of a telephone"
+                )));
+            }
+            Fact::KeysCommitted {
+                turn: TurnId(turn),
+                who: ParticipantId(who),
+                keys: text.push(keys),
             }
         }
         wire::Fact::TurnDismissed { turn, who, reason } => Fact::TurnDismissed {
@@ -838,6 +878,11 @@ mod tests {
                 text: text.push(""),
                 addressed: false,
             },
+            Fact::KeysCommitted {
+                turn: TurnId(8),
+                who,
+                keys: text.push("0123456789*#ABCD"),
+            },
             Fact::TurnDismissed {
                 turn: TurnId(6),
                 who,
@@ -941,9 +986,10 @@ mod tests {
             Fact::BatchResolved { .. } => 13,
             Fact::HandoffRequested { .. } => 14,
             Fact::AgentActivated { .. } => 15,
+            Fact::KeysCommitted { .. } => 16,
         }
     }
-    const KINDS: usize = 16;
+    const KINDS: usize = 17;
 
     #[test]
     fn every_kind_of_fact_comes_back_as_it_was_written() {
@@ -1014,14 +1060,24 @@ mod tests {
         let stages = stages(&facts, &text);
         assert_eq!(stages.len(), facts.len() + 1);
         let mut heard = MediaTime::from_ticks(0);
+        let mut versions = [0, 0];
         for (upto, snapshot) in stages.iter().enumerate() {
             heard = MediaTime::from_ticks(heard.ticks() + 48_000);
             let state = encode_state(snapshot, heard).unwrap();
             // Whatever stores a state may keep it as a line, as a record.
             let line = core::str::from_utf8(&state).unwrap();
             assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+            // A state is of the first version that has all it holds:
+            // the second from where somebody has pressed keys.
+            let keys = |item: &ItemView<'_>| matches!(item, ItemView::Keys { .. });
+            let version = if snapshot.parts().items.iter().any(keys) {
+                2
+            } else {
+                1
+            };
+            versions[version - 1] += 1;
             assert!(
-                line.starts_with(&format!("{{\"v\":1,\"upto\":{upto},")),
+                line.starts_with(&format!("{{\"v\":{version},\"upto\":{upto},")),
                 "{line}"
             );
 
@@ -1029,6 +1085,7 @@ mod tests {
             assert_eq!(&back, snapshot, "after fact {upto}");
             assert_eq!(heard_back, heard);
         }
+        assert!(versions[0] > 0 && versions[1] > 0, "{versions:?}");
         // Between them the stages hold something of everything a
         // snapshot can hold.
         let some = |holds: fn(&SnapshotParts<'_>) -> bool| {
@@ -1047,10 +1104,10 @@ mod tests {
     fn a_state_of_a_later_version_is_refused_by_its_version() {
         // A later version, with something this build has never heard of
         // where this build needs something else.
-        let later = br#"{"v":2,"upto":4,"mood":"cheerful"}"#;
+        let later = br#"{"v":3,"upto":4,"mood":"cheerful"}"#;
         assert_eq!(
             decode_state(later).unwrap_err(),
-            CodecError::Newer { version: 2 }
+            CodecError::Newer { version: 3 }
         );
     }
 
@@ -1076,7 +1133,7 @@ mod tests {
             String::new(),
             "not json".to_owned(),
             // No version, and a record where a state belongs.
-            whole.replacen("\"v\":1,", "", 1),
+            whole.replacen("\"v\":2,", "", 1),
             r#"{"v":1,"seq":4,"fact":{"kind":"tool_authorized","call":9}}"#.to_owned(),
             // Cut short.
             whole[..whole.len() / 2].to_owned(),
@@ -1106,14 +1163,94 @@ mod tests {
         }
     }
 
+    /// A journal as the build before keys wrote it, revision `a694b75`: a
+    /// record of every kind of fact there was then, and the state they
+    /// add up to, a line each.
+    const BEFORE_KEYS: &str = include_str!("../tests/fixtures/journal-v1.jsonl");
+
+    #[test]
+    fn a_journal_written_before_keys_still_opens() {
+        let mut lines: Vec<&str> = BEFORE_KEYS.lines().collect();
+        let state_line = lines.pop().unwrap();
+        assert_eq!(lines.len(), 34);
+        let mut text = TextArena::default();
+        let mut facts = Vec::new();
+        for (line, seq) in lines.iter().zip(1..) {
+            assert!(line.starts_with("{\"v\":1,"), "{line}");
+            let stamped = decode(line.as_bytes(), &mut text).unwrap();
+            assert_eq!(stamped.seq, Seq(seq));
+            // And this build writes the fact as that build did: a build
+            // that is rolled back reads what this one wrote.
+            assert_eq!(&encode(&stamped, &text).unwrap()[..], line.as_bytes());
+            facts.push(stamped);
+        }
+        // The state that build made of them is the one this build makes
+        // of them, and writes as that build did.
+        let (state, heard) = decode_state(state_line.as_bytes()).unwrap();
+        assert_eq!(heard, MediaTime::from_ticks(96_000));
+        let config = KernelConfig::default();
+        let blank = Kernel::new(config.clone(), DefaultPolicies::default())
+            .unwrap()
+            .snapshot();
+        let policies = DefaultPolicies::default();
+        let restored = Kernel::restore(config, policies, &blank, &facts, &text).unwrap();
+        assert_eq!(restored.snapshot(), state);
+        assert_eq!(
+            &encode_state(&state, heard).unwrap()[..],
+            state_line.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_record_is_of_the_first_version_that_has_its_fact() {
+        // Not of the newest there is: a build from before keys reads
+        // everything of a session in which nobody pressed one.
+        let mut text = TextArena::default();
+        for fact in every_kind(&mut text) {
+            let record = encode(&Stamped { seq: Seq(7), fact }, &text).unwrap();
+            let line = core::str::from_utf8(&record).unwrap();
+            let version = if matches!(fact, Fact::KeysCommitted { .. }) {
+                2
+            } else {
+                1
+            };
+            assert!(
+                line.starts_with(&format!("{{\"v\":{version},\"seq\":7,")),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn keys_that_are_none_are_refused() {
+        let mut text = TextArena::default();
+        let cases: [&[u8]; 3] = [
+            br#"{"v":2,"seq":4,"fact":{"kind":"keys_committed","turn":1,"who":1,"keys":""}}"#,
+            br#"{"v":2,"seq":4,"fact":{"kind":"keys_committed","turn":1,"who":1,"keys":"12E"}}"#,
+            br#"{"v":2,"seq":4,"fact":{"kind":"keys_committed","turn":1,"who":1,"keys":"1 2"}}"#,
+        ];
+        for case in cases {
+            let refused = decode(case, &mut text);
+            assert!(
+                matches!(refused, Err(CodecError::Malformed(_))),
+                "{}: {refused:?}",
+                String::from_utf8_lossy(case)
+            );
+        }
+        let pressed =
+            br#"{"v":2,"seq":4,"fact":{"kind":"keys_committed","turn":1,"who":1,"keys":"12d#"}}"#;
+        let read = decode(pressed, &mut text).unwrap();
+        assert_eq!(read.fact.text().map(|at| text.get(at)), Some("12d#"));
+    }
+
     #[test]
     fn a_record_of_a_later_version_is_refused_by_its_version() {
         let mut text = TextArena::default();
         // A later version, with a fact this build has never heard of.
-        let later = br#"{"v":2,"seq":4,"fact":{"kind":"mood_changed","to":"cheerful"}}"#;
+        let later = br#"{"v":3,"seq":4,"fact":{"kind":"mood_changed","to":"cheerful"}}"#;
         assert_eq!(
             decode(later, &mut text),
-            Err(CodecError::Newer { version: 2 })
+            Err(CodecError::Newer { version: 3 })
         );
         assert!(text.is_empty(), "nothing was read");
     }

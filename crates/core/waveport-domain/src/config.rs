@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::time::Duration;
 
+use crate::event::Key;
 use crate::ids::{AgentId, ToolId};
 use crate::time::MediaDur;
 
@@ -15,6 +16,8 @@ pub struct KernelConfig {
     pub limits: Limits,
     /// How long the kernel waits for things.
     pub timing: Timing,
+    /// When keys that are pressed one after the other are a turn.
+    pub keys: KeyPolicy,
     /// The agents. An [`AgentId`] is an index into this list.
     pub agents: Vec<AgentSpec>,
     /// The agent that holds the floor when the session starts.
@@ -29,6 +32,7 @@ impl Default for KernelConfig {
         Self {
             limits: Limits::default(),
             timing: Timing::default(),
+            keys: KeyPolicy::default(),
             agents: vec![AgentSpec::default()],
             front: AgentId(0),
             tools: Vec::new(),
@@ -63,6 +67,7 @@ impl KernelConfig {
             ("open_calls", limits.open_calls),
             ("pending_text", limits.pending_text),
             ("response_text", limits.response_text),
+            ("keys", limits.keys),
         ] {
             if value == 0 {
                 return Err(ConfigError::ZeroLimit(name));
@@ -105,6 +110,36 @@ impl KernelConfig {
     }
 }
 
+/// When the keys of a telephone that somebody presses one after the other
+/// are a turn. A run of keys is over at the first of three things: the key
+/// that ends one, the number of keys that makes one, and a time in which
+/// no key followed.
+///
+/// Waiting for a first key is not here. Only whoever asked for keys can
+/// wait for one, and the session does not know that anybody did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KeyPolicy {
+    /// The key that ends a run. It is not one of the run's keys. Pressed
+    /// when no run is under way, it is a run by itself. `None` if no key
+    /// ends a run.
+    pub terminator: Option<Key>,
+    /// How many keys are a run. `None` if no number is.
+    pub count: Option<u8>,
+    /// How long after a key the run is over, if no other followed.
+    pub wait: Duration,
+}
+
+impl Default for KeyPolicy {
+    /// The hash ends a run, and so do three seconds without a key.
+    fn default() -> Self {
+        Self {
+            terminator: Some(Key::Hash),
+            count: None,
+            wait: Duration::from_secs(3),
+        }
+    }
+}
+
 /// How large the kernel's tables are. Each is reserved in full when the
 /// session starts and never grows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -124,6 +159,9 @@ pub struct Limits {
     /// Bytes reserved for the text of each response when it starts. A
     /// longer response grows its buffer.
     pub response_text: usize,
+    /// Keys in one turn. A run of keys that reaches this is a turn, and
+    /// the key after it begins the next.
+    pub keys: usize,
 }
 
 impl Default for Limits {
@@ -135,6 +173,7 @@ impl Default for Limits {
             open_calls: 16,
             pending_text: 8192,
             response_text: 2048,
+            keys: 32,
         }
     }
 }

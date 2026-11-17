@@ -15,7 +15,7 @@
 use core::task::Context;
 
 use waveport_domain::command::SenseCmd;
-use waveport_domain::event::Event;
+use waveport_domain::event::{Event, Key};
 use waveport_domain::ids::{OpTag, ParticipantId};
 use waveport_domain::kernel::View;
 use waveport_domain::time::{MediaDur, MonoTime};
@@ -58,7 +58,10 @@ impl Driver {
     pub(crate) fn count(&self, stats: &mut SessionStats) {
         match self {
             Self::Cascade(parts) => parts.count(stats),
-            Self::Text(writer) => stats.strays = writer.unheard(),
+            Self::Text(writer) => {
+                stats.strays = writer.unheard();
+                stats.speaking.keys_unpressed = writer.unpressed();
+            }
         }
     }
 
@@ -184,6 +187,23 @@ impl Driver {
         match self {
             Self::Cascade(parts) => parts.parted(cx),
             Self::Text(_) => true,
+        }
+    }
+
+    /// The session is to press `keys` of its telephone.
+    pub(crate) fn press(&mut self, keys: &[Key], now: MonoTime) {
+        match self {
+            Self::Cascade(parts) => parts.press(keys, now),
+            // A session of text has no telephone.
+            Self::Text(writer) => writer.cannot_press(keys.len()),
+        }
+    }
+
+    /// The line is gone: the keys that are still to be pressed are not.
+    pub(crate) fn forget_keys(&mut self) {
+        match self {
+            Self::Cascade(parts) => parts.forget_keys(),
+            Self::Text(_) => {}
         }
     }
 

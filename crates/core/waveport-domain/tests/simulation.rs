@@ -16,7 +16,7 @@
 use waveport_kernel_sim::check::Report;
 use waveport_kernel_sim::seeded::{Profile, Tally, sweep};
 
-/// Sessions per profile in an ordinary test run: 4,200 in all.
+/// Sessions per profile in an ordinary test run: 4,800 in all.
 const SEEDS: u64 = 600;
 
 /// Runs the profile's sessions. Returns what they did when at least the
@@ -162,6 +162,31 @@ fn lines() -> Result<(), Report> {
     assert!(tally.calls >= 200, "{tally:?}");
     assert!(tally.completed >= 100, "{tally:?}");
     assert!(tally.continuations >= 80, "{tally:?}");
+    Ok(())
+}
+
+#[test]
+fn keys() -> Result<(), Report> {
+    let Some(tally) = swept(Profile::Keys)? else {
+        return Ok(());
+    };
+    // Several keys to a run, and many runs to a session: with and without
+    // the key that ends one, of a number of keys, or ended by the time in
+    // which no key followed.
+    assert!(tally.keys >= 6_000, "{tally:?}");
+    assert!(tally.keyed >= 2_500, "{tally:?}");
+    assert!(tally.keys >= 2 * tally.keyed, "{tally:?}");
+    // Keys among speech, and over the agent, which every one of them
+    // stops.
+    assert!(tally.turns >= 2_500, "{tally:?}");
+    assert!(tally.barge_ins >= 800, "{tally:?}");
+    assert!(tally.cut >= 800, "{tally:?}");
+    // What the keys ask for is answered, in words and with tools.
+    assert!(tally.replies >= 4_000, "{tally:?}");
+    assert!(tally.spoken >= 800, "{tally:?}");
+    assert!(tally.calls >= 1_000, "{tally:?}");
+    assert!(tally.continuations >= 400, "{tally:?}");
+    assert!(tally.closed >= 100, "{tally:?}");
     Ok(())
 }
 

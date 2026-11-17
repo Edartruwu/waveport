@@ -450,6 +450,7 @@ pub(crate) fn lines(kernel: &Kernel<BoxedPolicies>) -> Vec<String> {
         .items()
         .map(|item| match item {
             ItemView::UserTurn { who, text, .. } => format!("{who}: {text}"),
+            ItemView::Keys { who, keys, .. } => format!("{who} pressed: {keys}"),
             ItemView::Utterance {
                 agent,
                 text,

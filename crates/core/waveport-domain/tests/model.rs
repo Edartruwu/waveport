@@ -38,6 +38,7 @@ fn one_turn() -> Scope {
         says: 0,
         closes: 0,
         drops: 0,
+        keys: 0,
         crashes: 0,
         late: 0,
         most_states: 4_000_000,
@@ -66,6 +67,15 @@ struct Seen {
     waiting: Cell<u64>,
     /// A session that closed with its line gone.
     abandoned: Cell<u64>,
+    /// Keys in the conversation.
+    keyed: Cell<u64>,
+    /// Keys right after what their presser said, and right before it.
+    said_then_pressed: Cell<u64>,
+    pressed_then_said: Cell<u64>,
+    /// Two runs of keys, one after the other.
+    pressed_twice: Cell<u64>,
+    /// Keys that could go on and words that wait for them.
+    behind_keys: Cell<u64>,
 }
 
 impl Seen {
@@ -102,6 +112,23 @@ impl Seen {
         count(&self.restored, restored);
         count(&self.closed, view.lifecycle() == Lifecycle::Closed);
         count(&self.together, view.generations().count() >= 2);
+        let kinds = view
+            .items()
+            .map(|item| match item {
+                ItemView::UserTurn { .. } => 't',
+                ItemView::Keys { .. } => 'k',
+                _ => '.',
+            })
+            .collect::<String>();
+        count(&self.keyed, kinds.contains('k'));
+        count(&self.said_then_pressed, kinds.contains("tk"));
+        count(&self.pressed_then_said, kinds.contains("kt"));
+        count(&self.pressed_twice, kinds.contains("kk"));
+        let open = view
+            .turns()
+            .map(|open| if open.keys { 'k' } else { 't' })
+            .collect::<String>();
+        count(&self.behind_keys, open == "kt");
         let gone = !view.is_attached();
         let running = view.lifecycle() == Lifecycle::Running;
         count(&self.waiting, gone && running && view.reply_owed());
@@ -268,6 +295,46 @@ fn words_to_say_and_a_model_that_does_not_stop() -> Result<(), Report> {
     let (explored, seen) = tried(&scope)?;
     assert!(explored.states >= 10_000, "{explored:?}");
     assert!(seen.whole.get() > 0 && seen.cut.get() > 0, "{seen:?}");
+    Ok(())
+}
+
+#[test]
+fn keys_and_a_turn() -> Result<(), Report> {
+    let scope = Scope {
+        keys: 2,
+        timers: 1,
+        ..one_turn()
+    };
+    let (explored, seen) = tried(&scope)?;
+    assert!(explored.states >= 40_000, "{explored:?}");
+    // Two keys, each a digit or the key that ends a run, at every moment
+    // of a turn and its reply: one run or two, before what is said, after
+    // it and in the middle of it, and over the agent.
+    assert!(seen.keyed.get() > 0, "{seen:?}");
+    assert!(seen.pressed_twice.get() > 0, "{seen:?}");
+    assert!(seen.said_then_pressed.get() > 0, "{seen:?}");
+    assert!(seen.pressed_then_said.get() > 0, "{seen:?}");
+    // Words that are in wait for keys that could go on.
+    assert!(seen.behind_keys.get() > 0, "{seen:?}");
+    assert!(seen.cut.get() > 0 && seen.whole.get() > 0, "{seen:?}");
+    Ok(())
+}
+
+#[test]
+fn a_key_and_a_call() -> Result<(), Report> {
+    let scope = Scope {
+        tools: vec![Effect::Pure],
+        calls: 1,
+        keys: 1,
+        timers: 1,
+        ..one_turn()
+    };
+    let (explored, seen) = tried(&scope)?;
+    assert!(explored.states >= 45_000, "{explored:?}");
+    // The key is pressed before the call, while it runs and while what it
+    // found is said.
+    assert!(seen.keyed.get() > 0 && seen.completed.get() > 0, "{seen:?}");
+    assert!(seen.cut.get() > 0 && seen.whole.get() > 0, "{seen:?}");
     Ok(())
 }
 
@@ -462,13 +529,72 @@ fn larger() -> Vec<(&'static str, Scope, u64)> {
         (
             "a call, a close and four timers",
             Scope {
-                tools: once,
+                tools: once.clone(),
                 calls: 1,
                 closes: 1,
                 timers: 4,
                 ..one_turn()
             },
             120_000,
+        ),
+        (
+            "three keys and a turn",
+            Scope {
+                keys: 3,
+                timers: 2,
+                ..one_turn()
+            },
+            2_500_000,
+        ),
+        (
+            "keys of two people",
+            Scope {
+                people: 2,
+                keys: 2,
+                timers: 1,
+                ..one_turn()
+            },
+            300_000,
+        ),
+        (
+            "keys and a process that dies",
+            Scope {
+                keys: 2,
+                crashes: 1,
+                timers: 1,
+                ..one_turn()
+            },
+            250_000,
+        ),
+        (
+            "keys and a close",
+            Scope {
+                keys: 2,
+                closes: 1,
+                timers: 1,
+                ..one_turn()
+            },
+            100_000,
+        ),
+        (
+            "a key and a line that drops",
+            Scope {
+                keys: 1,
+                drops: 1,
+                timers: 2,
+                ..one_turn()
+            },
+            120_000,
+        ),
+        (
+            "keys and a call that happens at most once",
+            Scope {
+                tools: once,
+                calls: 1,
+                keys: 2,
+                ..one_turn()
+            },
+            100_000,
         ),
     ]
 }
@@ -483,6 +609,6 @@ fn larger_sessions() -> Result<(), Report> {
         assert!(explored.states >= least, "{name}: {explored:?}");
         states += explored.states;
     }
-    assert!(states >= 8_000_000, "{states}");
+    assert!(states >= 11_500_000, "{states}");
     Ok(())
 }

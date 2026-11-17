@@ -36,7 +36,7 @@ mod typed_cut_off;
 mod typed_twice;
 mod words_after_barge_in;
 
-use waveport_kernel_sim::check::{Report, passes, pending, unstarted};
+use waveport_kernel_sim::check::{Report, passes, unstarted};
 
 #[test]
 fn lost_input() -> Result<(), Report> {
@@ -111,15 +111,12 @@ fn line_stays_gone() -> Result<(), Report> {
     passes(line_stays_gone::line_stays_gone)
 }
 
-/// Waits for the kernel to take keys: today there is no event to tell it
-/// of one.
 #[test]
 fn keys_are_one_turn() -> Result<(), Report> {
-    pending(keys_are_one_turn::keys_are_one_turn)
+    passes(keys_are_one_turn::keys_are_one_turn)
 }
 
-/// Waits for the same.
 #[test]
 fn keys_after_speech() -> Result<(), Report> {
-    pending(keys_after_speech::keys_after_speech)
+    passes(keys_after_speech::keys_after_speech)
 }

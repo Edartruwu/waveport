@@ -57,6 +57,9 @@ pub(crate) struct Writer {
     /// Packets of audio that came on a transport that carries some.
     /// Nobody hears them.
     unheard: u64,
+    /// Keys the session was asked to press. A session of text has no
+    /// telephone to press them on.
+    unpressed: u64,
 }
 
 impl Writer {
@@ -104,6 +107,17 @@ impl Writer {
     /// How many packets of audio came and were not heard.
     pub(crate) const fn unheard(&self) -> u64 {
         self.unheard
+    }
+
+    /// The session was asked to press `keys` keys, which it cannot.
+    pub(crate) fn cannot_press(&mut self, keys: usize) {
+        let keys = u64::try_from(keys).unwrap_or(u64::MAX);
+        self.unpressed = self.unpressed.saturating_add(keys);
+    }
+
+    /// How many keys the session was asked to press.
+    pub(crate) const fn unpressed(&self) -> u64 {
+        self.unpressed
     }
 
     /// No more text of the response `tag` follows.

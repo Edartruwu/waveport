@@ -208,6 +208,8 @@ impl Summary {
                     turn.addressed = addressed;
                 }
             }
+            // Keys are a turn, and one that is always for the agent.
+            Fact::KeysCommitted { .. } => inner.counts.turns += 1,
             Fact::TurnDismissed { .. } => inner.counts.dismissed += 1,
             Fact::UtteranceCommitted { truncated, .. } => {
                 inner.counts.utterances += 1;

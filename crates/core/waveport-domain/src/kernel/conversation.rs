@@ -27,6 +27,11 @@ enum Item {
         text: Span,
         addressed: bool,
     },
+    Keys {
+        turn: TurnId,
+        who: ParticipantId,
+        keys: Span,
+    },
     Utterance {
         generation: GenId,
         agent: AgentId,
@@ -98,6 +103,12 @@ impl Conversation {
             text,
             addressed,
         });
+    }
+
+    /// Appends the keys a user pressed.
+    pub(super) fn push_keys(&mut self, turn: TurnId, who: ParticipantId, keys: &str) {
+        let keys = self.keep(keys);
+        self.items.push(Item::Keys { turn, who, keys });
     }
 
     /// Appends what an agent said, as far as it was heard.
@@ -175,6 +186,11 @@ impl Conversation {
                 who,
                 text: self.text_of(text),
                 addressed,
+            },
+            Item::Keys { turn, who, keys } => ItemView::Keys {
+                turn,
+                who,
+                keys: self.text_of(keys),
             },
             Item::Utterance {
                 generation,

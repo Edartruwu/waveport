@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use waveport_domain::command::{Activity, ClientEvent};
 use waveport_domain::config::{AgentSpec, Effect, KernelConfig, ToolSpec};
+use waveport_domain::event::Key;
 use waveport_domain::fact::Lifecycle;
 use waveport_domain::ids::{GenId, ParticipantId, ToolId};
 use waveport_domain::kernel::ItemView;
@@ -157,6 +158,10 @@ impl Chat {
                 ItemView::UserTurn { who, text, .. } => Said::User {
                     speaker: Some(who),
                     text: text.to_owned(),
+                },
+                ItemView::Keys { who, keys, .. } => Said::User {
+                    speaker: Some(who),
+                    text: waveport_runtime::context::keys_as_text(keys),
                 },
                 ItemView::Utterance { text, .. } => Said::Assistant {
                     text: text.to_owned(),
@@ -526,6 +531,22 @@ async fn a_chat_goes_on_from_its_journal() {
     let asked = chat.llm.asked();
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].messages.len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chat_has_no_telephone_to_press_keys_on() {
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say("Hello!")]]);
+    let mut chat = Chat::start(llm).await;
+    let keys = vec![Key::One, Key::Two, Key::Hash];
+    chat.ask
+        .try_send(SessionInput::Press { keys }.into())
+        .unwrap();
+    chat.types("hello");
+    assert_eq!(chat.until(1_000).await, None);
+    // The keys were not pressed, the session says how many, and the
+    // chat goes on as if nothing had been asked.
+    assert_eq!(chat.session.stats().speaking.keys_unpressed, 3);
+    assert_eq!(chat.conversation(), [user("hello"), assistant("Hello!")]);
 }
 
 #[tokio::test(start_paused = true)]

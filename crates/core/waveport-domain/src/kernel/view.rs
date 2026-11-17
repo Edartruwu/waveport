@@ -101,6 +101,7 @@ impl<'a> View<'a> {
             span: open.span,
             speaking: open.speaking,
             ducking: open.overlap.map(|overlap| overlap.generation),
+            keys: open.keyed,
         })
     }
 
@@ -204,6 +205,8 @@ pub struct TurnView {
     /// The response whose speech this turn overlaps and has lowered, while
     /// that is undecided.
     pub ducking: Option<GenId>,
+    /// Whether it is a turn of keys that are pressed, and not of speech.
+    pub keys: bool,
 }
 
 /// A tool call that has not ended.
@@ -264,6 +267,15 @@ pub enum ItemView<'a> {
         text: &'a str,
         /// Whether it was meant for the agent.
         addressed: bool,
+    },
+    /// Keys of a telephone that a user pressed, one after the other.
+    Keys {
+        /// The turn.
+        turn: TurnId,
+        /// Who pressed them.
+        who: ParticipantId,
+        /// The keys as they are written: digits, `*`, `#` and `A` to `D`.
+        keys: &'a str,
     },
     /// What an agent said, as far as it was heard.
     Utterance {

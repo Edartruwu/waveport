@@ -11,7 +11,7 @@ use core::task::{Context, Poll};
 use std::sync::Arc;
 
 use waveport_domain::command::SenseCmd;
-use waveport_domain::event::Event;
+use waveport_domain::event::{Event, Key};
 use waveport_domain::ids::{OpTag, ParticipantId, TurnId};
 use waveport_domain::kernel::View;
 use waveport_domain::time::{MediaDur, MediaTime, MonoTime};
@@ -225,6 +225,16 @@ impl Cascade {
     /// Returns whether it is the first of that response.
     pub(crate) fn say(&mut self, tag: OpTag, piece: &str) -> bool {
         self.voice.speak(tag, piece)
+    }
+
+    /// The session is to press `keys`.
+    pub(crate) fn press(&mut self, keys: &[Key], now: MonoTime) {
+        self.voice.press(keys, now);
+    }
+
+    /// The keys that are still to be pressed are not.
+    pub(crate) fn forget_keys(&mut self) {
+        self.voice.forget_keys();
     }
 
     /// No more text of the response `tag` follows.

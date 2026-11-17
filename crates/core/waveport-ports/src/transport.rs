@@ -8,10 +8,19 @@
 //! A transport need not carry audio. One that carries text alone says so
 //! in what it can do ([`TransportCaps::audio`]), and a session that
 //! hears and speaks is not started on it.
+//!
+//! The keys of a telephone are not audio either way. A key somebody
+//! pressed arrives as an event ([`TransportEvent::Dtmf`]), from a
+//! transport whose far end says which key it was: nothing in a session
+//! listens for the tones of keys, because speech is taken for them too
+//! easily. A key the session presses leaves in the way the transport
+//! says ([`TransportCaps::keys`]): by itself, or as a tone in the audio
+//! where the far end has no other way to be told.
 
 use core::task::{Context, Poll};
 
 use bytes::Bytes;
+use waveport_domain::event::Key;
 use waveport_domain::ids::{OpTag, ParticipantId};
 use waveport_domain::time::MediaDur;
 
@@ -46,6 +55,23 @@ pub trait Transport: Send + 'static {
     ///
     /// [`Full`]: the transport is behind. The request was not taken.
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full>;
+
+    /// Sends a frame of audio that is of no response: the tone of a key
+    /// the session presses while nothing is being said, or the pause
+    /// after it. It is played after whatever was sent before it, and
+    /// counts for no response's playback.
+    ///
+    /// Only a transport whose keys leave as tones ([`KeysOut::Tones`])
+    /// is given any, so one that says otherwise need not have this.
+    ///
+    /// # Errors
+    ///
+    /// [`Full`]: the transport is behind. The frame was not taken, and is
+    /// not sent later.
+    fn try_send_tone(&mut self, tone: ToneOut<'_>) -> Result<(), Full> {
+        let _ = tone;
+        Ok(())
+    }
 
     /// Tells the far end that the session is over, in whatever way the
     /// transport has for that: a goodbye, a call that is hung up. `Ready`
@@ -102,6 +128,14 @@ pub enum TransportEvent {
         /// What they wrote.
         text: String,
     },
+    /// A participant pressed a key of their telephone, and the far end
+    /// says which.
+    Dtmf {
+        /// Who.
+        who: ParticipantId,
+        /// The key.
+        key: Key,
+    },
     /// The connection dropped. It may come back.
     Detached,
     /// The connection is back.
@@ -123,6 +157,15 @@ pub struct FrameOut<'a> {
     pub last: bool,
 }
 
+/// A frame of audio that is of no response, encoded for the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToneOut<'a> {
+    /// How long it lasts.
+    pub length: MediaDur,
+    /// The packet.
+    pub payload: &'a [u8],
+}
+
 /// A request to a transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TransportControl {
@@ -134,6 +177,13 @@ pub enum TransportControl {
         /// The response.
         tag: OpTag,
     },
+    /// Press this key at the far end, after the keys it was asked to
+    /// press before. Only a transport that presses keys itself
+    /// ([`KeysOut::OutOfBand`]) is asked.
+    Dtmf {
+        /// The key.
+        key: Key,
+    },
 }
 
 /// What a transport can do.
@@ -143,6 +193,22 @@ pub struct TransportCaps {
     pub audio: Option<AudioCaps>,
     /// Whether participants can send text.
     pub text: bool,
+    /// How a key that the session presses reaches the far end. `None`
+    /// for a transport on which none can be pressed.
+    pub keys: Option<KeysOut>,
+}
+
+/// How a key that a session presses reaches the far end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeysOut {
+    /// The transport presses it ([`TransportControl::Dtmf`]): with a
+    /// message of its own, a request to its carrier, or an event in its
+    /// stream. Nothing is heard in the audio.
+    OutOfBand,
+    /// As a tone in the audio the session sends: the far end has no
+    /// other way to be told. The session makes the tone, and it sounds
+    /// over whatever is being said, as on a telephone.
+    Tones,
 }
 
 /// How a transport carries audio.

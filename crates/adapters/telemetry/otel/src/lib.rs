@@ -571,6 +571,29 @@ impl Otel {
             .end_with_timestamp(to);
     }
 
+    /// A turn entered the conversation, said or pressed.
+    fn committed(
+        &self,
+        session: SessionId,
+        watched: &mut Watched,
+        turn: TurnId,
+        addressed: bool,
+        now: SystemTime,
+    ) {
+        let committed = KeyValue::new(names::TURN_OUTCOME, "committed");
+        let said_to = KeyValue::new(names::ADDRESSED, addressed);
+        self.measures.turns.add(1, &[committed, said_to.clone()]);
+        if let Some(open) = watched.open.take_if(|open| open.turn == turn) {
+            open.cx.span().set_attribute(said_to);
+            if addressed {
+                watched.open = Some(open);
+            } else {
+                // Nobody answers a turn that was said to someone else.
+                self.close(session, watched, &open, now);
+            }
+        }
+    }
+
     /// Takes one fact, recorded at `at`. Returns whether the session is
     /// over.
     fn fact(&self, session: SessionId, watched: &mut Watched, at: MonoTime, fact: &Fact) -> bool {
@@ -578,21 +601,9 @@ impl Otel {
         match *fact {
             Fact::TurnCommitted {
                 turn, addressed, ..
-            } => {
-                let committed = KeyValue::new(names::TURN_OUTCOME, "committed");
-                let said_to = KeyValue::new(names::ADDRESSED, addressed);
-                self.measures.turns.add(1, &[committed, said_to.clone()]);
-                if let Some(open) = watched.open.take_if(|open| open.turn == turn) {
-                    open.cx.span().set_attribute(said_to);
-                    if addressed {
-                        watched.open = Some(open);
-                    } else {
-                        // Nobody answers a turn that was said to someone
-                        // else.
-                        self.close(session, watched, &open, now);
-                    }
-                }
-            }
+            } => self.committed(session, watched, turn, addressed, now),
+            // Keys are a turn that is always for the agent.
+            Fact::KeysCommitted { turn, .. } => self.committed(session, watched, turn, true, now),
             Fact::TurnDismissed { reason, .. } => {
                 let why = KeyValue::new(names::TURN_OUTCOME, dismissal_name(reason));
                 self.measures.turns.add(1, &[why]);

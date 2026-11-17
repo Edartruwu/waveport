@@ -10,8 +10,8 @@ use crate::time::{MediaDur, MediaSpan, MediaTime};
 /// input, and the difference is what closes the race where a user's words
 /// are flushed by the interruption they caused:
 ///
-/// - **Perception** (`Speech`, `Transcript`, `Eou`, `Overlap`, `TextIn`) is a
-///   fact about the world. It is never dropped because the agent was
+/// - **Perception** (`Speech`, `Transcript`, `Eou`, `Overlap`, `TextIn`, `Key`)
+///   is a fact about the world. It is never dropped because the agent was
 ///   interrupted.
 /// - **Results of agent output** (`Op`) are dropped, in one place, when the
 ///   response they belong to is no longer live.
@@ -62,6 +62,13 @@ pub enum Event {
         /// What they wrote.
         text: Text,
     },
+    /// A participant pressed a key of a telephone.
+    Key {
+        /// Who.
+        who: ParticipantId,
+        /// Which key.
+        key: Key,
+    },
     /// A result of work on a response, with the tag the work was started
     /// with.
     Op(OpTag, OpEvent),
@@ -74,6 +81,144 @@ pub enum Event {
     Control(ControlInput),
     /// Every fact up to and including this one is stored durably.
     Durable(Seq),
+}
+
+/// A key of a telephone: the sixteen that RFC 4733 numbers from 0 to 15.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Key {
+    /// 0.
+    Zero,
+    /// 1.
+    One,
+    /// 2.
+    Two,
+    /// 3.
+    Three,
+    /// 4.
+    Four,
+    /// 5.
+    Five,
+    /// 6.
+    Six,
+    /// 7.
+    Seven,
+    /// 8.
+    Eight,
+    /// 9.
+    Nine,
+    /// The star.
+    Star,
+    /// The hash, or pound.
+    Hash,
+    /// A, which few telephones have.
+    A,
+    /// B.
+    B,
+    /// C.
+    C,
+    /// D.
+    D,
+}
+
+impl Key {
+    /// Every key, in the order of their numbers.
+    pub const ALL: [Self; 16] = [
+        Self::Zero,
+        Self::One,
+        Self::Two,
+        Self::Three,
+        Self::Four,
+        Self::Five,
+        Self::Six,
+        Self::Seven,
+        Self::Eight,
+        Self::Nine,
+        Self::Star,
+        Self::Hash,
+        Self::A,
+        Self::B,
+        Self::C,
+        Self::D,
+    ];
+
+    /// The key as it is written: a digit, `*`, `#`, or a capital letter.
+    #[must_use]
+    pub const fn as_char(self) -> char {
+        match self {
+            Self::Zero => '0',
+            Self::One => '1',
+            Self::Two => '2',
+            Self::Three => '3',
+            Self::Four => '4',
+            Self::Five => '5',
+            Self::Six => '6',
+            Self::Seven => '7',
+            Self::Eight => '8',
+            Self::Nine => '9',
+            Self::Star => '*',
+            Self::Hash => '#',
+            Self::A => 'A',
+            Self::B => 'B',
+            Self::C => 'C',
+            Self::D => 'D',
+        }
+    }
+
+    /// The key that is written `written`. The letters are taken in either
+    /// case.
+    #[must_use]
+    pub const fn from_char(written: char) -> Option<Self> {
+        Some(match written {
+            '0' => Self::Zero,
+            '1' => Self::One,
+            '2' => Self::Two,
+            '3' => Self::Three,
+            '4' => Self::Four,
+            '5' => Self::Five,
+            '6' => Self::Six,
+            '7' => Self::Seven,
+            '8' => Self::Eight,
+            '9' => Self::Nine,
+            '*' => Self::Star,
+            '#' => Self::Hash,
+            'A' | 'a' => Self::A,
+            'B' | 'b' => Self::B,
+            'C' | 'c' => Self::C,
+            'D' | 'd' => Self::D,
+            _ => return None,
+        })
+    }
+
+    /// The number RFC 4733 gives the key: 0 to 9 for the digits, 10 for
+    /// the star, 11 for the hash and 12 to 15 for the letters.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The key RFC 4733 numbers `code`.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Zero,
+            1 => Self::One,
+            2 => Self::Two,
+            3 => Self::Three,
+            4 => Self::Four,
+            5 => Self::Five,
+            6 => Self::Six,
+            7 => Self::Seven,
+            8 => Self::Eight,
+            9 => Self::Nine,
+            10 => Self::Star,
+            11 => Self::Hash,
+            12 => Self::A,
+            13 => Self::B,
+            14 => Self::C,
+            15 => Self::D,
+            _ => return None,
+        })
+    }
 }
 
 /// Which way a participant's voice activity changed.
@@ -233,6 +378,8 @@ pub enum TimerId {
     Grace,
     /// A line that dropped has had its time to come back.
     Detach,
+    /// Whoever pressed keys has had their time to press another.
+    Keys(TurnId),
 }
 
 /// A request from outside the conversation.

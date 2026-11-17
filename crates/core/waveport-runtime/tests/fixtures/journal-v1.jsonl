@@ -1,0 +1,35 @@
+{"v":1,"seq":1,"fact":{"kind":"participant_joined","who":3}}
+{"v":1,"seq":2,"fact":{"kind":"participant_left","who":3}}
+{"v":1,"seq":3,"fact":{"kind":"lifecycle_changed","to":"draining"}}
+{"v":1,"seq":4,"fact":{"kind":"lifecycle_changed","to":"closing","reason":"abandoned"}}
+{"v":1,"seq":5,"fact":{"kind":"lifecycle_changed","to":"closed","reason":"failure"}}
+{"v":1,"seq":6,"fact":{"kind":"lifecycle_changed","to":"running","reason":"requested"}}
+{"v":1,"seq":7,"fact":{"kind":"epoch_advanced","to":4294967295,"cause":"barge_in"}}
+{"v":1,"seq":8,"fact":{"kind":"epoch_advanced","to":2,"cause":"interrupted"}}
+{"v":1,"seq":9,"fact":{"kind":"epoch_advanced","to":3,"cause":"handoff"}}
+{"v":1,"seq":10,"fact":{"kind":"epoch_advanced","to":4,"cause":"superseded"}}
+{"v":1,"seq":11,"fact":{"kind":"epoch_advanced","to":5,"cause":"failure"}}
+{"v":1,"seq":12,"fact":{"kind":"epoch_advanced","to":6,"cause":"recovery"}}
+{"v":1,"seq":13,"fact":{"kind":"epoch_advanced","to":7,"cause":"closing"}}
+{"v":1,"seq":14,"fact":{"kind":"turn_committed","turn":4,"who":3,"span":[48000,18446744073709551615],"text":"She said \"wait\" — then:\n\t¿qué hora es? 🙂 \\ \u0000","addressed":true}}
+{"v":1,"seq":15,"fact":{"kind":"turn_committed","turn":5,"who":3,"span":[7,7],"text":"","addressed":false}}
+{"v":1,"seq":16,"fact":{"kind":"turn_dismissed","turn":6,"who":3,"reason":"backchannel"}}
+{"v":1,"seq":17,"fact":{"kind":"turn_dismissed","turn":7,"who":3,"reason":"noise"}}
+{"v":1,"seq":18,"fact":{"kind":"turn_dismissed","turn":8,"who":3,"reason":"empty"}}
+{"v":1,"seq":19,"fact":{"kind":"turn_dismissed","turn":9,"who":3,"reason":"closed"}}
+{"v":1,"seq":20,"fact":{"kind":"notice_appended","about":"recovered","text":"Some work was lost."}}
+{"v":1,"seq":21,"fact":{"kind":"notice_appended","about":"handoff","text":""}}
+{"v":1,"seq":22,"fact":{"kind":"utterance_progress","generation":9,"agent":1,"heard":"It is a quarter "}}
+{"v":1,"seq":23,"fact":{"kind":"utterance_committed","generation":9,"agent":1,"answers":12,"text":"It is a quarter past nine.","truncated":false}}
+{"v":1,"seq":24,"fact":{"kind":"utterance_committed","generation":9,"agent":1,"text":"It is a","truncated":true}}
+{"v":1,"seq":25,"fact":{"kind":"tool_proposed","call":18446744073709551615,"batch":2,"generation":9,"tool":65535,"args":"{\"zone\":\"local\"}"}}
+{"v":1,"seq":26,"fact":{"kind":"tool_authorized","call":18446744073709551615}}
+{"v":1,"seq":27,"fact":{"kind":"tool_dispatched","call":18446744073709551615,"attempt":2}}
+{"v":1,"seq":28,"fact":{"kind":"tool_finished","call":18446744073709551615,"outcome":"completed","result":"09:15"}}
+{"v":1,"seq":29,"fact":{"kind":"tool_finished","call":18446744073709551615,"outcome":"failed","result":"no such zone"}}
+{"v":1,"seq":30,"fact":{"kind":"tool_finished","call":18446744073709551615,"outcome":"cancelled","result":""}}
+{"v":1,"seq":31,"fact":{"kind":"tool_finished","call":18446744073709551615,"outcome":"in_doubt","result":"unknown"}}
+{"v":1,"seq":32,"fact":{"kind":"batch_resolved","batch":2}}
+{"v":1,"seq":33,"fact":{"kind":"handoff_requested","to":2}}
+{"v":1,"seq":34,"fact":{"kind":"agent_activated","agent":2}}
+{"v":1,"upto":34,"heard_until":96000,"epoch":7,"lifecycle":"running","closed_for":"requested","front":2,"turn_floor":10,"gen_floor":10,"next_call":18446744073709551615,"next_batch":3,"participants":[],"calls":[],"batches":[],"items":[{"kind":"user_turn","turn":4,"who":3,"text":"She said \"wait\" — then:\n\t¿qué hora es? 🙂 \\ \u0000","addressed":true},{"kind":"user_turn","turn":5,"who":3,"text":"","addressed":false},{"kind":"notice","about":"recovered","text":"Some work was lost."},{"kind":"notice","about":"handoff","text":""},{"kind":"utterance","generation":9,"agent":1,"text":"It is a quarter past nine.","truncated":false},{"kind":"utterance","generation":9,"agent":1,"text":"It is a","truncated":true},{"kind":"tool_call","call":18446744073709551615,"tool":65535,"generation":9,"args":"{\"zone\":\"local\"}"},{"kind":"tool_result","call":18446744073709551615,"outcome":"completed","text":"09:15"},{"kind":"tool_result","call":18446744073709551615,"outcome":"failed","text":"no such zone"},{"kind":"tool_result","call":18446744073709551615,"outcome":"cancelled","text":""},{"kind":"tool_result","call":18446744073709551615,"outcome":"in_doubt","text":"unknown"}],"owed":{"version":11,"cause":{"for":"continuation","batch":2}},"answered":12}

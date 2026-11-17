@@ -64,6 +64,21 @@ Building it settled what the list above leaves open:
 - **`Fact::KeysCommitted { turn, who, keys }`**, which owes a reply as a committed turn does. The runtime shows the keys to the model as text of the user.
 - **Waiting for a first key** is not the kernel's: only a task that asked for keys can wait for one, and tasks come with the agent layer of phase 4.
 
+Building it settled what the list above leaves open, and changed one line of it:
+
+- **Speech does not end a run of keys.** The list says it does. But the tone of a key is sound on the line, and whatever listens for a voice can take it for one; a run that ended whenever speech began would be cut into runs of one key by its own tones. A run goes on through speech and ends by its own rules. A key still ends what whoever pressed it was saying.
+- **A person's turns enter the conversation in the order they began.** Words said before keys are before them, even when their transcript comes after the last key: the keys wait, over, for the turn before them. `keys_after_speech` asks for it.
+- **Keys end with what was said after them, when that has to end.** Somebody presses, then speaks for as long as a turn may, and speaks anew: the turn that ran out is committed, and the keys before it go with it, though another key could have followed. A seeded session found the case, and its trace is kept.
+- **The key that ends runs is a run by itself** when none is under way. "Press the hash to go on" has to be answered.
+- **A run has 32 keys at most** (`Limits.keys`), and ends at the last. Room for them is taken at its first key, so the keys that follow leave the heap alone, as the other frequent steps do.
+- **A key there is no room for changes nothing.** When as many turns are open as a session holds, a key that would begin a run is not accepted: it stops nothing and ends nothing. The first build ended the speech of whoever pressed and then found no room, which a seeded session showed.
+- **A key in a session that is closing** stops what is being heard, as any key does. If that was the last thing the session waited for, the run the key began is dismissed in the same step, because the session closed.
+- **The model is shown** `(pressed on the telephone's keys: 4071)` as text of the user. The words around the keys say that they were pressed and not said, and the port of a model is as it was.
+- **The journal's format is at its second version**, the first change it has had. A record and a state say the first version that has everything they hold, and not the newest their writer knows, so a session in which nobody pressed a key writes what the build before keys reads. A journal that build wrote is kept, and every test run reads it, writes it again byte for byte and restores a session from it.
+- **Keys the other way are the runtime's, and not in the conversation.** An application asks a session to press keys (`SessionInput::Press`), and a transport says how keys leave it (`TransportCaps.keys`). Out of band, each key is one `TransportControl::Dtmf`. As tones, the audio path makes them: the frequencies of ITU-T Q.23 at −8 and −6 dBm0, 100 ms of tone and 100 ms of pause, which is longer than the least a receiver is held to take. While the agent speaks they are added to what it says, as a telephone does it, and otherwise sent as audio of no response (`Transport::try_send_tone`), which a transport without tones never sees. Where keys cannot leave they are not pressed and are counted, and none is kept for a line that is gone.
+- **No twelfth invariant.** The second says of keys what it says of words (section 13 of the architecture): every key in one run, a run in the conversation as it was pressed, once it is over, and a person's turns in the order they began.
+- **It cost what was measured**, against the revision before it: the transcript that completes a turn takes 0.6% more instructions, a report from playback 0.4%, and no other step more than 0.2%. A frame of audio costs what it did, in and out.
+
 ## Words that come after the turn
 
 - **`AgentSpec.words`**: `BeforeCommit` as today, or `AfterCommit`.

@@ -57,7 +57,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
 use waveport_domain::command::{Command, LlmCmd, PlayoutCmd, SttCmd, ToolCmd, TtsCmd};
 use waveport_domain::config::{ConfigError, KernelConfig};
-use waveport_domain::event::{CloseReason, ControlInput, Event, TimerId, ToolEvent};
+use waveport_domain::event::{CloseReason, ControlInput, Event, Key, TimerId, ToolEvent};
 use waveport_domain::fact::{Fact, Lifecycle, Stamped};
 use waveport_domain::ids::{OpTag, ParticipantId, Seq, ToolCallId, ToolId};
 use waveport_domain::kernel::{Kernel, RestoreError, Snapshot, View};
@@ -460,6 +460,9 @@ pub struct Session<P: Policies = DefaultPolicies> {
 
     transport: Box<dyn Transport>,
     line: Line,
+    /// Keys the session was asked to press while nobody was there to
+    /// hear them.
+    unpressed: u64,
     llm: Arc<dyn Llm>,
     tools: Arc<dyn ToolExecutor>,
     sink: Option<Arc<dyn EventSink>>,
@@ -582,6 +585,7 @@ impl<P: Policies> Session<P> {
             } else {
                 Line::None
             },
+            unpressed: 0,
             transport: parts.transport.unwrap_or_else(|| Box::new(Gone)),
             llm,
             tools: parts.tools,
@@ -650,6 +654,7 @@ impl<P: Policies> Session<P> {
     pub fn stats(&self) -> SessionStats {
         let mut stats = SessionStats::default();
         self.driver.count(&mut stats);
+        stats.speaking.keys_unpressed += self.unpressed;
         stats.states = self.store.states();
         stats
     }
@@ -873,11 +878,18 @@ impl<P: Policies> Session<P> {
         if let Some(mut inbox) = self.inbox.take() {
             let open = loop {
                 match inbox.poll_recv(cx) {
+                    // Keys to press are not the kernel's to know of:
+                    // they leave as the transport has them leave.
+                    Poll::Ready(Some(Request::Input(SessionInput::Press { keys }))) => {
+                        self.press(&keys, now);
+                    }
                     Poll::Ready(Some(Request::Input(input))) => {
                         if let SessionInput::Text { who, .. } = &input {
                             self.typed(*who);
                         }
-                        self.queue.push(asked(input));
+                        if let Some(event) = asked(input) {
+                            self.queue.push(event);
+                        }
                     }
                     Poll::Ready(Some(Request::Follow { from, to })) => follows.push((from, to)),
                     Poll::Ready(None) => break false,
@@ -921,6 +933,20 @@ impl<P: Policies> Session<P> {
         changed
     }
 
+    /// The application has the session press `keys`. Nobody is there to
+    /// hear them while the line is gone or the session is closing, and
+    /// they are not kept for later: whoever comes back has not asked for
+    /// them.
+    fn press(&mut self, keys: &[Key], now: MonoTime) {
+        let view = self.kernel.view();
+        if view.is_attached() && view.lifecycle() == Lifecycle::Running {
+            self.driver.press(keys, now);
+        } else {
+            let keys = u64::try_from(keys.len()).unwrap_or(u64::MAX);
+            self.unpressed = self.unpressed.saturating_add(keys);
+        }
+    }
+
     fn poll_transport(&mut self, cx: &mut Context<'_>, now: MonoTime) {
         while self.line == Line::Open {
             let Poll::Ready(event) = self.transport.poll_event(cx) else {
@@ -949,6 +975,9 @@ impl<P: Policies> Session<P> {
                     self.driver.packet(now, who, packet);
                 }
                 Some(TransportEvent::Played { tag, played }) => self.driver.acked(tag, played),
+                Some(TransportEvent::Dtmf { who, key }) => {
+                    self.queue.push(Event::Key { who, key });
+                }
                 Some(TransportEvent::Text { who, text }) => {
                     self.typed(who);
                     self.queue.push(Event::TextIn {
@@ -961,6 +990,7 @@ impl<P: Policies> Session<P> {
                 // nothing while the line is gone, and waits for it only
                 // as long as the session was given.
                 Some(TransportEvent::Detached) => {
+                    self.driver.forget_keys();
                     self.queue.push(Event::Control(ControlInput::Detached));
                 }
                 Some(TransportEvent::Attached) => {
@@ -973,6 +1003,7 @@ impl<P: Policies> Session<P> {
                 None => {
                     self.line = Line::Closed;
                     self.transport = Box::new(Gone);
+                    self.driver.forget_keys();
                     self.queue.push(Event::Control(ControlInput::Detached));
                     let reason = CloseReason::Abandoned;
                     self.queue
@@ -1105,9 +1136,17 @@ impl<P: Policies> Session<P> {
                     let seq = stamped.seq;
                     self.tell(&SessionEvent::Fact { seq, record });
                 }
-                if let Fact::TurnCommitted { turn, span, .. } = stamped.fact {
-                    mark(self.sink.as_ref(), self.id, now, Stage::TurnEnded(turn));
-                    self.heard_until = self.heard_until.max(span.end);
+                match stamped.fact {
+                    Fact::TurnCommitted { turn, span, .. } => {
+                        mark(self.sink.as_ref(), self.id, now, Stage::TurnEnded(turn));
+                        self.heard_until = self.heard_until.max(span.end);
+                    }
+                    // Keys are a turn as well, with no audio of its own:
+                    // whoever times the answer times it from here.
+                    Fact::KeysCommitted { turn, .. } => {
+                        mark(self.sink.as_ref(), self.id, now, Stage::TurnEnded(turn));
+                    }
+                    _ => {}
                 }
             }
             if let Some(sink) = &self.sink {
@@ -1240,7 +1279,9 @@ impl<P: Policies> Session<P> {
         let settled = facts.iter().any(|stamped| {
             matches!(
                 stamped.fact,
-                Fact::TurnCommitted { .. } | Fact::UtteranceCommitted { .. }
+                Fact::TurnCommitted { .. }
+                    | Fact::KeysCommitted { .. }
+                    | Fact::UtteranceCommitted { .. }
             )
         });
         if !(overdue || due && settled) {
@@ -1301,6 +1342,7 @@ impl Transport for Gone {
         TransportCaps {
             audio: None,
             text: false,
+            keys: None,
         }
     }
 
@@ -1317,9 +1359,11 @@ impl Transport for Gone {
     }
 }
 
-/// What an application asked for, as the kernel is told it.
-fn asked(input: SessionInput) -> Event {
-    match input {
+/// What an application asked for, as the kernel is told it. Of keys to
+/// press it is not told.
+fn asked(input: SessionInput) -> Option<Event> {
+    Some(match input {
+        SessionInput::Press { .. } => return None,
         SessionInput::Text { who, text } => Event::TextIn {
             who,
             text: text.into(),
@@ -1332,7 +1376,7 @@ fn asked(input: SessionInput) -> Event {
         SessionInput::Close => Event::Control(ControlInput::Close {
             reason: CloseReason::Requested,
         }),
-    }
+    })
 }
 
 /// Tells whoever times a session that it has reached a stage of a turn.

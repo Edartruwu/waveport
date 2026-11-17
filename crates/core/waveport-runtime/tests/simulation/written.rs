@@ -326,8 +326,8 @@ fn made_up(profile: Profile, seed: u64) -> Plan {
     }
 
     match profile {
-        // A chat has no line that could drop.
-        Profile::Calm | Profile::Lines => {}
+        // A chat has no line that could drop, and no telephone.
+        Profile::Calm | Profile::Lines | Profile::Keys => {}
         Profile::Chaos => trouble(&mut plan, &mut rng, last),
         Profile::Crashes => {
             let mut dies: Vec<u64> = (0..rng.range(1..4)).map(|_| rng.range(1..45)).collect();
