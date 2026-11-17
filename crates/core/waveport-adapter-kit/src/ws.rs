@@ -8,6 +8,11 @@
 //! A transport is on the other side of such a connection: its far end
 //! connects to it. [`WsConn::accept`] takes a connection that was made
 //! to a listener on this machine, and what follows is the same.
+//!
+//! A server that answers HTTP on the same port reads the request itself,
+//! and has the connection changed into a WebSocket when it is asked to.
+//! [`accept_key`] is what it answers with, and [`WsConn::from_upgraded`]
+//! takes the connection from there.
 
 use core::fmt;
 use core::pin::Pin;
@@ -25,10 +30,11 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, Utf8Bytes};
 use waveport_ports::error::PortError;
 
@@ -69,6 +75,31 @@ const ACCEPTED_MESSAGE_AT_MOST: usize = 1 << 20;
 /// The header a client names the protocols it speaks in, and a server the
 /// one it chose.
 const PROTOCOL_HEADER: &str = "sec-websocket-protocol";
+
+/// What a server says in `Sec-WebSocket-Accept` to a client that said
+/// `key` in `Sec-WebSocket-Key`. It shows the client that the server
+/// read its request as one for a WebSocket.
+#[must_use]
+pub fn accept_key(key: &str) -> String {
+    derive_accept_key(key.trim().as_bytes())
+}
+
+/// Whether `protocol` is among the protocols a client says it speaks:
+/// `offered` is what it sent in `Sec-WebSocket-Protocol`, each header of
+/// that name a value.
+pub fn offers<'a>(offered: impl IntoIterator<Item = &'a str>, protocol: &str) -> bool {
+    offered
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .any(|offer| offer.trim() == protocol)
+}
+
+/// How a connection is read that somebody made to this machine.
+fn accepted() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(ACCEPTED_MESSAGE_AT_MOST))
+        .max_frame_size(Some(ACCEPTED_MESSAGE_AT_MOST))
+}
 
 /// The frame a connection is closed with for a reason.
 fn close_frame(code: u16, reason: &str) -> CloseFrame {
@@ -115,10 +146,18 @@ impl fmt::Display for WsText {
     }
 }
 
-/// A connection, with or without TLS under it.
+/// What a connection that was taken over from somebody else is read
+/// from and written to.
+trait Taken: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Taken for T {}
+
+/// A connection: with or without TLS under it, or one that an HTTP
+/// server had before.
 enum Io {
     Plain(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
+    Upgraded(Box<dyn Taken>),
 }
 
 impl AsyncRead for Io {
@@ -130,6 +169,7 @@ impl AsyncRead for Io {
         match self.get_mut() {
             Self::Plain(io) => Pin::new(io).poll_read(cx, buf),
             Self::Tls(io) => Pin::new(io.as_mut()).poll_read(cx, buf),
+            Self::Upgraded(io) => Pin::new(io.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -143,6 +183,7 @@ impl AsyncWrite for Io {
         match self.get_mut() {
             Self::Plain(io) => Pin::new(io).poll_write(cx, buf),
             Self::Tls(io) => Pin::new(io.as_mut()).poll_write(cx, buf),
+            Self::Upgraded(io) => Pin::new(io.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -150,6 +191,7 @@ impl AsyncWrite for Io {
         match self.get_mut() {
             Self::Plain(io) => Pin::new(io).poll_flush(cx),
             Self::Tls(io) => Pin::new(io.as_mut()).poll_flush(cx),
+            Self::Upgraded(io) => Pin::new(io.as_mut()).poll_flush(cx),
         }
     }
 
@@ -157,6 +199,7 @@ impl AsyncWrite for Io {
         match self.get_mut() {
             Self::Plain(io) => Pin::new(io).poll_shutdown(cx),
             Self::Tls(io) => Pin::new(io.as_mut()).poll_shutdown(cx),
+            Self::Upgraded(io) => Pin::new(io.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -252,9 +295,11 @@ impl WsConn {
     /// Takes a connection that was made to a listener on this machine:
     /// reads the request and answers it.
     ///
-    /// `protocol` is the one protocol spoken here. A client that does not
-    /// name it among the ones it speaks is refused, and so is one that
-    /// asks for a path other than `path`.
+    /// `protocol` is the one protocol spoken here, if it has a name. A
+    /// client that does not name it among the ones it speaks is refused,
+    /// and so is one that asks for a path other than `path`. Without a
+    /// name nothing is asked of what the client says it speaks, and
+    /// nothing is chosen: a carrier's media stream names no protocol.
     ///
     /// # Errors
     ///
@@ -263,7 +308,7 @@ impl WsConn {
     pub async fn accept(
         tcp: TcpStream,
         path: &str,
-        protocol: &str,
+        protocol: Option<&str>,
         timeout: Duration,
     ) -> Result<(Self, WsAsked), PortError> {
         let _ = tcp.set_nodelay(true);
@@ -279,14 +324,15 @@ impl WsConn {
             if uri.path() != path {
                 return Err(refusal(StatusCode::NOT_FOUND, "nothing is served here"));
             }
+            let Some(protocol) = protocol else {
+                return Ok(response);
+            };
             let offered = request
                 .headers()
                 .get_all(PROTOCOL_HEADER)
                 .iter()
-                .filter_map(|value| value.to_str().ok())
-                .flat_map(|value| value.split(','))
-                .any(|offer| offer.trim() == protocol);
-            if !offered {
+                .filter_map(|value| value.to_str().ok());
+            if !offers(offered, protocol) {
                 return Err(refusal(
                     StatusCode::BAD_REQUEST,
                     &format!("the protocol spoken here is {protocol}"),
@@ -297,11 +343,11 @@ impl WsConn {
             }
             Ok(response)
         };
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(ACCEPTED_MESSAGE_AT_MOST))
-            .max_frame_size(Some(ACCEPTED_MESSAGE_AT_MOST));
-        let accepting =
-            tokio_tungstenite::accept_hdr_async_with_config(Io::Plain(tcp), check, Some(config));
+        let accepting = tokio_tungstenite::accept_hdr_async_with_config(
+            Io::Plain(tcp),
+            check,
+            Some(accepted()),
+        );
         let stream = match tokio::time::timeout(timeout, accepting).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
@@ -317,6 +363,24 @@ impl WsConn {
             }
         };
         Ok((Self { stream }, asked))
+    }
+
+    /// Takes a connection whose request somebody else read and answered:
+    /// an HTTP server that was asked to change the connection into a
+    /// WebSocket, checked who asked, and said that it does, with
+    /// [`accept_key`]. What comes over `io` from here on are the
+    /// messages of a WebSocket, and they are taken as from a connection
+    /// that was accepted here: none is longer than one may be.
+    ///
+    /// `io` is the connection as the server hands it over, with whatever
+    /// the server had read of it beyond the request.
+    pub async fn from_upgraded<S>(io: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let io = Io::Upgraded(Box::new(io));
+        let stream = WebSocketStream::from_raw_socket(io, Role::Server, Some(accepted())).await;
+        Self { stream }
     }
 
     /// Sends text.
@@ -489,7 +553,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use waveport_ports::error::RetryClass;
 
-    use super::{WsConn, WsMessage, WsRequest};
+    use super::{ACCEPTED_MESSAGE_AT_MOST, WsConn, WsMessage, WsRequest, accept_key, offers};
 
     /// A server on this machine that serves one connection with `serve`.
     /// Returns its address.
@@ -580,7 +644,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let (mut conn, asked) =
-                WsConn::accept(tcp, "/v0/session", "talk.v0", Duration::from_secs(2))
+                WsConn::accept(tcp, "/v0/session", Some("talk.v0"), Duration::from_secs(2))
                     .await
                     .unwrap();
             assert_eq!(asked.path, "/v0/session");
@@ -618,7 +682,7 @@ mod tests {
             let (listener, url) = listener().await;
             let server = tokio::spawn(async move {
                 let (tcp, _) = listener.accept().await.unwrap();
-                WsConn::accept(tcp, "/v0/session", "talk.v0", Duration::from_secs(2))
+                WsConn::accept(tcp, "/v0/session", Some("talk.v0"), Duration::from_secs(2))
                     .await
                     .unwrap_err()
             });
@@ -638,11 +702,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_that_names_no_protocol_is_taken_where_none_is_asked_for() {
+        // A carrier's media stream connects as itself, and says nothing
+        // of a protocol.
+        let (first, url) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = first.accept().await.unwrap();
+            let (mut conn, asked) = WsConn::accept(tcp, "/stream", None, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(asked.query.as_deref(), Some("call=7"));
+            assert_eq!(text(&conn.next().await.unwrap().unwrap()), "connected");
+            assert_eq!(conn.next().await.unwrap(), None);
+        });
+        let url_of_stream = format!("{url}/stream?call=7");
+        let mut conn = WsConn::connect(WsRequest::new(&url_of_stream))
+            .await
+            .unwrap();
+        conn.send_text("connected".to_owned()).await.unwrap();
+        conn.close().await;
+        server.await.unwrap();
+
+        // The path is still the one that is served.
+        let (second, url) = listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = second.accept().await.unwrap();
+            WsConn::accept(tcp, "/stream", None, Duration::from_secs(2))
+                .await
+                .unwrap_err()
+        });
+        let elsewhere = format!("{url}/elsewhere");
+        let error = WsConn::connect(WsRequest::new(&elsewhere))
+            .await
+            .unwrap_err();
+        assert_eq!(error.class, RetryClass::Permanent, "{error}");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn a_key_is_answered_as_the_protocol_has_it() {
+        // The example of RFC 6455, section 1.3.
+        let answer = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+        assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), answer);
+        // As it stands in a header, with what is around it.
+        assert_eq!(accept_key(" dGhlIHNhbXBsZSBub25jZQ== "), answer);
+        assert_ne!(accept_key("dGhlIHNhbXBsZSBub25jZQ"), answer);
+    }
+
+    #[test]
+    fn a_protocol_is_offered_in_one_header_or_in_several() {
+        assert!(offers(["waveport.v1"], "waveport.v1"));
+        assert!(offers(["other.v9, waveport.v1"], "waveport.v1"));
+        assert!(offers(["other.v9", " waveport.v1 "], "waveport.v1"));
+        assert!(!offers(["waveport.v10", "xwaveport.v1"], "waveport.v1"));
+        assert!(!offers([] as [&str; 0], "waveport.v1"));
+        assert!(!offers([""], "waveport.v1"));
+    }
+
+    /// Reads the head of a request, and returns what it says in the
+    /// header `name`.
+    async fn head_says(tcp: &mut TcpStream, name: &str) -> String {
+        let mut head = Vec::new();
+        let mut buffer = [0; 1024];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = tcp.read(&mut buffer).await.unwrap();
+            assert_ne!(n, 0, "the request ended early");
+            head.extend_from_slice(&buffer[..n]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let prefix = format!("{name}: ");
+        head.lines()
+            .find_map(|line| {
+                let same = line.len() >= prefix.len()
+                    && line[..prefix.len()].eq_ignore_ascii_case(&prefix);
+                same.then(|| line[prefix.len()..].to_owned())
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_an_http_server_answered_is_taken_from_there() {
+        let (listener, url) = listener().await;
+        let server = tokio::spawn(async move {
+            // What an HTTP server does: it reads the request, and says
+            // that the connection is a WebSocket from here on.
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let key = head_says(&mut tcp, "sec-websocket-key").await;
+            let answer = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                accept_key(&key)
+            );
+            tcp.write_all(answer.as_bytes()).await.unwrap();
+            let mut conn = WsConn::from_upgraded(tcp).await;
+            assert_eq!(text(&conn.next().await.unwrap().unwrap()), "hello");
+            conn.send_binary(Bytes::from_static(&[7, 8])).await.unwrap();
+            conn.send_text("and words".to_owned()).await.unwrap();
+            // The client says goodbye, in good order.
+            assert_eq!(conn.next().await.unwrap(), None);
+        });
+        // A client that holds the server to the protocol: it takes the
+        // answer only with the key answered as it has to be.
+        let url = format!("{url}/v1/client");
+        let mut conn = WsConn::connect(WsRequest::new(&url)).await.unwrap();
+        conn.send_text("hello".to_owned()).await.unwrap();
+        assert_eq!(
+            conn.next().await.unwrap(),
+            Some(WsMessage::Binary(Bytes::from_static(&[7, 8])))
+        );
+        assert_eq!(text(&conn.next().await.unwrap().unwrap()), "and words");
+        conn.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_was_taken_over_takes_no_message_that_is_too_long() {
+        use tokio_tungstenite::WebSocketStream;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        // Not a socket: whatever can be read and written will do, which
+        // is what an HTTP server hands over.
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let mut conn = WsConn::from_upgraded(near).await;
+        let client = tokio::spawn(async move {
+            let mut client = WebSocketStream::from_raw_socket(far, Role::Client, None).await;
+            let fits = vec![1; ACCEPTED_MESSAGE_AT_MOST - 1024];
+            client.send(Message::Binary(fits.into())).await.unwrap();
+            let too_long = vec![2; ACCEPTED_MESSAGE_AT_MOST + 1];
+            // Nobody reads all of it.
+            let _ = client.send(Message::Binary(too_long.into())).await;
+            client
+        });
+        let Some(WsMessage::Binary(taken)) = conn.next().await.unwrap() else {
+            panic!("expected bytes");
+        };
+        assert_eq!(taken.len(), ACCEPTED_MESSAGE_AT_MOST - 1024);
+        let error = conn.next().await.unwrap_err();
+        assert_eq!(error.class, RetryClass::Permanent, "{error}");
+        drop(conn);
+        let _ = client.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_close_that_waits_lets_the_far_end_finish_what_it_was_saying() {
         let (listener, url) = listener().await;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let (mut conn, _) = WsConn::accept(tcp, "/", "talk.v0", Duration::from_secs(2))
+            let (mut conn, _) = WsConn::accept(tcp, "/", Some("talk.v0"), Duration::from_secs(2))
                 .await
                 .unwrap();
             conn.send_text("the last word".to_owned()).await.unwrap();
@@ -682,7 +888,7 @@ mod tests {
         let (listener, url) = listener().await;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let (conn, _) = WsConn::accept(tcp, "/", "talk.v0", Duration::from_secs(2))
+            let (conn, _) = WsConn::accept(tcp, "/", Some("talk.v0"), Duration::from_secs(2))
                 .await
                 .unwrap();
             let began = std::time::Instant::now();
@@ -716,7 +922,7 @@ mod tests {
             drop(stream);
         });
         let (tcp, _) = listener.accept().await.unwrap();
-        let error = WsConn::accept(tcp, "/", "talk.v0", Duration::from_millis(50))
+        let error = WsConn::accept(tcp, "/", Some("talk.v0"), Duration::from_millis(50))
             .await
             .unwrap_err();
         assert_eq!(error.class, RetryClass::Timeout, "{error}");
@@ -728,7 +934,7 @@ mod tests {
         let (listener, url) = listener().await;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let (conn, _) = WsConn::accept(tcp, "/", "talk.v0", Duration::from_secs(2))
+            let (conn, _) = WsConn::accept(tcp, "/", Some("talk.v0"), Duration::from_secs(2))
                 .await
                 .unwrap();
             conn.close_with(1008, "that is not allowed").await;

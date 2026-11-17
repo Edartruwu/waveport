@@ -31,7 +31,7 @@ mod wire;
 use core::fmt;
 use core::pin::Pin;
 
-use waveport_adapter_kit::http::{HttpClient, HttpRequest, HttpSettings};
+use waveport_adapter_kit::http::{Auth, Body, HttpClient, HttpRequest, HttpSettings};
 use waveport_adapter_kit::secret::Secret;
 use waveport_adapter_kit::sse::SseParser;
 use waveport_adapter_kit::stream;
@@ -148,8 +148,8 @@ impl Llm for OpenAiCompat {
                 .post(HttpRequest {
                     url: &self.url,
                     headers: &[("accept", "text/event-stream")],
-                    key: self.config.key.as_ref(),
-                    json: &body,
+                    auth: self.config.key.as_ref().map_or(Auth::None, Auth::Bearer),
+                    body: Body::Json(&body),
                 })
                 .await?;
 
