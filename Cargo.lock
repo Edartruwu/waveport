@@ -2949,6 +2949,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "waveport-transport-telephony-ws"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-ports",
+ "waveport-testkit",
+]
+
+[[package]]
 name = "waveport-transport-websocket"
 version = "0.1.0"
 dependencies = [

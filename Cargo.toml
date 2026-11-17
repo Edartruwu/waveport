@@ -141,6 +141,10 @@ prost = { version = "0.14.4", default-features = false }
 # November 2026, and is to be moved to when it is a week old.
 redb = { version = "4.5.0", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider"] }
+# The signature a carrier puts on what it asks, checked in a time that
+# does not tell how much of it fits. It is the cryptography that is
+# under `rustls` already.
+ring = "0.17.14"
 rtrb = "0.4.1"
 # The call that keeps a thread on the processors it is given, on Linux,
 # which is where there is such a call for a set of them. It is safe to
