@@ -34,7 +34,7 @@ cargo xtask fetch-assets --check   # verify only; fails if a file is missing
 
 A file whose digest does not match is deleted, never left in place. Adding a model is a reviewed change to the lock file.
 
-The tests of `waveport-models-onnx` and of `waveport-cli` run the real models, so they need the files: fetch them once before `cargo xtask ci`. They are looked for in `target/assets/`, or in the directory `WAVEPORT_ASSETS` names.
+The tests of `waveport-models-onnx`, of `waveport-assembly` and of `waveport-cli` run the real models, so they need the files: fetch them once before `cargo xtask ci`. They are looked for in `target/assets/`, or in the directory `WAVEPORT_ASSETS` names.
 
 ## Running the gates
 
@@ -84,7 +84,7 @@ stability = "experimental"
 | `kit` | `crates/core/` | Domain, ports, protocol, other kit crates |
 | `application` | `crates/core/` | Domain, ports, protocol, application. Not the kit |
 | `adapter` | `crates/adapters/` | Domain, ports, protocol, kit. Never another adapter |
-| `composition` | `apps/`, `crates/bindings/` | Everything above |
+| `composition` | `apps/`, `crates/bindings/` | Everything above, and other composition crates |
 | `testing` | `crates/testing/` | Everything above, and other testing crates |
 | `tooling` | `xtask/`, `benches/` | Anything; `xtask` itself depends on no workspace crate |
 
@@ -244,7 +244,7 @@ A key is read from the environment and goes nowhere but to its provider: none is
 
 **A call that is killed.** `resumed.rs` in the same folder runs such a call with its journal in a file, kills the process as `kill -9` does, starts the command again with `--resume last`, and has the caller ask once more. It does so at six places: while the model answers, while the agent speaks, once a tool has acted and before it has answered, while the record that allows a tool waits to be stored, and before and after the commit that stores all the call has come to. Each run checks that the second process goes on with the call, that the model is shown the conversation as the journal had it, that the tool that acts (`take_note`, which adds a line to a file) acted at most once in both processes together, that the caller's next question is answered aloud, and that a call that is over is not there to go on with.
 
-Some of those places last less than a millisecond, so the command is told where to stop: `WAVEPORT_TEST_HALT` names a place, the command says `halted: <place>` when it is there, and the test kills it then. A place in the journal (`before:<kind>` or `after:<kind>` of a record, or of `state`) stops the thread that writes the journal at that commit, while the rest of the call runs on; `tool` stops the tool that takes notes once it has written. `apps/waveport-cli/src/halt.rs` is all of it, and nothing else reads the variable. A new place a call can die in gets a case there. Check that a case can fail: make the kernel send a call with an effect again after a restart, and the case with the tool has to find two notes.
+Some of those places last less than a millisecond, so the command is told where to stop: `WAVEPORT_TEST_HALT` names a place, the command says `halted: <place>` when it is there, and the test kills it then. A place in the journal (`before:<kind>` or `after:<kind>` of a record, or of `state`) stops the thread that writes the journal at that commit, while the rest of the call runs on; `tool` stops the tool that takes notes once it has written. `apps/waveport-assembly/src/halt.rs` is all of it, and nothing else reads the variable. A new place a call can die in gets a case there. Check that a case can fail: make the kernel send a call with an effect again after a restart, and the case with the tool has to find two notes.
 
 **The WebSocket transport.** `crates/adapters/transport/websocket/tests/loopback.rs` runs the server side and the client against each other over real sockets on the loopback interface, and a client that breaks the protocol against the server.
 

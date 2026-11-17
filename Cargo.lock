@@ -2603,6 +2603,33 @@ name = "waveport-alloc-counter"
 version = "0.1.0"
 
 [[package]]
+name = "waveport-assembly"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "waveport-adapter-kit",
+ "waveport-domain",
+ "waveport-llm-openai-compat",
+ "waveport-models-onnx",
+ "waveport-ports",
+ "waveport-runtime",
+ "waveport-store-journal",
+ "waveport-store-memory",
+ "waveport-stt-assemblyai",
+ "waveport-stt-deepgram",
+ "waveport-stt-openai",
+ "waveport-telemetry-otel",
+ "waveport-testkit",
+ "waveport-tts-cartesia",
+ "waveport-tts-elevenlabs",
+]
+
+[[package]]
 name = "waveport-benches"
 version = "0.1.0"
 dependencies = [
@@ -2628,26 +2655,16 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
- "jiff",
  "serde_json",
  "tokio",
  "waveport-adapter-kit",
+ "waveport-assembly",
  "waveport-domain",
- "waveport-llm-openai-compat",
- "waveport-models-onnx",
  "waveport-ports",
  "waveport-runtime",
- "waveport-store-journal",
- "waveport-store-memory",
- "waveport-stt-assemblyai",
- "waveport-stt-deepgram",
- "waveport-stt-openai",
- "waveport-telemetry-otel",
  "waveport-testkit",
  "waveport-transport-local-audio",
  "waveport-transport-websocket",
- "waveport-tts-cartesia",
- "waveport-tts-elevenlabs",
 ]
 
 [[package]]

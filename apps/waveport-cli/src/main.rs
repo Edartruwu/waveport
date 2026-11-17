@@ -5,11 +5,12 @@
 //! An agent to talk to at this machine, one that takes a call whose
 //! caller follows a script, one that takes calls over a WebSocket from
 //! the same command run as a client, or one to chat with in writing.
-//! This is where the parts are put together:
-//! the session runtime, the models that listen, a provider for each of
-//! hearing, thinking and speaking, a transport, a journal and two tools.
-//! An agent that only writes is the same agent with a language model and
-//! its tools alone. Nothing here decides anything about a conversation.
+//! The command line defines an agent, and `waveport-assembly` puts it
+//! together: the session runtime, the models that listen, a provider for
+//! each of hearing, thinking and speaking, a journal and the tools. What
+//! is here is the line of each call, what is shown of it, and how it
+//! ends. An agent that only writes is the same agent on no line. Nothing
+//! here decides anything about a conversation.
 //!
 //! Calls are kept in a file, so that one that broke off can be gone on
 //! with: `--resume last`.
@@ -21,39 +22,19 @@ mod args;
 mod call;
 mod chat;
 mod client;
-mod halt;
-mod kept;
 mod report;
 mod script;
 mod serve;
 mod summary;
-mod tools;
 
-use core::fmt;
 use std::process::ExitCode;
 
 use clap::Parser;
+use waveport_assembly::{Context, Failure};
 use waveport_transport_local_audio::{Choice, LocalAudio, Options, devices};
 
 use crate::args::{Cli, Command, Dev, Run};
 use crate::call::Outcome;
-
-/// Why the command could not do what it was asked, in words for whoever
-/// ran it.
-#[derive(Debug)]
-struct Failure(String);
-
-/// Says what was being done when something failed.
-trait Context<T> {
-    /// The value, or a failure that begins with what `what` says.
-    fn with(self, what: impl FnOnce() -> String) -> Result<T, Failure>;
-}
-
-impl<T, E: fmt::Display> Context<T> for Result<T, E> {
-    fn with(self, what: impl FnOnce() -> String) -> Result<T, Failure> {
-        self.map_err(|error| Failure(format!("{}: {error}", what())))
-    }
-}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();

@@ -4,21 +4,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-
-/// Where OpenAI's language models are.
-pub(crate) const LLM_URL: &str = "https://api.openai.com/v1";
-
-/// What a provider is asked for when the command line says nothing else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Usual {
-    /// Where the provider listens.
-    pub url: &'static str,
-    pub model: &'static str,
-    /// The voice, of a provider that speaks.
-    pub voice: &'static str,
-    /// The environment variable that holds the key.
-    pub key_env: &'static str,
-}
+use waveport_assembly::Resume;
+use waveport_assembly::spec::{
+    self, ASSETS, AgentSpec, Keeps, LANGUAGE, LLM_KEY_ENV, LLM_MODEL, LLM_URL, LlmSpec, Named,
+    STATE_EVERY, SpeechSpec, StackSpec, SttSpec, TtsSpec,
+};
 
 /// Who recognises speech.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -34,27 +24,12 @@ pub(crate) enum Hears {
     AssemblyAi,
 }
 
-impl Hears {
-    pub(crate) const fn usual(self) -> Usual {
-        match self {
-            Self::OpenAi => Usual {
-                url: "wss://api.openai.com/v1/realtime",
-                model: "gpt-live-transcribe",
-                voice: "",
-                key_env: "OPENAI_API_KEY",
-            },
-            Self::Deepgram => Usual {
-                url: "wss://api.deepgram.com/v1/listen",
-                model: "nova-3",
-                voice: "",
-                key_env: "DEEPGRAM_API_KEY",
-            },
-            Self::AssemblyAi => Usual {
-                url: "wss://streaming.assemblyai.com/v3/ws",
-                model: "universal-3-6-pro",
-                voice: "",
-                key_env: "ASSEMBLYAI_API_KEY",
-            },
+impl From<Hears> for spec::Hears {
+    fn from(hears: Hears) -> Self {
+        match hears {
+            Hears::OpenAi => Self::OpenAi,
+            Hears::Deepgram => Self::Deepgram,
+            Hears::AssemblyAi => Self::AssemblyAi,
         }
     }
 }
@@ -70,24 +45,23 @@ pub(crate) enum Speaks {
     ElevenLabs,
 }
 
-impl Speaks {
-    pub(crate) const fn usual(self) -> Usual {
-        match self {
-            Self::Cartesia => Usual {
-                url: "wss://api.cartesia.ai/tts/websocket",
-                model: "sonic-3.6",
-                voice: "228fca29-3a0a-435c-8728-5cb483251068",
-                key_env: "CARTESIA_API_KEY",
-            },
-            Self::ElevenLabs => Usual {
-                url: "wss://api.elevenlabs.io/v1/text-to-speech",
-                model: "eleven_flash_v2_5",
-                voice: "Xb7hH8MSUJpSbSDYk0k2",
-                key_env: "ELEVENLABS_API_KEY",
-            },
+impl From<Speaks> for spec::Speaks {
+    fn from(speaks: Speaks) -> Self {
+        match speaks {
+            Speaks::Cartesia => Self::Cartesia,
+            Speaks::ElevenLabs => Self::ElevenLabs,
         }
     }
 }
+
+/// What the command line calls the settings that a failure may be about.
+pub(crate) const SAID: Named = Named {
+    journal: "--journal",
+    memory: "--no-journal",
+    assets: "--assets",
+    otlp: "--otlp",
+    by: "the command line",
+};
 
 /// Where calls are taken over a WebSocket unless told otherwise: on this
 /// machine alone.
@@ -96,42 +70,6 @@ pub(crate) const LISTEN: &str = "127.0.0.1:9283";
 /// Where a client finds an agent that was told nothing about where to
 /// take calls.
 pub(crate) const CALLS: &str = "ws://127.0.0.1:9283";
-
-/// What an agent is told when it is told nothing else.
-pub(crate) const INSTRUCTIONS: &str = "You are a friendly assistant on a voice call. What you \
-write is spoken aloud, so answer in one or two short sentences of plain speech, with no lists, \
-no symbols and no formatting. Use get_time when you are asked the time or the date. When the \
-caller says goodbye or asks to end the call, say goodbye and call end_call.";
-
-/// What an agent that writes is told when it is told nothing else.
-pub(crate) const WRITTEN: &str = "You are a friendly assistant in a chat. Answer in one or two \
-short sentences of plain text, with no lists and no formatting. Use get_time when you are asked \
-the time or the date. When the user says goodbye or asks to end the chat, say goodbye and call \
-end_call.";
-
-/// Where calls are kept when the command line says nothing else: in the
-/// folder the command is run in.
-pub(crate) const JOURNAL: &str = ".waveport/journal.redb";
-
-/// The call to go on with.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Resume {
-    /// The one that was last begun with the journal.
-    Last,
-    /// The one whose token this file holds.
-    File(PathBuf),
-}
-
-impl core::str::FromStr for Resume {
-    type Err = core::convert::Infallible;
-
-    fn from_str(said: &str) -> Result<Self, Self::Err> {
-        Ok(match said {
-            "last" => Self::Last,
-            file => Self::File(PathBuf::from(file)),
-        })
-    }
-}
 
 /// Voice agents on this machine.
 #[derive(Debug, Parser)]
@@ -326,7 +264,7 @@ pub(crate) struct Agent {
     /// How many records of a call are written before all that the call
     /// has come to is stored in one piece, so that going on with it
     /// need not read every record.
-    #[arg(long, value_name = "RECORDS", default_value_t = 256)]
+    #[arg(long, value_name = "RECORDS", default_value_t = STATE_EVERY)]
     pub state_every: u64,
     /// A file for the agent to write notes in. With it the agent has a
     /// tool that adds a line to the file.
@@ -345,10 +283,10 @@ pub(crate) struct Agent {
     #[arg(long, value_name = "URL", default_value = LLM_URL)]
     pub llm_url: String,
     /// The language model.
-    #[arg(long, value_name = "MODEL", default_value = "gpt-6-luna")]
+    #[arg(long, value_name = "MODEL", default_value = LLM_MODEL)]
     pub llm_model: String,
     /// The environment variable that holds the key for it.
-    #[arg(long, value_name = "VARIABLE", default_value = "OPENAI_API_KEY")]
+    #[arg(long, value_name = "VARIABLE", default_value = LLM_KEY_ENV)]
     pub llm_key_env: String,
 }
 
@@ -357,7 +295,7 @@ pub(crate) struct Agent {
 #[derive(Debug, Args)]
 pub(crate) struct Aloud {
     /// The language of the call, as a tag such as `en` or `es`.
-    #[arg(long, value_name = "TAG", default_value = "en")]
+    #[arg(long, value_name = "TAG", default_value = LANGUAGE)]
     pub language: String,
     /// Where the models that listen are: what `cargo xtask fetch-assets`
     /// fetched.
@@ -365,7 +303,7 @@ pub(crate) struct Aloud {
         long,
         value_name = "DIR",
         env = "WAVEPORT_ASSETS",
-        default_value = "target/assets"
+        default_value = ASSETS
     )]
     pub assets: PathBuf,
 
@@ -426,62 +364,60 @@ pub(crate) struct Aloud {
     pub tts_key_env: Option<String>,
 }
 
-/// A provider as an agent uses it: what the command line says, and for
-/// the rest what is usual.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Chosen {
-    pub url: String,
-    pub model: String,
-    pub voice: String,
-    pub key_env: String,
-    /// Whether the address is the provider's own, which gives nothing
-    /// away without a key.
-    pub own: bool,
-}
+impl Agent {
+    /// The agent as it is defined: what the command line says of it,
+    /// with what `aloud` says it hears and speaks with, if it does
+    /// either.
+    pub(crate) fn spec(&self, aloud: Option<&Aloud>) -> AgentSpec {
+        AgentSpec {
+            instructions: self.instructions.clone(),
+            instructions_file: self.instructions_file.clone(),
+            greeting: self.greeting.clone(),
+            llm: LlmSpec {
+                url: self.llm_url.clone(),
+                model: self.llm_model.clone(),
+                key_env: self.llm_key_env.clone(),
+            },
+            speech: aloud.map(Aloud::spec),
+        }
+    }
 
-impl Chosen {
-    fn new(
-        usual: Usual,
-        url: Option<&String>,
-        model: Option<&String>,
-        key: Option<&String>,
-    ) -> Self {
-        let or = |said: Option<&String>, usual: &str| {
-            said.map_or_else(|| usual.to_owned(), Clone::clone)
+    /// What the calls of the command share, as the command line says.
+    pub(crate) fn stack(&self, aloud: Option<&Aloud>) -> StackSpec {
+        let keeps = match &self.journal {
+            _ if self.no_journal => Keeps::Memory,
+            Some(file) => Keeps::File(file.clone()),
+            None => Keeps::Usual,
         };
-        let url = or(url, usual.url);
-        Self {
-            own: url == usual.url,
-            url,
-            model: or(model, usual.model),
-            voice: usual.voice.to_owned(),
-            key_env: or(key, usual.key_env),
+        StackSpec {
+            keeps,
+            state_every: self.state_every,
+            notes: self.notes.clone(),
+            otlp: self.otlp.clone(),
+            assets: aloud.map_or_else(|| PathBuf::from(ASSETS), |aloud| aloud.assets.clone()),
+            named: SAID,
         }
     }
 }
 
 impl Aloud {
-    /// The provider that recognises speech.
-    pub(crate) fn hears(&self) -> Chosen {
-        Chosen::new(
-            self.stt.usual(),
-            self.stt_url.as_ref(),
-            self.stt_model.as_ref(),
-            self.stt_key_env.as_ref(),
-        )
-    }
-
-    /// The provider that synthesises speech.
-    pub(crate) fn speaks(&self) -> Chosen {
-        let chosen = Chosen::new(
-            self.tts.usual(),
-            self.tts_url.as_ref(),
-            self.tts_model.as_ref(),
-            self.tts_key_env.as_ref(),
-        );
-        Chosen {
-            voice: self.tts_voice.clone().unwrap_or(chosen.voice.clone()),
-            ..chosen
+    /// What the agent hears and speaks with, as it is defined.
+    pub(crate) fn spec(&self) -> SpeechSpec {
+        SpeechSpec {
+            language: self.language.clone(),
+            stt: SttSpec {
+                provider: self.stt.into(),
+                url: self.stt_url.clone(),
+                model: self.stt_model.clone(),
+                key_env: self.stt_key_env.clone(),
+            },
+            tts: TtsSpec {
+                provider: self.tts.into(),
+                url: self.tts_url.clone(),
+                model: self.tts_model.clone(),
+                voice: self.tts_voice.clone(),
+                key_env: self.tts_key_env.clone(),
+            },
         }
     }
 }
@@ -492,7 +428,9 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::{Cli, Command, Hears, LLM_URL, Resume, Speaks, WRITTEN};
+    use waveport_assembly::spec::{Keeps, WRITTEN};
+
+    use super::{Cli, Command, Hears, LLM_URL, Resume, SAID, Speaks};
 
     #[test]
     fn the_command_line_is_one_clap_can_build() {
@@ -525,27 +463,27 @@ mod tests {
             (told_nothing.stt, told_nothing.tts),
             (Hears::OpenAi, Speaks::Cartesia)
         );
-        let hears = told_nothing.hears();
+        let hears = told_nothing.spec().stt.chosen();
         assert_eq!(hears.url, "wss://api.openai.com/v1/realtime");
         assert_eq!(hears.key_env, "OPENAI_API_KEY");
         assert!(hears.own);
-        assert_eq!(told_nothing.speaks().key_env, "CARTESIA_API_KEY");
+        assert_eq!(told_nothing.spec().tts.chosen().key_env, "CARTESIA_API_KEY");
 
         // Another provider brings its own address, model, voice and the
         // name of the variable that holds its key.
         let others = agent(&["--stt", "deepgram", "--tts", "elevenlabs"]);
-        let hears = others.hears();
+        let hears = others.spec().stt.chosen();
         assert_eq!(hears.url, "wss://api.deepgram.com/v1/listen");
         assert_eq!(
             (hears.model.as_str(), hears.key_env.as_str()),
             ("nova-3", "DEEPGRAM_API_KEY")
         );
-        let speaks = others.speaks();
+        let speaks = others.spec().tts.chosen();
         assert_eq!(speaks.url, "wss://api.elevenlabs.io/v1/text-to-speech");
         assert_eq!(speaks.model, "eleven_flash_v2_5");
         assert_eq!(speaks.key_env, "ELEVENLABS_API_KEY");
         assert!(speaks.own && !speaks.voice.is_empty());
-        let third = agent(&["--stt", "assemblyai"]).hears();
+        let third = agent(&["--stt", "assemblyai"]).spec().stt.chosen();
         assert_eq!(third.model, "universal-3-6-pro");
         assert_eq!(third.key_env, "ASSEMBLYAI_API_KEY");
 
@@ -562,11 +500,11 @@ mod tests {
             "--tts-key-env",
             "MY_KEY",
         ]);
-        let hears = told.hears();
+        let hears = told.spec().stt.chosen();
         assert!(!hears.own);
         assert_eq!(hears.model, "nova-3-medical");
         assert_eq!(hears.key_env, "DEEPGRAM_API_KEY");
-        let speaks = told.speaks();
+        let speaks = told.spec().tts.chosen();
         assert_eq!(
             (speaks.voice.as_str(), speaks.key_env.as_str()),
             ("my-voice", "MY_KEY")
@@ -637,6 +575,18 @@ mod tests {
         assert!(told_nothing.agent.journal.is_none() && !told_nothing.agent.no_journal);
         assert_eq!(told_nothing.agent.state_every, 256);
         assert!(told_nothing.resume.is_none() && told_nothing.agent.notes.is_none());
+        // What the calls share is what the command line says: the usual
+        // file, a file that is named, or none.
+        let shared = told_nothing.agent.stack(Some(&told_nothing.aloud));
+        assert_eq!(shared.keeps, Keeps::Usual);
+        assert_eq!(shared.assets, PathBuf::from("target/assets"));
+        assert_eq!(shared.named, SAID);
+        let named = dev(&["--journal", "calls.redb", "--notes", "notes.txt"]).unwrap();
+        let shared = named.agent.stack(Some(&named.aloud));
+        assert_eq!(shared.keeps, Keeps::File(PathBuf::from("calls.redb")));
+        assert_eq!(shared.notes, Some(PathBuf::from("notes.txt")));
+        let nowhere = dev(&["--no-journal"]).unwrap();
+        assert_eq!(nowhere.agent.stack(None).keeps, Keeps::Memory);
 
         // The call that was last begun, or the one a file has the token
         // of. There is nowhere to write a token itself.
@@ -669,6 +619,10 @@ mod tests {
         };
         assert_eq!(chat.agent.llm_url, LLM_URL);
         assert!(chat.resume.is_none() && chat.agent.instructions.is_none());
+        // Defined, it is an agent that neither hears nor speaks.
+        let defined = chat.agent.spec(None);
+        assert!(defined.speech.is_none());
+        assert_eq!(defined.llm.model, "gpt-6-luna");
         // What it is told when it is told nothing says nothing of a
         // voice.
         assert!(!WRITTEN.contains("spoken") && !WRITTEN.contains("voice"));

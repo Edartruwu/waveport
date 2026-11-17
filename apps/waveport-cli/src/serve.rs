@@ -11,12 +11,12 @@ use waveport_ports::journal::SessionId;
 use waveport_transport_websocket::{GREETING_TIMEOUT, Knock, Listener};
 
 use crate::args::Serve;
-use crate::call::{self, Outcome, Stack};
+use crate::call::{self, Outcome, Setup};
 use crate::{Context, Failure};
 
 /// What the calls of one server share.
 struct Calls {
-    stack: Stack,
+    stack: Setup,
     /// How many calls may be taken in all, if that is limited.
     at_most: Option<u32>,
     /// How many have been.
@@ -40,8 +40,8 @@ impl Calls {
 /// Takes calls until it is told to stop, or has taken as many as it was
 /// told to.
 pub(crate) async fn serve(args: Serve) -> Result<Outcome, Failure> {
-    let stack = Stack::build(&args.agent, Some(&args.aloud), false).await?;
-    for note in &stack.notes {
+    let stack = Setup::build(&args.agent, Some(&args.aloud), false).await?;
+    for note in stack.notes() {
         println!("note: {note}");
     }
     let listener = Listener::bind(args.listen, args.exposed)

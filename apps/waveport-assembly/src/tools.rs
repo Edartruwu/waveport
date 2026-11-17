@@ -1,4 +1,4 @@
-//! The tools an agent of this command has.
+//! The tools an agent has.
 //!
 //! One only looks: it tells the time. Another acts, and once: it ends
 //! the call. Between them they are the two kinds of tool a session has to
@@ -27,10 +27,12 @@ const NOTHING: &str = r#"{"type":"object","properties":{},"additionalProperties"
 const A_TEXT: &str = r#"{"type":"object","properties":{"text":{"type":"string","description":"What to write down, in one line."}},"required":["text"],"additionalProperties":false}"#;
 
 /// The tool that takes notes: where it writes them, and whether it is to
-/// stop once it has written, for the test that kills the command there.
+/// stop once it has written, for the test that kills the program there.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Notes {
+pub struct Notes {
+    /// The file a note is a line of.
     pub file: PathBuf,
+    /// Whether the tool stops once it has written, and never answers.
     pub halt: bool,
 }
 
@@ -38,11 +40,7 @@ pub(crate) struct Notes {
 /// asks for its call to be ended is found, and `notes` is the tool that
 /// takes notes, if the agent has one. The order is the order the tools
 /// have in a call's journal: a new tool goes last.
-pub(crate) fn add(
-    registry: &mut Registry,
-    sessions: Weak<dyn SessionControl>,
-    notes: Option<Notes>,
-) {
+pub fn add(registry: &mut Registry, sessions: Weak<dyn SessionControl>, notes: Option<Notes>) {
     registry.add(
         ToolDef {
             name: "get_time".to_owned(),

@@ -78,7 +78,7 @@ Phase numbers refer to the roadmap. Locations are relative to the repository roo
 | MCP client for tools and resources | `crates/adapters/tools/mcp` | 4 |
 | Knowledge retrieval and long-term memory | `crates/adapters/knowledge` | 4 |
 | Text-to-speech cache | `crates/adapters/store/cache` | 4 |
-| Declarative agent files | `apps/waveport-cli`, `apps/waveportd` | 4 |
+| Declarative agent files | `apps/waveport-assembly`, read by `apps/waveport-cli` and `apps/waveportd` | 4 |
 | Seamless re-session for time-limited speech-to-speech providers | `crates/core/waveport-runtime` | 4 |
 
 ### Orchestration and durability

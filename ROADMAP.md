@@ -142,6 +142,8 @@ Added on 16 November 2026, when the plan for the phase was held against what the
 
 What the kernel learns in this phase, and how sessions of other shapes are run, is in [decision 0004](docs/decisions/0004-session-shapes.md). Of the four things it learns, the first two are done. A line that drops is waited for, for 30 s unless a session is given another time, what was being said is cut off where it was heard, nothing is said into the gap, and whoever comes back is given the reply they did not get. A line that stays gone ends the session as abandoned. No transport brings a line back yet: that comes with client protocol v1. And the keys of a telephone are turns: keys that follow one another are one run, which ends on the hash, on a number of keys, or when none has followed for three seconds, as a session is set; it enters the conversation as keys and is answered once. A key stops the agent at once, and words and keys keep the order they came in. The journal has a new kind of record for it, its first, and a journal from before still opens.
 
+The daemon's first part is there ahead of it: the assembly of a session is out of the `waveport` command and in a library of its own, `waveport-assembly`. An agent is one definition, which the command makes from its command line and a server will read from a file, and the same agent hears and speaks over a line with audio and reads and writes over one without.
+
 Exit criteria:
 
 - One agent definition answers a browser call, a phone call through a carrier and a text-only chat.
