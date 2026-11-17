@@ -42,6 +42,7 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/adapters/transport/local-audio` | The microphone and loudspeaker of this machine, or a caller who follows a script |
 | `crates/adapters/transport/websocket` | A far end that connects over a WebSocket, and the client for it. For this machine and networks that are trusted |
 | `crates/adapters/transport/telephony-ws` | A telephone call that a carrier streams over a WebSocket, with Twilio as its first carrier, and a stand-in for a carrier for tests. Not yet held against a carrier |
+| `crates/adapters/transport/webrtc` | A browser on a WebRTC call, and a client for it without a browser. Not yet held against a browser |
 | `crates/adapters/store/memory` | A journal that lasts as long as its process |
 | `crates/adapters/store/journal` | A journal in a file on this machine, from which a session goes on after its process died |
 | `apps/waveport-assembly` | What an agent is made of, as one definition, and a session put together from it. Whatever runs agents does it here |

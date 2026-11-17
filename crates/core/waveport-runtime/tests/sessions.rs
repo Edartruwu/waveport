@@ -395,6 +395,84 @@ async fn a_caller_asks_and_hears_the_whole_answer() {
 const STORY: &str = "Of course. Once upon a time there was a ship that sailed all the seas \
                      of the world and never came home.";
 
+/// Whether a packet of Opus carries a copy of the one before it: the
+/// bit that says so is the second of a frame of speech (RFC 6716,
+/// section 4.2.4). It is asked of packets of one frame of 20 ms.
+fn carries_a_copy(packet: &[u8]) -> bool {
+    let [toc, first, ..] = packet else {
+        return false;
+    };
+    // Not a packet of music, which has no such copy, and one frame.
+    let (kind, frames) = (toc >> 3, toc & 0x03);
+    kind < 16 && frames == 0 && first & 0x40 != 0
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_far_end_that_loses_packets_is_sent_a_copy_of_each_in_the_next() {
+    let speech = [(1_000, 2_200, "what time is it please")];
+    // Six seconds of an answer: 100 characters at 60 ms each.
+    let answer = "It is a quarter past nine, and the next train leaves at ten from the platform that is nearest here..";
+    assert_eq!(answer.len(), 100);
+    let world = World::new(
+        &speech,
+        ScriptedLlm::replies(vec![vec![LlmStep::say(answer)]]),
+    );
+    let browser = TransportCaps {
+        audio: Some(AudioCaps {
+            inbound: Codec::Opus,
+            outbound: Codec::Opus,
+            remote_buffer: RemoteBuffer {
+                clearable: true,
+                reports_played: true,
+            },
+        }),
+        text: true,
+        keys: None,
+    };
+    // The far end says every second what it lost: nothing, then a
+    // tenth from the middle of the answer on.
+    let transport = FakeTransport::with(browser)
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 12_000, &talks(&speech))
+        .loses(2_000, 0)
+        .loses(3_000, 0)
+        .loses(4_000, 0)
+        .loses(5_000, 10)
+        .loses(6_000, 9);
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(12_000).await, None, "the session goes on");
+
+    let log = running.far_end.log();
+    let at = |frame: &&SentFrame| ms(frame);
+    let well: Vec<&SentFrame> = log.frames.iter().filter(|f| at(f) < 5_000).collect();
+    let lossy: Vec<&SentFrame> = log.frames.iter().filter(|f| at(f) >= 5_200).collect();
+    // The answer was being said both before the far end said so and
+    // after.
+    assert!(
+        well.len() > 50 && lossy.len() > 50,
+        "{} {}",
+        well.len(),
+        lossy.len()
+    );
+    let copies = |frames: &[&SentFrame]| {
+        frames
+            .iter()
+            .filter(|frame| carries_a_copy(&frame.payload))
+            .count()
+    };
+    // The voice of this test is a tone, and an encoder spends a copy
+    // only on what it takes for speech: so it is some packets that
+    // carry one, where none did before. How much of real speech is
+    // covered is for a test with real speech to say.
+    assert_eq!(copies(&well), 0);
+    assert!(copies(&lossy) > 0, "none of {}", lossy.len());
+    // Nothing else about the answer changed: it was all said, and all
+    // heard.
+    let tag = log.frames[0].tag;
+    assert_eq!(log.sent(tag), MediaDur::from_millis(100 * 60));
+    assert_eq!(log.heard(tag), MediaDur::from_millis(100 * 60));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_caller_who_interrupts_is_answered_on_what_they_heard() {
     let speech = [

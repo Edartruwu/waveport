@@ -79,6 +79,31 @@ About 50 ms of every Chrome call's set-up on a fast network are a wait: Chrome s
 | What a loudspeaker plays | The browsers had no heads and no sound. In Chrome a tap of the audio in the page is itself about 60 ms late | Milestone 39 |
 | Mobile browsers | None here | Not in this phase |
 
+## What milestone 16 found
+
+The transport is `crates/adapters/transport/webrtc`. It was written against a client of its own, which offers what the two browsers offered here, and not against a browser: what follows is what the library and the tests taught, and where the transport does something else than the table above says.
+
+| What | What the transport does | Why |
+|---|---|---|
+| Packets that are not audio | Audio is numbered for the session by its place in the stream's time, and not by the sequence numbers of its packets with the others taken out | Padding, keys, a frame that comes twice and a packet that is sent again all take sequence numbers. Time has none of that: a frame is where it is, and a hole in time is that many frames |
+| Which response audio is of | A `mark` of client protocol v1 says where in the stream a run begins and where it ends (`ts`), which the protocol did not have | Audio and messages go apart, and either can be first. A client that goes by which came first puts audio into the wrong response |
+| Retransmission of the browser's audio | Asked for without RED, as decided. A packet that is sent again is taken if it comes in time and **is not waited for** | The wait is the reorder buffer's, and how long it should be is a figure of a browser on a network: milestone 18 |
+| How fast the encoder learns the loss | From what the far end says of every packet, once a second, and from its receiver reports, five seconds apart: the larger of the two | `str0m` says a loss of its own only between two receiver reports that fall into one of its windows, which did not happen once. What is said of every packet leaves out the packets between two messages and says too little, and the reports say it right and late. The encoder is told the worst of the last four figures, from two in a hundred on |
+| A line that drops | Nothing arrived for five seconds | `str0m` says so after about fifteen on the side that answers. A far end that is there sends audio fifty times a second, and reports and checks when it has none |
+| An offer that is made again | The answer is `str0m`'s, and the call goes on. The side that offers again has to say its new address after it has taken the answer | `str0m` forgets the addresses of the side that offers when it accepts an answer to a restart |
+| What `str0m` hands over | Everything is asked for after every datagram | In RTP mode it keeps one packet it received until it is asked again. A frame then arrives one packet late, or not at all at the end of a call |
+| DTMF | Keys we send are events beside the audio, which is not held back for them | Neither browser was seen to play an event, and what one makes of audio that goes on under a key was not measured. A key we send is said eight times, 20 ms apart, the last of them three times over with its end bit, and the next key is at least that and 80 ms later in the stream |
+| DTLS 1.3 | Off, a setting. With it on at either end or both, the client of this crate connects | Says nothing about a browser |
+| A far end that does not speak the protocol | Answered when whoever serves the offer says so: audio and keys, and no channel | The stock Pipecat client, and anything else that is only a WebRTC peer |
+| The data channel | The one that is agreed on in advance, and no other. **A channel the client opens in band is not answered on** | The table above says it is accepted too. Beside the channel that is agreed on, one that this crate's own client opened in band never opened, and why was not followed up. The client that needs it is the stock Pipecat one: milestone 19, where it is on a call |
+| Which call a datagram is of | The name the far end's checks are addressed to, and from then on the address it came from | One socket for all calls. A far end whose address changes with no new offer is heard again at its next check |
+| Whose a datagram is | A call is reached from an address, or over a connection, only once a check from there knew the call's password, and nothing else from anywhere else is shown to the call (`Rtc::accepts`) | The name is in every check, in clear. A first version learned an address from any datagram that named the call: eight forged checks then took the far end's place in the table, a forged first word could reach the handshake, a forged frame replaced a connection, and any of them kept a silent line looking well. A review found all four |
+| The end of a call | The far end is served until it says that it has the goodbye, or hangs up, a third of a second at most, and then the call is ended. A call that is let go of otherwise is ended at once | The end is another datagram than the goodbye. `str0m` is closed the moment it is asked to be, so a first version that ended the call with the goodbye waited for nothing |
+| A call that is ended while its channel is set up | Over at once for the end that ended it; the other finds the line silent | `str0m` refuses to close while the data channel it began is not there yet, and then sends nothing. It is the client's end that begins it. A test of this crate that hung up at that moment failed one run in two on a busy machine |
+| Connections that say nothing | Sixty-four may wait to say which call they are for, five seconds each, and one more takes the place of the oldest | A first version let none in while as many waited. Nothing limits what one address does: that is for whatever stands before the server |
+
+Still not known: what a browser does with any of it. The first to say is the daemon's page on a call, at milestone 18.
+
 ## What it cost
 
 An afternoon of one machine. The endpoint, the page that drives a call, the scripts and the tables are in `spikes/webrtc/`. The reports of the single runs hold the SDP of every call, and with it the addresses of the machine they were made on, so they are not in the repository: the tables made from them are.

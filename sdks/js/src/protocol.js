@@ -132,7 +132,7 @@ export const KEYS = "0123456789*#ABCD";
  * What a server says.
  *
  * @typedef {Welcome
- *   | { type: "mark", run: number, generation: number, end?: true }
+ *   | { type: "mark", run: number, generation: number, end?: true, ts?: number }
  *   | { type: "clear", run: number }
  *   | ({ type: "fact", seq: number } & Fact)
  *   | ({ type: "told" } & News)
@@ -398,7 +398,7 @@ const FROM_SERVER = {
     next_seq: int,
     grace_ms: maybe(int),
   }),
-  mark: shaped({ run: int, generation: int, end: flag }),
+  mark: shaped({ run: int, generation: int, end: flag, ts: maybe(int) }),
   clear: shaped({ run: int }),
   fact: tagged("kind", FACTS, { seq: int }),
   told: tagged("kind", NEWS),

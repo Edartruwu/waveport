@@ -101,6 +101,7 @@ waveport-telemetry-otel = { path = "crates/adapters/telemetry/otel", version = "
 waveport-testkit = { path = "crates/testing/waveport-testkit", version = "0.1.0" }
 waveport-transport-local-audio = { path = "crates/adapters/transport/local-audio", version = "0.1.0" }
 waveport-transport-telephony-ws = { path = "crates/adapters/transport/telephony-ws", version = "0.1.0" }
+waveport-transport-webrtc = { path = "crates/adapters/transport/webrtc", version = "0.1.0" }
 waveport-transport-websocket = { path = "crates/adapters/transport/websocket", version = "0.1.0" }
 waveport-tts-cartesia = { path = "crates/adapters/tts/cartesia", version = "0.1.0" }
 waveport-tts-elevenlabs = { path = "crates/adapters/tts/elevenlabs", version = "0.1.0" }
@@ -108,14 +109,25 @@ waveport-tts-elevenlabs = { path = "crates/adapters/tts/elevenlabs", version = "
 # The daemon's routes and the bodies of its event streams. Its own
 # server is left out: the daemon serves each connection with hyper, so
 # that it can say how long the head of a request may take to arrive.
+# What the WebRTC transport's own crypto provider is made of (decision
+# 0005): the ciphers of SRTP, the hashes, and the key and certificate a
+# DTLS handshake shows. All of it is Rust: the provider that comes with
+# `str0m` asks for `rcgen`, which brings aws-lc and with it C and cmake.
+aes = "0.9.4"
+aes-gcm = "0.11.1"
 axum = { version = "0.8.9", default-features = false }
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", default-features = false }
 cpal = "0.18.2"
+ctr = "0.10.1"
+# The DTLS of the WebRTC transport, with the cryptography that is Rust
+# and without the certificate maker that is not.
+dimpl = { version = "=0.9.0", default-features = false, features = ["rust-crypto"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 # The entropy of the operating system, for a token nobody can guess.
 getrandom = "0.4.3"
+hmac = "0.13.0"
 hyper = { version = "1.12.0", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
 # The time where the machine is, for a tool that tells it. The time zones
@@ -135,6 +147,7 @@ opus = "0.4.0"
 # ONNX Runtime is loaded from a file when the program starts, not linked in:
 # no library is downloaded while building, and none is built.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["api-31", "load-dynamic", "std"] }
+p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
 prost = { version = "0.14.4", default-features = false }
 # The journal's file: a store that commits a whole group of records with
 # one sync, and comes back whole after a crash. 4.6.0 mends a repair that
@@ -155,11 +168,20 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-platform-verifier = "0.7.1"
 serde = { version = "1.0.229", default-features = false }
 serde_json = { version = "1.0.154", default-features = false }
+sha1 = "0.11.0"
 sha2 = { version = "0.11.1", default-features = false }
+# WebRTC without I/O of its own: ICE, DTLS, SRTP, SCTP and the session
+# description. Exact, because it changes its API on most minor releases.
+# Without its features there is no cryptography in it: the transport
+# brings its own.
+str0m = { version = "=0.25.0", default-features = false }
+# What a crypto provider for `str0m` implements.
+str0m-proto = { version = "=0.8.0", default-features = false, features = ["dtls"] }
 tokio = { version = "~1.53", default-features = false }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 toml = "1.2.1"
+x509-cert = { version = "0.3.0", default-features = false, features = ["builder", "std"] }
 
 # Benchmark harnesses, used only by the `benches` package.
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }

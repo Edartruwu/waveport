@@ -271,6 +271,7 @@ impl Client {
                     run,
                     generation,
                     end: false,
+                    ..
                 } => Heard::Begins { run, generation },
                 FromServer::Mark { run, end: true, .. } => Heard::Ends(run),
                 FromServer::Clear { run } => Heard::Clear(run),

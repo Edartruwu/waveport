@@ -14,6 +14,9 @@
 //! binary message that holds audio and nothing else: plain samples of 16
 //! bits, little end first, or one Opus packet, as [`AudioFormat`] says.
 //! On a WebRTC call the audio is the call's, and only the JSON is here.
+//! What says where audio is says it there by the call's own count, the
+//! RTP time: a mark where its run begins ([`FromServer::Mark`]), and
+//! the client where it has played to ([`FromClient::PlayedRtp`]).
 //!
 //! # A connection
 //!
@@ -345,6 +348,13 @@ pub enum FromServer {
         /// Whether this is the end of the run and not its beginning.
         #[serde(default, skip_serializing_if = "is_false")]
         end: bool,
+        /// On a WebRTC call, where in the call's audio the run begins,
+        /// or where it ends: the RTP time of its first sample, or of
+        /// the first after its last. Left out on a connection that
+        /// carries the audio itself, where the mark stands in its
+        /// place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ts: Option<u32>,
     },
     /// What the client holds of this run, and of every run before it,
     /// and has not played is to be discarded.

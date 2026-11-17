@@ -26,7 +26,7 @@ use waveport_domain::audio::FRAME_MS;
 use waveport_domain::event::{Event, Key, OpEvent, Part};
 use waveport_domain::ids::OpTag;
 use waveport_domain::time::{MediaDur, MonoTime};
-use waveport_media::codec::opus::OpusSettings;
+use waveport_media::codec::opus::{LossWatch, OpusSettings};
 use waveport_media::codec::{CodecError, Encoder};
 use waveport_media::dtmf::{Dialer, MOST};
 use waveport_media::ledger::{Mark, Spread};
@@ -216,6 +216,9 @@ pub(crate) struct Voice {
     config: TtsConfig,
     playout: Playout,
     encoder: Encoder,
+    /// What the far end says it lost, and what the encoder expects of
+    /// the line for it.
+    loss: LossWatch,
     speaking: Option<Speaking>,
     /// The position last told to the kernel.
     reported: Option<Position>,
@@ -253,6 +256,7 @@ impl Voice {
             config,
             playout: Playout::new(PlayoutConfig::new(plan.rate)),
             encoder,
+            loss: LossWatch::default(),
             speaking: None,
             reported: None,
             started: None,
@@ -326,6 +330,16 @@ impl Voice {
     pub(crate) fn acked(&mut self, tag: OpTag, played: MediaDur) {
         if self.playback.far_end_reports {
             self.playout.ack(tag, played);
+        }
+    }
+
+    /// The far end says how much of what it was sent lately did not
+    /// arrive. The encoder is told what to expect of the line when that
+    /// changes.
+    pub(crate) fn lost(&mut self, percent: u8) {
+        if let Some(expects) = self.loss.told(percent) {
+            // What a watch expects is in range.
+            let _ = self.encoder.expect_loss(expects);
         }
     }
 

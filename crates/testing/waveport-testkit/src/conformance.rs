@@ -607,6 +607,10 @@ impl<'a> Watched<'a> {
     fn look(&mut self, cx: &mut Context<'_>) {
         while !self.over {
             match self.transport.poll_event(cx) {
+                // What the far end lost of what it was sent is said at
+                // any time, by a transport whose far end says so, and
+                // no check waits for it.
+                Poll::Ready(Some(TransportEvent::Loss { .. })) => {}
                 Poll::Ready(Some(event)) => self.said.push_back(event),
                 Poll::Ready(None) => self.over = true,
                 Poll::Pending => break,
