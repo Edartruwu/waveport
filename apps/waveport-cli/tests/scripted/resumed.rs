@@ -327,6 +327,24 @@ impl Set {
         asked
     }
 
+    /// Waits until the model was asked.
+    ///
+    /// A process that is killed while the model answers is at its place
+    /// once it has stored the question, and it asks the model as it
+    /// stores: the two are not in step. Killed before its request has
+    /// left, it never asked, and the answer that was meant for it is
+    /// given to the process that goes on.
+    async fn the_model_is_asked(&self) {
+        let began = Instant::now();
+        while self.llm.requests().is_empty() {
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "the model was not asked"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Runs a call until its process is at `place`, and kills the
     /// process there. Returns what it told, and its errors.
     async fn killed_at(&self, place: &str) -> (Vec<String>, String) {
@@ -349,6 +367,9 @@ impl Set {
                 errors.lock().unwrap().join("\n")
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if place == "after:turn_committed" {
+            self.the_model_is_asked().await;
         }
         // As `kill -9` does it: the process is given no chance to
         // finish anything.
@@ -785,6 +806,7 @@ async fn a_call_from_elsewhere_goes_on_when_its_agent_was_killed_and_is_back() {
     let errors = lines_of(caller.stderr.take().unwrap());
 
     first.says(&format!("halted: {place}")).await;
+    set.the_model_is_asked().await;
     first.killed();
     let asked_before = set.asked_once_quiet().await;
 
