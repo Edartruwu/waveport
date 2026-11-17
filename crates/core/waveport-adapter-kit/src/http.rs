@@ -5,11 +5,22 @@
 //! one up costs as much time as a model takes to start writing, and
 //! hands every failure over as a [`PortError`] whose class says whether
 //! trying again can help.
+//!
+//! The same client asks the smaller things: a carrier that is told to
+//! place a call, or asked how one stands. Those say who asks in a way of
+//! their own ([`Auth`]), some take a form and not JSON ([`Body`]), and
+//! their answers are short enough to be read whole
+//! ([`HttpResponse::body`]).
 
 use core::fmt;
+use core::fmt::Write as _;
 use core::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
+use reqwest::Method;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use waveport_ports::error::PortError;
 
 use crate::retry::error_of_status;
@@ -41,18 +52,123 @@ impl Default for HttpSettings {
     }
 }
 
+/// How a request says who sends it. The key goes in a header that is
+/// marked as one not to be shown, and is struck out of whatever the
+/// server says back in an error.
+#[derive(Clone, Copy, Debug)]
+pub enum Auth<'a> {
+    /// It does not say.
+    None,
+    /// The key as a bearer token: `Authorization: Bearer`.
+    Bearer(&'a Secret),
+    /// A name and its key: `Authorization: Basic`. Carriers take the
+    /// name of an account and its token that way.
+    Basic {
+        /// The name, which is no secret.
+        user: &'a str,
+        /// The key that goes with it.
+        key: &'a Secret,
+    },
+    /// The key as the value of a header of the provider's own, such as
+    /// `x-api-key`.
+    Header {
+        /// The name of the header.
+        name: &'a str,
+        /// The key.
+        key: &'a Secret,
+    },
+}
+
+impl Auth<'_> {
+    /// The header that says who sends the request, if one does.
+    fn header(&self) -> Result<Option<(&str, HeaderValue)>, PortError> {
+        let (name, value) = match self {
+            Self::None => return Ok(None),
+            Self::Bearer(key) => (AUTHORIZATION.as_str(), format!("Bearer {}", key.expose())),
+            Self::Basic { user, key } => (
+                AUTHORIZATION.as_str(),
+                format!("Basic {}", basic(user, key)),
+            ),
+            Self::Header { name, key } => (*name, key.expose().to_owned()),
+        };
+        // What the value is stays out of the error: it is the key.
+        let mut value = HeaderValue::from_str(&value)
+            .map_err(|_| PortError::permanent("the key cannot be sent in a header"))?;
+        // Kept out of whatever prints the request.
+        value.set_sensitive(true);
+        Ok(Some((name, value)))
+    }
+
+    /// `text` without the key, in any shape it was sent in.
+    fn strike(&self, text: &str) -> String {
+        match self {
+            Self::None => text.to_owned(),
+            Self::Bearer(key) | Self::Header { key, .. } => key.strike(text),
+            Self::Basic { user, key } => {
+                // A server that repeats the header repeats the key as it
+                // was sent, which is not as it is written.
+                let sent = Secret::new(basic(user, key));
+                key.strike(&sent.strike(text))
+            }
+        }
+    }
+}
+
+/// A name and its key as `Authorization: Basic` has them.
+fn basic(user: &str, key: &Secret) -> String {
+    STANDARD.encode(format!("{user}:{}", key.expose()))
+}
+
+/// What a request carries.
+#[derive(Clone, Copy, Debug)]
+pub enum Body<'a> {
+    /// Nothing.
+    None,
+    /// JSON.
+    Json(&'a [u8]),
+    /// Names and their values, as a form sends them
+    /// (`application/x-www-form-urlencoded`).
+    Form(&'a [(&'a str, &'a str)]),
+}
+
+/// Names and values as a form sends them.
+fn form(fields: &[(&str, &str)]) -> Vec<u8> {
+    fn written(text: &str, out: &mut String) {
+        for byte in text.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                    out.push(char::from(byte));
+                }
+                b' ' => out.push('+'),
+                _ => {
+                    let _ = write!(out, "%{byte:02X}");
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    for (name, value) in fields {
+        if !out.is_empty() {
+            out.push('&');
+        }
+        written(name, &mut out);
+        out.push('=');
+        written(value, &mut out);
+    }
+    out.into_bytes()
+}
+
 /// A request.
 #[derive(Clone, Copy, Debug)]
 pub struct HttpRequest<'a> {
     /// The address.
     pub url: &'a str,
-    /// Headers to send, besides the key.
+    /// Headers to send, besides the one that says who sends it.
     pub headers: &'a [(&'a str, &'a str)],
-    /// The key, sent as a bearer token. It is struck out of whatever the
-    /// server says back in an error.
-    pub key: Option<&'a Secret>,
-    /// The body, which is JSON.
-    pub json: &'a [u8],
+    /// Who sends it.
+    pub auth: Auth<'a>,
+    /// What it carries.
+    pub body: Body<'a>,
 }
 
 /// An HTTP client. Clones share their connections.
@@ -98,18 +214,54 @@ impl HttpClient {
     /// than a success. In that case a little of what it said is in the
     /// error, with the key struck out.
     pub async fn post(&self, request: HttpRequest<'_>) -> Result<HttpResponse, PortError> {
-        let mut builder = self
-            .inner
-            .post(request.url)
-            .header("content-type", "application/json")
-            .body(request.json.to_vec());
+        self.send(Method::POST, request).await
+    }
+
+    /// Sends a `GET` and waits for the answer to begin.
+    ///
+    /// # Errors
+    ///
+    /// As [`post`](Self::post). A request that carries something is not
+    /// sent: a `GET` carries nothing.
+    pub async fn get(&self, request: HttpRequest<'_>) -> Result<HttpResponse, PortError> {
+        if !matches!(request.body, Body::None) {
+            return Err(PortError::permanent("a GET carries nothing"));
+        }
+        self.send(Method::GET, request).await
+    }
+
+    /// The request as it is sent.
+    fn built(
+        &self,
+        method: Method,
+        request: &HttpRequest<'_>,
+    ) -> Result<reqwest::Request, PortError> {
+        let mut builder = self.inner.request(method, request.url);
+        builder = match request.body {
+            Body::None => builder,
+            Body::Json(json) => builder
+                .header("content-type", "application/json")
+                .body(json.to_vec()),
+            Body::Form(fields) => builder
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(form(fields)),
+        };
         for (name, value) in request.headers {
             builder = builder.header(*name, *value);
         }
-        if let Some(key) = request.key {
-            builder = builder.bearer_auth(key.expose());
+        if let Some((name, value)) = request.auth.header()? {
+            builder = builder.header(name, value);
         }
-        let mut response = builder.send().await.map_err(send_error)?;
+        builder.build().map_err(send_error)
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        request: HttpRequest<'_>,
+    ) -> Result<HttpResponse, PortError> {
+        let built = self.built(method, &request)?;
+        let mut response = self.inner.execute(built).await.map_err(send_error)?;
         let status = response.status();
         if status.is_success() {
             return Ok(HttpResponse { inner: response });
@@ -127,11 +279,7 @@ impl HttpClient {
                 _ => break,
             }
         }
-        let said = String::from_utf8_lossy(&said);
-        let said = match request.key {
-            Some(key) => key.strike(&said),
-            None => said.into_owned(),
-        };
+        let said = request.auth.strike(&String::from_utf8_lossy(&said));
         Err(error_of_status(status.as_u16(), wait.as_deref(), &said))
     }
 }
@@ -164,6 +312,27 @@ impl HttpResponse {
     pub async fn chunk(&mut self) -> Result<Option<Bytes>, PortError> {
         self.inner.chunk().await.map_err(send_error)
     }
+
+    /// The whole body, for an answer that is short: one of `at_most`
+    /// bytes or fewer.
+    ///
+    /// # Errors
+    ///
+    /// The connection dropped, the server was silent for too long, or
+    /// the answer is longer than that. The same request would be
+    /// answered at the same length.
+    pub async fn body(mut self, at_most: usize) -> Result<Vec<u8>, PortError> {
+        let mut body = Vec::new();
+        while let Some(chunk) = self.chunk().await? {
+            if body.len() + chunk.len() > at_most {
+                return Err(PortError::permanent(format!(
+                    "the answer is longer than the {at_most} bytes that are read of one"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
 }
 
 /// A failure to send a request or to read its answer.
@@ -194,7 +363,9 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use waveport_ports::error::RetryClass;
 
-    use super::{HttpClient, HttpRequest, HttpSettings};
+    use reqwest::Method;
+
+    use super::{Auth, Body, HttpClient, HttpRequest, HttpSettings, form};
     use crate::secret::Secret;
     use crate::sse::SseParser;
 
@@ -305,8 +476,8 @@ mod tests {
             .post(HttpRequest {
                 url: &url,
                 headers: &[("x-extra", "yes")],
-                key: Some(&key),
-                json: b"{\"stream\":true}",
+                auth: Auth::Bearer(&key),
+                body: Body::Json(b"{\"stream\":true}"),
             })
             .await
             .unwrap();
@@ -354,8 +525,8 @@ mod tests {
                 .post(HttpRequest {
                     url: &url,
                     headers: &[],
-                    key: Some(&key),
-                    json: body.as_bytes(),
+                    auth: Auth::Bearer(&key),
+                    body: Body::Json(body.as_bytes()),
                 })
                 .await
                 .unwrap_err();
@@ -384,8 +555,8 @@ mod tests {
             .post(HttpRequest {
                 url: &url,
                 headers: &[],
-                key: None,
-                json: b"{}",
+                auth: Auth::None,
+                body: Body::Json(b"{}"),
             })
             .await
             .unwrap_err();
@@ -418,8 +589,8 @@ mod tests {
                 .post(HttpRequest {
                     url: &url,
                     headers: &[],
-                    key: None,
-                    json: body,
+                    auth: Auth::None,
+                    body: Body::Json(body),
                 })
                 .await
                 .unwrap();
@@ -427,5 +598,207 @@ mod tests {
             let error = response.chunk().await.unwrap_err();
             assert_eq!(error.class, class, "{error}");
         }
+    }
+
+    #[test]
+    fn a_form_is_written_as_a_browser_writes_one() {
+        assert_eq!(form(&[]), b"");
+        // A number to call, an address with an address in it, and what
+        // is neither a letter nor a digit.
+        let fields = [
+            ("To", "+15550100"),
+            ("Url", "https://voice.example/answer?call=7&again=no"),
+            ("Friendly Name", "a b*c-d.e_f~g"),
+            ("Said", "¿Qué hora es?"),
+            ("Empty", ""),
+        ];
+        let written = String::from_utf8(form(&fields)).unwrap();
+        assert_eq!(
+            written,
+            "To=%2B15550100\
+             &Url=https%3A%2F%2Fvoice.example%2Fanswer%3Fcall%3D7%26again%3Dno\
+             &Friendly+Name=a+b*c-d.e_f%7Eg\
+             &Said=%C2%BFQu%C3%A9+hora+es%3F\
+             &Empty="
+        );
+    }
+
+    #[test]
+    fn whoever_sends_a_request_is_said_in_a_header_that_is_not_shown() {
+        let client = client();
+        let key = Secret::new("tok-secret-123");
+        let cases = [
+            (Auth::Bearer(&key), "authorization", "Bearer tok-secret-123"),
+            (
+                Auth::Basic {
+                    user: "an-account",
+                    key: &key,
+                },
+                "authorization",
+                // `an-account:tok-secret-123`
+                "Basic YW4tYWNjb3VudDp0b2stc2VjcmV0LTEyMw==",
+            ),
+            (
+                Auth::Header {
+                    name: "x-api-key",
+                    key: &key,
+                },
+                "x-api-key",
+                "tok-secret-123",
+            ),
+        ];
+        for (auth, name, value) in cases {
+            let request = HttpRequest {
+                url: "http://127.0.0.1:9/",
+                headers: &[("x-extra", "yes")],
+                auth,
+                body: Body::None,
+            };
+            let built = client.built(Method::GET, &request).unwrap();
+            let sent = built.headers().get(name).unwrap();
+            assert_eq!(sent.to_str().unwrap(), value, "{name}");
+            assert!(sent.is_sensitive(), "{name}");
+            // What prints the request does not print the key.
+            let shown = format!("{built:?} {request:?}");
+            for held in ["tok-secret-123", "YW4tYWNjb3VudDp0b2stc2VjcmV0LTEyMw"] {
+                assert!(!shown.contains(held), "{shown}");
+            }
+            assert!(!built.headers().get("x-extra").unwrap().is_sensitive());
+        }
+        // Who does not say is not said.
+        let request = HttpRequest {
+            url: "http://127.0.0.1:9/",
+            headers: &[],
+            auth: Auth::None,
+            body: Body::None,
+        };
+        let built = client.built(Method::GET, &request).unwrap();
+        assert!(built.headers().get("authorization").is_none());
+        // A key that cannot stand in a header is not sent, and not
+        // repeated.
+        let broken = Secret::new("tok\nsecret");
+        let request = HttpRequest {
+            auth: Auth::Bearer(&broken),
+            ..request
+        };
+        let error = client.built(Method::GET, &request).unwrap_err();
+        assert_eq!(error.class, RetryClass::Permanent);
+        assert!(!error.message.contains("secret"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_repeats_no_key_in_whatever_shape_it_was_sent() {
+        let url = server(|mut stream, request| async move {
+            // A server that says back what it was sent, as some do.
+            let sent: Vec<&str> = request
+                .lines()
+                .filter(|line| {
+                    let line = line.to_ascii_lowercase();
+                    line.starts_with("authorization:") || line.starts_with("x-api-key:")
+                })
+                .collect();
+            let body = format!("not allowed: {} (tok-secret-123)", sent.join(" "));
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        })
+        .await;
+        let key = Secret::new("tok-secret-123");
+        let client = client();
+        for auth in [
+            Auth::Bearer(&key),
+            Auth::Basic {
+                user: "an-account",
+                key: &key,
+            },
+            Auth::Header {
+                name: "x-api-key",
+                key: &key,
+            },
+        ] {
+            let error = client
+                .post(HttpRequest {
+                    url: &url,
+                    headers: &[],
+                    auth,
+                    body: Body::Form(&[("To", "+15550100")]),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.class, RetryClass::Auth, "{auth:?}: {error}");
+            assert!(error.message.contains("not allowed"), "{error}");
+            for held in ["tok-secret-123", "YW4tYWNjb3VudDp0b2stc2VjcmV0LTEyMw"] {
+                assert!(!error.message.contains(held), "{auth:?}: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_form_is_posted_and_a_short_answer_is_read_whole() {
+        let url = server(|mut stream, request| async move {
+            let lower = request.to_ascii_lowercase();
+            let body = if request.starts_with("POST ") {
+                assert!(
+                    lower.contains("content-type: application/x-www-form-urlencoded\r\n"),
+                    "{request}"
+                );
+                assert!(lower.contains("authorization: basic "), "{request}");
+                assert!(request.ends_with("\r\n\r\nTo=%2B15550100&Digits=12%23"));
+                "{\"call\":\"made-up\"}"
+            } else {
+                assert!(
+                    request.starts_with("GET /v1/chat/completions HTTP/1.1\r\n"),
+                    "{request}"
+                );
+                // Nothing is carried, and nothing says that something is.
+                assert!(!lower.contains("content-type:"), "{request}");
+                assert!(request.ends_with("\r\n\r\n"));
+                "{\"state\":\"ringing\"}"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        })
+        .await;
+        let key = Secret::new("tok-secret-123");
+        let auth = Auth::Basic {
+            user: "an-account",
+            key: &key,
+        };
+        let client = client();
+        let placed = client
+            .post(HttpRequest {
+                url: &url,
+                headers: &[],
+                auth,
+                body: Body::Form(&[("To", "+15550100"), ("Digits", "12#")]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(placed.body(64).await.unwrap(), b"{\"call\":\"made-up\"}");
+
+        let asked = HttpRequest {
+            url: &url,
+            headers: &[],
+            auth,
+            body: Body::None,
+        };
+        let stands = client.get(asked).await.unwrap();
+        assert_eq!(stands.body(19).await.unwrap(), b"{\"state\":\"ringing\"}");
+        // An answer that is longer than is read of one is not read.
+        let error = client.get(asked).await.unwrap().body(18).await.unwrap_err();
+        assert_eq!(error.class, RetryClass::Permanent, "{error}");
+        // And a GET that was to carry something is not sent.
+        let carrying = HttpRequest {
+            body: Body::Json(b"{}"),
+            ..asked
+        };
+        let error = client.get(carrying).await.unwrap_err();
+        assert_eq!(error.class, RetryClass::Permanent, "{error}");
+        assert!(error.message.contains("a GET carries nothing"), "{error}");
     }
 }

@@ -14,6 +14,9 @@
 //!   ([`retry`]).
 //! - [`pool`] keeps a WebSocket connection whose work is done for the
 //!   work that comes next.
+//! - [`mod@line`] is what the transports share that carry audio over a
+//!   connection of messages: the responses a far end was sent, and its
+//!   audio cut into the packets a session takes.
 //! - [`sse`] reads the event streams language models answer with.
 //! - [`timeline`] turns a speech recogniser's times into the session's.
 //! - [`turns`] adds up what a session says of its turns into how long
@@ -24,6 +27,7 @@
 //! - [`secret`] keeps keys out of logs.
 
 pub mod http;
+pub mod line;
 pub mod pcm;
 pub mod pool;
 pub mod retry;

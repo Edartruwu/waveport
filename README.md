@@ -28,7 +28,7 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/core/waveport-domain` | Domain model and the session kernel. `no_std`: no sockets, clocks or threads |
 | `crates/core/waveport-media` | The per-frame audio path: reordering, decoding, resampling, pacing |
 | `crates/core/waveport-ports` | The traits adapters implement, what each can say it does, and the session planner |
-| `crates/core/waveport-adapter-kit` | What adapters share: a stream helper, WebSocket and HTTP clients, connections kept for the next response, server-sent events, retry classes |
+| `crates/core/waveport-adapter-kit` | What adapters share: a stream helper, WebSocket and HTTP clients, connections kept for the next response, server-sent events, retry classes, and what transports that carry audio over messages have in common |
 | `crates/core/waveport-runtime` | Application layer: runs sessions. Shards, the session actor, and the compute plane that shares the listening models among sessions |
 | `crates/core/waveport-control` | Application layer: runs the fleet |
 | `crates/core/waveport-protocol` | Wire formats: client protocol, control API, journal records. Depends on no other crate |

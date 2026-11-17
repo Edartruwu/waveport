@@ -4,14 +4,14 @@
 use core::fmt;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use waveport_adapter_kit::line::{Inbound, Packet, Runs};
 use waveport_adapter_kit::stream::{self, Commands, Either, Events, Receiver, Sender};
 use waveport_adapter_kit::ws::{WsConn, WsMessage};
 use waveport_domain::ids::{OpTag, ParticipantId};
@@ -33,10 +33,6 @@ const ROOM: usize = 64;
 /// How many lines about the call may wait for the connection. One that
 /// finds no room is not sent.
 const LINES: usize = 64;
-
-/// How many responses are remembered, to know which one a client says it
-/// has played.
-const MOST_RUNS: usize = 64;
 
 /// The close code for a client that did not keep to the protocol.
 const NOT_ALLOWED: u16 = 1008;
@@ -140,7 +136,7 @@ impl Knock {
     /// connection is closed.
     pub async fn greet(self, timeout: Duration) -> Result<Caller, PortError> {
         let by = Instant::now() + timeout;
-        let (mut conn, _) = WsConn::accept(self.tcp, PATH, PROTOCOL, timeout).await?;
+        let (mut conn, _) = WsConn::accept(self.tcp, PATH, Some(PROTOCOL), timeout).await?;
         let hello = match tokio::time::timeout_at(by, conn.next()).await {
             Ok(Ok(Some(message))) => message,
             Ok(Ok(None) | Err(_)) => {
@@ -223,7 +219,7 @@ impl Caller {
                 rate,
                 who,
                 runs: Runs::default(),
-                inbound: Inbound::new(rate),
+                inbound: Inbound::pcm(rate),
             };
             far.serve(session, commands, told, events)
         });
@@ -366,137 +362,6 @@ impl Transport for WsTransport {
     }
 }
 
-/// A response on its way to the client.
-#[derive(Clone, Copy, Debug)]
-struct Run {
-    tag: OpTag,
-    /// The number the client knows it by.
-    number: u32,
-    /// How many of its samples were sent.
-    sent: u32,
-}
-
-/// The responses the client was sent, the newest last.
-#[derive(Debug, Default)]
-struct Runs {
-    known: VecDeque<Run>,
-    /// The number of the next response.
-    next: u32,
-    /// The number of the response whose audio the client was last told
-    /// follows.
-    open: Option<u32>,
-}
-
-impl Runs {
-    /// The response `tag`, which is a new one if it is not known.
-    fn of(&mut self, tag: OpTag) -> &mut Run {
-        let found = self.known.iter().position(|run| run.tag == tag);
-        let at = found.unwrap_or_else(|| {
-            if self.known.len() >= MOST_RUNS {
-                self.known.pop_front();
-            }
-            self.known.push_back(Run {
-                tag,
-                number: self.next,
-                sent: 0,
-            });
-            self.next = self.next.wrapping_add(1);
-            self.known.len() - 1
-        });
-        // The place is one that was just found or made.
-        #[expect(clippy::indexing_slicing, reason = "the index is of this queue")]
-        &mut self.known[at]
-    }
-
-    fn numbered(&self, number: u32) -> Option<Run> {
-        self.known.iter().copied().find(|run| run.number == number)
-    }
-
-    fn tagged(&self, tag: OpTag) -> Option<Run> {
-        self.known.iter().copied().find(|run| run.tag == tag)
-    }
-}
-
-/// The client's audio, cut into the packets a session takes: 20 ms each,
-/// numbered, and each with the place of its first sample in the stream.
-#[derive(Debug)]
-struct Inbound {
-    rate: Rate,
-    /// What has arrived and does not fill a packet yet.
-    held: BytesMut,
-    sequence: u16,
-    /// How many samples came before the next packet.
-    position: u64,
-    /// When the first audio arrived.
-    began: Option<Instant>,
-}
-
-impl Inbound {
-    fn new(rate: Rate) -> Self {
-        Self {
-            rate,
-            held: BytesMut::new(),
-            sequence: 0,
-            position: 0,
-            began: None,
-        }
-    }
-
-    /// How many bytes a packet holds.
-    const fn packet(&self) -> usize {
-        self.rate.frame() * 2
-    }
-
-    /// Takes what a message holds, which arrived at `now`.
-    ///
-    /// # Errors
-    ///
-    /// The message is not whole samples, or holds more than a second.
-    fn take(&mut self, samples: &[u8], now: Instant) -> Result<(), &'static str> {
-        let a_second = u64::from(self.rate.hz());
-        if !samples.len().is_multiple_of(2) {
-            return Err("a message of audio has to hold whole samples");
-        }
-        let arriving = (samples.len() / 2) as u64;
-        if arriving > a_second {
-            return Err("a message of audio may hold a second at most");
-        }
-        let began = *self.began.get_or_insert(now);
-        let since = now.saturating_duration_since(began);
-        let due =
-            u64::try_from(since.as_micros() * u128::from(a_second) / 1_000_000).unwrap_or(u64::MAX);
-        let have = self.position + (self.held.len() / 2) as u64 + arriving;
-        if due > have + a_second {
-            // The client stopped sending for a while. What it sends now
-            // was heard now, and not when the count of samples says.
-            self.held.clear();
-            self.position = due.saturating_sub(arriving);
-        }
-        self.held.extend_from_slice(samples);
-        Ok(())
-    }
-
-    /// The next packet that is full: its number, the place of its first
-    /// sample, and its samples.
-    fn next(&mut self) -> Option<(u16, u32, Bytes)> {
-        let packet = self.packet();
-        if self.held.len() < packet {
-            return None;
-        }
-        let samples = self.held.split_to(packet).freeze();
-        let sequence = self.sequence;
-        // Both wrap round, as the port has them.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the place in a stream wraps round"
-        )]
-        let timestamp = self.position as u32;
-        self.sequence = self.sequence.wrapping_add(1);
-        self.position += (packet / 2) as u64;
-        Some((sequence, timestamp, samples))
-    }
-}
-
 /// How a connection came to its end.
 enum End {
     /// The session said goodbye.
@@ -615,15 +480,14 @@ impl Far {
         let run = self.runs.of(tag);
         run.sent = run.sent.saturating_add(length);
         let run = run.number;
-        if self.runs.open != Some(run) {
-            self.runs.open = Some(run);
+        if self.runs.begins(run) {
             self.say(&FromServer::Mark { run, end: false }).await?;
         }
         if !samples.is_empty() {
             self.conn.send_binary(samples).await?;
         }
         if last {
-            self.runs.open = None;
+            self.runs.ends(run);
             self.say(&FromServer::Mark { run, end: true }).await?;
         }
         Ok(())
@@ -634,9 +498,7 @@ impl Far {
         let Some(run) = self.runs.tagged(tag) else {
             return Ok(());
         };
-        if self.runs.open == Some(run.number) {
-            self.runs.open = None;
-        }
+        self.runs.ends(run.number);
         self.say(&FromServer::Clear { run: run.number }).await
     }
 
@@ -653,7 +515,12 @@ impl Far {
                 if let Err(why) = self.inbound.take(&samples, Instant::now()) {
                     return Some(End::Broke(why));
                 }
-                while let Some((sequence, timestamp, payload)) = self.inbound.next() {
+                while let Some(packet) = self.inbound.next_packet() {
+                    let Packet {
+                        sequence,
+                        timestamp,
+                        payload,
+                    } = packet;
                     let audio = TransportEvent::Audio {
                         who,
                         sequence,
@@ -689,109 +556,5 @@ impl Far {
             Ok(FromClient::Hello { .. }) => Some(End::Broke("hello is said once")),
             Err(_) => Some(End::Broke("that is not a message of the protocol")),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use core::time::Duration;
-
-    use tokio::time::Instant;
-    use waveport_domain::ids::{Epoch, GenId, OpTag};
-    use waveport_ports::audio::Rate;
-
-    use super::{Inbound, MOST_RUNS, Runs};
-
-    fn tag(generation: u32) -> OpTag {
-        OpTag {
-            generation: GenId(generation),
-            epoch: Epoch(1),
-        }
-    }
-
-    #[test]
-    fn audio_is_cut_into_packets_whatever_the_pieces_it_arrives_in() {
-        let mut inbound = Inbound::new(Rate::Hz16000);
-        let now = Instant::now();
-        // 20 ms at 16 kHz is 320 samples, 640 bytes.
-        let piece: Vec<u8> = (0..500_u16).flat_map(u16::to_le_bytes).collect();
-        inbound.take(&piece, now).unwrap();
-        let (sequence, timestamp, first) = inbound.next().unwrap();
-        assert_eq!((sequence, timestamp, first.len()), (0, 0, 640));
-        assert_eq!(first[..4], [0, 0, 1, 0]);
-        assert!(inbound.next().is_none());
-        inbound.take(&piece, now).unwrap();
-        let (sequence, timestamp, second) = inbound.next().unwrap();
-        assert_eq!((sequence, timestamp, second.len()), (1, 320, 640));
-        // It goes on where the first packet ended: sample 320 of the
-        // first piece.
-        assert_eq!(second[..2], 320_u16.to_le_bytes());
-        let (sequence, timestamp, _) = inbound.next().unwrap();
-        assert_eq!((sequence, timestamp), (2, 640));
-        assert!(inbound.next().is_none());
-    }
-
-    #[test]
-    fn audio_that_is_not_whole_samples_or_is_too_long_is_refused() {
-        let mut inbound = Inbound::new(Rate::Hz8000);
-        let now = Instant::now();
-        assert!(inbound.take(&[0; 3], now).is_err());
-        assert!(inbound.take(&[0; 16_002], now).is_err());
-        // A second is taken.
-        inbound.take(&[0; 16_000], now).unwrap();
-        // Nothing is nothing.
-        inbound.take(&[], now).unwrap();
-    }
-
-    #[test]
-    fn a_client_that_paused_is_heard_when_it_speaks_again() {
-        let mut inbound = Inbound::new(Rate::Hz8000);
-        let start = Instant::now();
-        // 20 ms at 8 kHz is 160 samples, 320 bytes. Half a second
-        // arrives, and a part of a packet with it.
-        inbound.take(&[0; 8_100], start).unwrap();
-        let mut last = None;
-        while let Some(packet) = inbound.next() {
-            last = Some(packet);
-        }
-        let (sequence, timestamp, _) = last.unwrap();
-        assert_eq!((sequence, timestamp), (24, 24 * 160));
-
-        // Nothing for five seconds, and then a packet: it is placed at
-        // now, five seconds on, and the part that was held is let go.
-        let later = start + Duration::from_secs(5);
-        inbound.take(&[0; 320], later).unwrap();
-        let (sequence, timestamp, _) = inbound.next().unwrap();
-        assert_eq!((sequence, timestamp), (25, 5 * 8_000 - 160));
-
-        // A client that is a little late is not taken to have paused.
-        let mut inbound = Inbound::new(Rate::Hz8000);
-        inbound.take(&[0; 320], start).unwrap();
-        inbound
-            .take(&[0; 320], start + Duration::from_millis(900))
-            .unwrap();
-        assert_eq!(inbound.next().unwrap().1, 0);
-        assert_eq!(inbound.next().unwrap().1, 160);
-    }
-
-    #[test]
-    fn responses_are_numbered_as_they_come_and_the_oldest_are_forgotten() {
-        let mut runs = Runs::default();
-        assert_eq!(runs.of(tag(7)).number, 0);
-        runs.of(tag(7)).sent = 960;
-        assert_eq!(runs.of(tag(9)).number, 1);
-        // A response that is known keeps its number, and what was sent.
-        assert_eq!(runs.of(tag(7)).number, 0);
-        assert_eq!(runs.numbered(0).unwrap().sent, 960);
-        assert_eq!(runs.tagged(tag(9)).unwrap().number, 1);
-        assert!(runs.numbered(2).is_none());
-        assert!(runs.tagged(tag(8)).is_none());
-
-        for (_, generation) in (0..MOST_RUNS).zip(100_u32..) {
-            let _ = runs.of(tag(generation));
-        }
-        assert!(runs.tagged(tag(7)).is_none());
-        assert!(runs.numbered(0).is_none());
-        assert_eq!(runs.known.len(), MOST_RUNS);
     }
 }

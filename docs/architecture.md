@@ -463,9 +463,10 @@ pub trait RtTx: Send {
 |---|---|
 | Stream helper | Both halves of a stream port from one `async` block (section 8.1) |
 | WebSocket client | Connects with a time limit, sends and receives text and binary messages, and turns a close code into a retry class |
-| WebSocket server side | Takes a connection that was made to this machine: one path, one protocol that the client has to offer, messages of a megabyte at most, a time limit for the request |
+| WebSocket server side | Takes a connection that was made to this machine: one path, one protocol that the client has to offer if the protocol has a name (a carrier's media stream names none), messages of a megabyte at most, a time limit for the request. It also takes a connection whose request an HTTP server read and answered, as the daemon does on its one port: the kit gives the answer to the client's key, and reads the connection from there under the same limits |
+| Audio over messages | What the transports share that carry audio over such a connection: the responses a far end was sent, under the numbers it knows them by and with how much of each was sent, and its audio cut into packets of 20 ms whatever the pieces it arrives in, for samples of 16 bits and for G.711 |
 | Kept connections | A connection whose work is done is kept for the work that comes next, since making one takes three trips to a provider and back. One that turns out to be gone before the provider was heard on it is replaced, and the new one is told what the old one was |
-| HTTP client | A POST whose answer is read a piece at a time; a status that is not a success becomes an error with its retry class and the provider's `Retry-After` |
+| HTTP client | A POST or a GET whose answer is read a piece at a time, or whole when it is short; a status that is not a success becomes an error with its retry class and the provider's `Retry-After`. Who asks is said as a bearer token, as a name and its key (`Basic`), or in a header of the provider's own, and in each shape the key is in a header that is not shown and is struck out of what the server says back. A body is JSON, or a form |
 | Server-sent events | A parser that is given bytes as they arrive, with a limit on the length of an event |
 | Secrets | A key type that prints as `Secret(…)` and is struck out of any text that may be shown |
 | Retry | The class of an HTTP status or a close code, and a backoff with jitter |
