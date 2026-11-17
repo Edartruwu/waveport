@@ -18,7 +18,7 @@ use core::fmt;
 use crate::audio::{Codec, Rate};
 use crate::llm::LlmCaps;
 use crate::stt::{SttCaps, SttFinalize, SttTiming};
-use crate::transport::TransportCaps;
+use crate::transport::{KeysOut, TransportCaps};
 use crate::tts::{Alignment, TtsCaps, TtsInput};
 
 /// The rate of the audio the listening models take, and so the rate a
@@ -179,6 +179,11 @@ pub struct SpeakPlan {
     pub marks: Marks,
     /// How the synthesiser wants its text.
     pub input: TtsInput,
+    /// How a key that the session presses reaches the far end: by the
+    /// transport, or as a tone the session adds to the audio it sends
+    /// where the transport has no other way. `None` where none can be
+    /// pressed.
+    pub keys: Option<KeysOut>,
 }
 
 /// How the marks of a speech synthesiser are read.
@@ -289,6 +294,7 @@ pub fn plan(
     if agent.tools > 0 && !think.tools {
         return Err(PlanError::NoTools);
     }
+    let keys = transport.and_then(|transport| transport.keys);
     let Some(transport) = transport.and_then(|transport| transport.audio) else {
         return Err(PlanError::NoAudio);
     };
@@ -331,6 +337,7 @@ pub fn plan(
         wire: transport.outbound,
         marks,
         input: speak.input,
+        keys,
     };
 
     // Playback.
@@ -379,7 +386,7 @@ mod tests {
     use crate::audio::{Codec, Law, Rate, RateSet};
     use crate::llm::LlmCaps;
     use crate::stt::{SttCaps, SttFinalize, SttTiming};
-    use crate::transport::{AudioCaps, RemoteBuffer, TransportCaps};
+    use crate::transport::{AudioCaps, KeysOut, RemoteBuffer, TransportCaps};
     use crate::tts::{Alignment, TtsCaps, TtsInput};
 
     /// A recogniser with nothing to wish for.
@@ -403,6 +410,7 @@ mod tests {
     const CARD: TransportCaps = TransportCaps {
         audio: Some(CARD_AUDIO),
         text: false,
+        keys: None,
     };
     const CARD_AUDIO: AudioCaps = AudioCaps {
         inbound: Codec::Pcm(Rate::Hz48000),
@@ -424,6 +432,7 @@ mod tests {
             },
         }),
         text: false,
+        keys: Some(KeysOut::Tones),
     };
 
     fn brain(hear: SttCaps, think: LlmCaps, speak: TtsCaps) -> BrainProfile {
@@ -450,6 +459,28 @@ mod tests {
         assert_eq!(plan.speak.marks, Marks::Timed);
         assert_eq!(plan.speak.input, TtsInput::Incremental);
         assert!(plan.playback.far_end_reports && plan.playback.clear_on_stop);
+    }
+
+    #[test]
+    fn keys_leave_as_the_transport_has_them_leave() {
+        let agent = AgentNeeds::default();
+        let parts = brain(HEAR, THINK, SPEAK);
+        // A sound card has no keys, and that is nothing to wish for.
+        let card = cascade(agent, &parts, CARD);
+        assert_eq!(card.speak.keys, None);
+        assert_eq!(card.shortfalls, []);
+        // A line that can only be told in its audio is given tones, at
+        // the rate the session speaks at.
+        let line = cascade(agent, &parts, LINE);
+        assert_eq!(line.speak.keys, Some(KeysOut::Tones));
+        assert_eq!(line.speak.rate, Rate::Hz8000);
+        // One that presses keys itself is asked to.
+        let pressing = TransportCaps {
+            keys: Some(KeysOut::OutOfBand),
+            ..LINE
+        };
+        let plan = cascade(agent, &parts, pressing);
+        assert_eq!(plan.speak.keys, Some(KeysOut::OutOfBand));
     }
 
     #[test]
@@ -591,6 +622,7 @@ mod tests {
         let written = TransportCaps {
             audio: None,
             text: true,
+            keys: None,
         };
         assert_eq!(plan(&agent, &text, Some(&written)), nothing_amiss);
 
@@ -662,6 +694,7 @@ mod tests {
         let written = TransportCaps {
             audio: None,
             text: true,
+            keys: None,
         };
         assert_eq!(
             plan(&agent, &brain(HEAR, THINK, SPEAK), None),

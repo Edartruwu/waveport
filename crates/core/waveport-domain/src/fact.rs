@@ -63,6 +63,18 @@ pub enum Fact {
         /// Whether it was meant for the agent, and so is owed a reply.
         addressed: bool,
     },
+    /// Keys of a telephone that a user pressed one after the other entered
+    /// the conversation. They are owed a reply, as a turn meant for the
+    /// agent is.
+    KeysCommitted {
+        /// The turn.
+        turn: TurnId,
+        /// Who pressed them.
+        who: ParticipantId,
+        /// The keys as they are written, in the order they were pressed:
+        /// digits, `*`, `#` and `A` to `D`.
+        keys: TextRef,
+    },
     /// A user turn ended without entering the conversation.
     TurnDismissed {
         /// The turn.
@@ -165,6 +177,7 @@ impl Fact {
     pub const fn text(&self) -> Option<TextRef> {
         match self {
             Self::TurnCommitted { text, .. }
+            | Self::KeysCommitted { keys: text, .. }
             | Self::NoticeAppended { text, .. }
             | Self::UtteranceCommitted { text, .. } => Some(*text),
             Self::UtteranceProgress { heard, .. } => Some(*heard),
@@ -182,6 +195,7 @@ impl Fact {
     pub const fn with_text(mut self, text: TextRef) -> Self {
         match &mut self {
             Self::TurnCommitted { text: at, .. }
+            | Self::KeysCommitted { keys: at, .. }
             | Self::NoticeAppended { text: at, .. }
             | Self::UtteranceCommitted { text: at, .. }
             | Self::UtteranceProgress { heard: at, .. }

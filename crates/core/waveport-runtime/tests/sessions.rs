@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 use waveport_domain::command::{Activity, ClientEvent, Command};
 use waveport_domain::config::{AgentSpec, Effect, KernelConfig, ToolSpec};
-use waveport_domain::event::Event;
+use waveport_domain::event::{Event, Key};
 use waveport_domain::fact::{Lifecycle, Stamped};
 use waveport_domain::ids::{GenId, ParticipantId, Seq, ToolId, TurnId};
 use waveport_domain::kernel::{ItemView, View};
@@ -26,6 +26,9 @@ use waveport_domain::out::Out;
 use waveport_domain::policy::DefaultPolicies;
 use waveport_domain::text::TextArena;
 use waveport_domain::time::{MediaDur, MonoTime};
+use waveport_media::codec::opus::OpusSettings;
+use waveport_media::codec::{Decoder, Encoder};
+use waveport_media::dtmf::Dialer;
 use waveport_ports::audio::{Codec, Law, PcmBytes, Rate};
 use waveport_ports::error::PortError;
 use waveport_ports::journal::{Batch, Journal, SessionId, Snapshot};
@@ -33,7 +36,7 @@ use waveport_ports::plan::{CascadePlan, Marks, PlanError, SessionPlan, Shortfall
 use waveport_ports::stt::{SttFinalize, SttTiming};
 use waveport_ports::telemetry::{EventSink, Stage, StageMark};
 use waveport_ports::tool::ToolReply;
-use waveport_ports::transport::{AudioCaps, RemoteBuffer, TransportCaps};
+use waveport_ports::transport::{AudioCaps, KeysOut, RemoteBuffer, TransportCaps};
 use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::compute::Compute;
 use waveport_runtime::context::ToolDef;
@@ -250,6 +253,10 @@ fn said(item: ItemView<'_>) -> Said {
         ItemView::UserTurn { who, text, .. } => Said::User {
             speaker: Some(who),
             text: text.to_owned(),
+        },
+        ItemView::Keys { who, keys, .. } => Said::User {
+            speaker: Some(who),
+            text: waveport_runtime::context::keys_as_text(keys),
         },
         ItemView::Utterance { text, .. } => Said::Assistant {
             text: text.to_owned(),
@@ -681,6 +688,7 @@ async fn parts_that_can_do_less_still_hold_a_conversation() {
             remote_buffer: RemoteBuffer::default(),
         }),
         text: false,
+        keys: None,
     };
     let story = "Of course. Once upon a time there was a ship. It sailed all the seas of \
                  the world and never came home.";
@@ -949,6 +957,405 @@ async fn an_application_makes_the_agent_speak_stop_and_leave() {
             .iter()
             .any(|(_, told)| matches!(told, ClientEvent::Lifecycle(Lifecycle::Closed)))
     );
+}
+
+/// A telephone line that is told of keys in its audio alone.
+fn telephone() -> TransportCaps {
+    TransportCaps {
+        audio: Some(AudioCaps {
+            inbound: Codec::G711(Law::Mu),
+            outbound: Codec::G711(Law::Mu),
+            remote_buffer: RemoteBuffer::default(),
+        }),
+        text: false,
+        keys: Some(KeysOut::Tones),
+    }
+}
+
+fn keys(written: &str) -> Vec<Key> {
+    written
+        .chars()
+        .map(|key| Key::from_char(key).unwrap())
+        .collect()
+}
+
+/// What pressing `written` sounds like on a telephone line, a frame of
+/// 20 ms each, as the line carries it for a session that speaks at
+/// `rate`.
+fn tones_of(written: &str, rate: Rate) -> Vec<Vec<u8>> {
+    let mut dialer = Dialer::new(rate);
+    for key in keys(written) {
+        assert!(dialer.press(key));
+    }
+    let codec = Codec::G711(Law::Mu);
+    let mut encoder = Encoder::new(codec, rate, OpusSettings::default()).unwrap();
+    let mut frames = Vec::new();
+    while !dialer.is_idle() {
+        let mut frame = vec![0_i16; rate.frame()];
+        dialer.mix(&mut frame);
+        let mut packet = vec![0; codec.max_packet()];
+        let len = encoder.encode(&frame, &mut packet).unwrap();
+        packet.truncate(len);
+        frames.push(packet);
+    }
+    frames
+}
+
+/// The audio in a packet of a telephone line.
+fn heard(payload: &[u8]) -> Vec<i16> {
+    let mut decoder = Decoder::new(Codec::G711(Law::Mu), Rate::Hz8000).unwrap();
+    let mut audio = vec![0_i16; 160];
+    let n = decoder.decode(payload, &mut audio).unwrap();
+    audio.truncate(n);
+    audio
+}
+
+/// How loud the sine wave of `hz` is in telephone audio.
+fn sounding(audio: &[i16], hz: u32) -> f64 {
+    let turn = core::f64::consts::TAU * f64::from(hz) / 8_000.0;
+    let (mut sin, mut cos) = (0.0, 0.0);
+    for (n, &sample) in (0_u32..).zip(audio) {
+        let at = turn * f64::from(n);
+        sin += f64::from(sample) * at.sin();
+        cos += f64::from(sample) * at.cos();
+    }
+    2.0 * sin.hypot(cos) / f64::from(u32::try_from(audio.len()).unwrap())
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_a_caller_presses_are_a_turn_that_is_answered() {
+    let answer = "Thank you. One moment please.";
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say(answer)]]);
+    let world = World::new(&[], llm);
+    // Four digits and the hash that ends them, one key every 200 ms.
+    let transport = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 8_000, &[])
+        .keys(1_000, CALLER, "4071#");
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(8_000).await, None);
+
+    // The model was asked once, when the hash was pressed, and was shown
+    // the keys as text of the caller's that says what it is.
+    let asked = world.llm.asked();
+    assert_eq!(asked.len(), 1);
+    let shown = "(pressed on the telephone's keys: 4071)";
+    assert_eq!(asked[0].last_user(), Some(shown));
+    assert_eq!(
+        running.conversation(),
+        [
+            Said::User {
+                speaker: Some(CALLER),
+                text: shown.to_owned()
+            },
+            Said::Assistant {
+                text: answer.to_owned()
+            },
+        ]
+    );
+    // The answer began when the run was over, and not when its time ran
+    // out three seconds later.
+    let log = running.far_end.log();
+    let began = ms(&log.frames[0]);
+    assert!((1_800..2_300).contains(&began), "{began} ms");
+    assert_eq!(running.watch.first("Keys(TurnId(1)), Some"), Some(1_000));
+
+    // The journal holds the keys as keys, in a record of the version
+    // that has them, among records of the version before.
+    let records = world.journal.records(SESSION);
+    assert_eq!(
+        kinds(&records),
+        [
+            "participant_joined",
+            "keys_committed",
+            "utterance_progress",
+            "utterance_committed"
+        ]
+    );
+    let stored: Vec<String> = records
+        .iter()
+        .map(|record| String::from_utf8_lossy(record).into_owned())
+        .collect();
+    assert_eq!(
+        stored[1],
+        r#"{"v":2,"seq":2,"fact":{"kind":"keys_committed","turn":1,"who":1,"keys":"4071"}}"#
+    );
+    assert!(stored[0].starts_with(r#"{"v":1,"#) && stored[3].starts_with(r#"{"v":1,"#));
+    assert_eq!(
+        running.session.stats(),
+        waveport_runtime::session::SessionStats::default()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_key_stops_what_the_agent_is_saying() {
+    let speech = [(1_000, 2_200, "tell me a story")];
+    let llm = ScriptedLlm::replies(vec![
+        vec![LlmStep::say(STORY)],
+        vec![LlmStep::say("Putting you through.")],
+    ]);
+    let world = World::new(&speech, llm);
+    // The caller presses the zero in the middle of the story, and
+    // nothing after it.
+    let transport = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 12_000, &talks(&speech))
+        .keys(4_000, CALLER, "0");
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(12_000).await, None);
+
+    // The story stopped at the key, at once: nobody judged whether a key
+    // was meant.
+    let log = running.far_end.log();
+    let story = log.frames[0].tag;
+    assert_eq!(log.cleared.len(), 1);
+    let (stopped, cleared) = log.cleared[0];
+    assert_eq!(cleared, story);
+    assert!(
+        (4_000..4_030).contains(&u64::try_from(stopped.as_millis()).unwrap()),
+        "{stopped:?}"
+    );
+    let utterances = running.utterances();
+    assert_eq!(utterances.len(), 2, "{utterances:?}");
+    assert!(utterances[0].1, "the story was cut off");
+    assert!(STORY.starts_with(&utterances[0].0));
+    // No key followed for three seconds, so the zero is the run, and it
+    // is answered then.
+    let asked = world.llm.asked();
+    assert_eq!(asked.len(), 2);
+    assert_eq!(
+        asked[1].last_user(),
+        Some("(pressed on the telephone's keys: 0)")
+    );
+    let answer = log.frames.iter().find(|frame| frame.tag != story).unwrap();
+    assert!((7_000..7_500).contains(&ms(answer)), "{} ms", ms(answer));
+    assert_eq!(utterances[1], ("Putting you through.".to_owned(), false));
+    assert_eq!(
+        kinds(&world.journal.records(SESSION)),
+        [
+            "participant_joined",
+            "turn_committed",
+            "utterance_progress",
+            "utterance_committed",
+            "epoch_advanced",
+            "keys_committed",
+            "utterance_progress",
+            "utterance_committed",
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_the_application_presses_leave_as_the_line_takes_them() {
+    let press = |written: &str| -> Request {
+        SessionInput::Press {
+            keys: keys(written),
+        }
+        .into()
+    };
+
+    // A line that presses keys itself is asked to, for each in its turn.
+    let world = World::new(&[], ScriptedLlm::replies(vec![]));
+    let transport = FakeTransport::sound_card()
+        .pressing(KeysOut::OutOfBand)
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 4_000, &[]);
+    let mut running = Running::start(&world, transport).await;
+    let (ask, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+    assert_eq!(running.until(1_000).await, None);
+    ask.try_send(press("12#")).unwrap();
+    assert_eq!(running.until(4_000).await, None);
+    let log = running.far_end.log();
+    let pressed: Vec<Key> = log.pressed.iter().map(|(_, key)| *key).collect();
+    assert_eq!(pressed, keys("12#"));
+    assert!(
+        log.pressed
+            .iter()
+            .all(|(when, _)| when.as_millis() == 1_000)
+    );
+    assert_eq!((log.tones.len(), log.frames.len()), (0, 0));
+    assert_eq!(running.session.stats().speaking.keys_unpressed, 0);
+    // The conversation does not hold them, and nobody is asked anything.
+    assert_eq!(running.conversation(), []);
+    assert_eq!(world.llm.asked(), []);
+
+    // A telephone line is told in its audio: the tone of each key and
+    // the pause after it, in frames of their own at the pace they are
+    // heard, and exactly the tones that key has.
+    let world = World::new(&[], ScriptedLlm::replies(vec![]));
+    let transport =
+        FakeTransport::with(telephone())
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 4_000, &[]);
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(cascade(&running.session).speak.keys, Some(KeysOut::Tones));
+    let (ask, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+    assert_eq!(running.until(1_000).await, None);
+    ask.try_send(press("12#")).unwrap();
+    assert_eq!(running.until(4_000).await, None);
+    let log = running.far_end.log();
+    let wanted = tones_of("12#", cascade(&running.session).speak.rate);
+    assert_eq!(wanted.len(), 30, "three keys of 200 ms");
+    assert_eq!(log.tones.len(), wanted.len());
+    for (n, (sent, wanted)) in log.tones.iter().zip(&wanted).enumerate() {
+        assert_eq!(&sent.payload[..], &wanted[..], "frame {n}");
+        assert_eq!(sent.length, MediaDur::from_millis(20), "frame {n}");
+        let due = 1_000 + 20 * u128::try_from(n).unwrap();
+        assert_eq!(sent.when.as_millis(), due, "frame {n}");
+    }
+    // And they are what a telephone exchange listens for: the row and
+    // the column of each key in its 100 ms, and nothing in its pause.
+    let line: Vec<i16> = log
+        .tones
+        .iter()
+        .flat_map(|tone| heard(&tone.payload))
+        .collect();
+    assert_eq!(line.len(), 3 * 1_600);
+    for (key, (row, column)) in [(697, 1_209), (697, 1_336), (941, 1_477)]
+        .iter()
+        .enumerate()
+    {
+        let from = key * 1_600;
+        // The line changes the rate on the way, which takes a moment.
+        let tone = &line[from + 80..from + 800];
+        assert!(sounding(tone, *row) > 7_000.0, "key {key}");
+        assert!(sounding(tone, *column) > 8_000.0, "key {key}");
+        for other in [770, 852, 1_633] {
+            assert!(sounding(tone, other) < 800.0, "key {key}: {other} Hz");
+        }
+        let pause = &line[from + 900..from + 1_600];
+        assert!(pause.iter().all(|sample| sample.abs() < 100), "key {key}");
+    }
+    assert_eq!((log.pressed.len(), log.frames.len()), (0, 0));
+    assert_eq!(running.session.stats().speaking.keys_unpressed, 0);
+
+    // A sound card has no keys: none is pressed, and the session says how
+    // many were not.
+    let world = World::new(&[], ScriptedLlm::replies(vec![]));
+    let transport = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 4_000, &[]);
+    let mut running = Running::start(&world, transport).await;
+    let (ask, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+    assert_eq!(running.until(1_000).await, None);
+    ask.try_send(press("12#")).unwrap();
+    assert_eq!(running.until(4_000).await, None);
+    let log = running.far_end.log();
+    assert_eq!((log.pressed.len(), log.tones.len()), (0, 0));
+    assert_eq!(running.session.stats().speaking.keys_unpressed, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_key_pressed_while_the_agent_speaks_sounds_over_it() {
+    let world = World::new(&[], ScriptedLlm::replies(vec![]));
+    let transport =
+        FakeTransport::with(telephone())
+            .join(0, CALLER)
+            .microphone(CALLER, 0, 8_000, &[]);
+    let mut running = Running::start(&world, transport).await;
+    let (ask, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+    // Forty characters: 2.4 s of speech from the scripted synthesiser.
+    let text = "Please hold while I look for your order.".to_owned();
+    ask.try_send(SessionInput::Say { text }.into()).unwrap();
+    assert_eq!(running.until(1_000).await, None);
+    // The five, in the middle of it, and the nine with two frames of it
+    // left to go out.
+    ask.try_send(SessionInput::Press { keys: keys("5") }.into())
+        .unwrap();
+    assert_eq!(running.until(2_440).await, None);
+    ask.try_send(SessionInput::Press { keys: keys("9") }.into())
+        .unwrap();
+    assert_eq!(running.until(8_000).await, None);
+
+    let log = running.far_end.log();
+    // The speech went out from 102 ms on, a frame every 20 ms after the
+    // two it began with, and nothing of it was held back for a key.
+    assert_eq!(log.frames.len(), 120);
+    assert_eq!((ms(&log.frames[0]), ms(&log.frames[119])), (102, 2_462));
+    let during = |from: u64, to: u64| -> Vec<i16> {
+        log.frames
+            .iter()
+            .filter(|frame| (from..to).contains(&ms(frame)))
+            .flat_map(|frame| heard(&frame.payload))
+            .collect()
+    };
+    // The five is in the frames of what is being said, and in no frame
+    // of its own.
+    let with_key = during(1_000, 1_100);
+    let before = during(800, 900);
+    assert_eq!((with_key.len(), before.len()), (800, 800));
+    for hz in [770, 1_336] {
+        assert!(sounding(&with_key, hz) > 7_000.0, "{hz} Hz with the key");
+        assert!(sounding(&before, hz) < 1_000.0, "{hz} Hz before it");
+    }
+    // The nine begins over the last two frames of the speech and goes on
+    // by itself, a frame every 20 ms from where the speech left off:
+    // three more of its tone, and the five of its pause.
+    let alone: Vec<u128> = log.tones.iter().map(|tone| tone.when.as_millis()).collect();
+    assert_eq!(
+        alone,
+        [2_482, 2_502, 2_522, 2_542, 2_562, 2_582, 2_602, 2_622]
+    );
+    let nine: Vec<i16> = during(2_440, 2_500)
+        .into_iter()
+        .chain(log.tones.iter().flat_map(|tone| heard(&tone.payload)))
+        .collect();
+    assert_eq!(nine.len(), 1_600);
+    for hz in [852, 1_477] {
+        assert!(sounding(&nine[..800], hz) > 7_000.0, "{hz} Hz of the nine");
+    }
+    // The line changes the rate on the way, which rings for a moment.
+    assert!(
+        nine[900..].iter().all(|sample| sample.abs() < 100),
+        "its pause"
+    );
+    assert_eq!(running.session.stats().speaking.keys_unpressed, 0);
+    // All of what was said was heard as said: the keys took nothing.
+    assert_eq!(
+        running.utterances(),
+        [("Please hold while I look for your order.".to_owned(), false)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_are_not_pressed_into_a_line_that_is_gone() {
+    let world = World::new(&[], ScriptedLlm::replies(vec![]));
+    let transport = FakeTransport::with(telephone())
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 6_000, &[])
+        .line_drops(1_100)
+        .line_returns(3_000);
+    let mut running = Running::start(&world, transport).await;
+    let (ask, inbox) = tokio::sync::mpsc::channel(8);
+    running.session.listen_to(inbox);
+    assert_eq!(running.until(1_000).await, None);
+    // Five keys take a second. The line drops after the first 100 ms.
+    ask.try_send(
+        SessionInput::Press {
+            keys: keys("12345"),
+        }
+        .into(),
+    )
+    .unwrap();
+    assert_eq!(running.until(2_000).await, None);
+    // And keys asked for while it is gone are not kept for its return.
+    ask.try_send(SessionInput::Press { keys: keys("67") }.into())
+        .unwrap();
+    assert_eq!(running.until(6_000).await, None);
+
+    let log = running.far_end.log();
+    assert_eq!(log.drops, 1);
+    // The tone of the one, and nothing after the line dropped.
+    assert_eq!(log.tones.len(), 5, "{:?}", log.tones.len());
+    assert!(log.tones.iter().all(|tone| tone.when.as_millis() < 1_100));
+    assert_eq!(log.unheard, 0);
+    // Six of the seven keys were not pressed: the two to five that were
+    // waiting, and the two asked for into the gap.
+    assert_eq!(running.session.stats().speaking.keys_unpressed, 6);
 }
 
 /// The kind of each record, and for a change of lifecycle what to.
@@ -1873,6 +2280,7 @@ async fn a_session_that_hears_and_speaks_is_not_started_without_audio() {
     let written = TransportCaps {
         audio: None,
         text: true,
+        keys: None,
     };
     let (transport, _far_end) = FakeTransport::with(written).build();
     let error = refused(world.parts(transport)).await;

@@ -1,4 +1,4 @@
-//! The six stories of the kernel's scenarios, told to the whole session.
+//! The stories of the kernel's scenarios, told to the whole session.
 //!
 //! Each is one conversation. A seed decides what the story leaves open:
 //! how late each part answers, how the line treats the audio, how long
@@ -272,6 +272,190 @@ fn a_line_that_drops_and_comes_back_costs_the_caller_nothing() {
     // In the story more often than not.
     assert!(tally.cut >= tally.runs / 3, "{tally:?}");
     assert_eq!(tally.abandoned, 0, "{tally:?}");
+}
+
+const ENTER: &str = "Please enter your account number.";
+const BALANCE: &str = "Thank you. Your balance is forty dollars.";
+/// What a model is shown of the four keys.
+const PRESSED: &str = "(pressed on the telephone's keys: 4071)";
+/// How long a session of these stories waits for the next key.
+const KEY_WAIT_MS: u64 = 3_000;
+
+/// When the frames of what was said went out, in milliseconds.
+fn frames_sent(outcome: &Outcome) -> Vec<u64> {
+    let wire = &outcome.lives[0].wire;
+    wire.frames
+        .iter()
+        .map(|frame| u64::try_from(frame.when.as_millis()).unwrap())
+        .collect()
+}
+
+/// Scenario 15: the keys of a telephone are one turn, and are keys.
+fn keys_are_one_turn(seed: u64) -> Plan {
+    let mut rng = SimRng::new(Seed(seed)).fork("keys are one turn");
+    let mut plan = Plan::new(seed, spec(&[]));
+    weather(&mut plan, &mut rng);
+    quick(&mut plan, &mut rng);
+    plan.llm = Arc::new(|asked| match asked.last_user() {
+        Some("what is my balance") => vec![LlmStep::say(ENTER)],
+        Some(PRESSED) => vec![LlmStep::say(BALANCE)],
+        _ => vec![LlmStep::say("Sorry?")],
+    });
+    let asked = plan.says(0, 1_000, 300, "what is my balance");
+    // The caller presses while the agent asks for the number or after
+    // it has, and ends the four digits with the hash or just stops.
+    let from = asked + rng.range(2_000..6_000);
+    let keys = if rng.chance(1, 2) { "4071#" } else { "4071" };
+    let pressed = plan.presses(0, from, keys);
+    plan.until_ms = pressed + 40_000;
+    plan
+}
+
+fn keys_are_one_turn_ends(plan: &Plan, outcome: &Outcome) -> Result<(), String> {
+    let turns: Vec<&str> = outcome.turns().iter().map(|(_, text, _)| *text).collect();
+    if turns != ["what is my balance"] {
+        return Err(format!("the turns are {turns:?}"));
+    }
+    // One turn of keys, without the hash, whichever way it ended.
+    let keys = outcome.keys();
+    if keys != [(ParticipantId(1), "4071")] {
+        return Err(format!("the keys are {keys:?}"));
+    }
+    // And one answer to it: not four.
+    if outcome.asked.len() != 2 {
+        return Err(format!("the model was asked {} times", outcome.asked.len()));
+    }
+    let utterances = outcome.utterances();
+    match utterances[..] {
+        // A key stops the agent, so what it was asking may be cut.
+        [(_, asked, cut), (_, answer, false)]
+            if answer == BALANCE && ENTER.starts_with(asked) && (cut || asked == ENTER) => {}
+        // Or was not begun.
+        [(_, answer, false)] if answer == BALANCE => {}
+        _ => return Err(format!("the agent said {utterances:?}")),
+    }
+    // Nothing was said while the caller pressed: not after the first
+    // key, but for the fade of what it cut off, and not before the run
+    // was over, which without the hash is when no key has followed.
+    let (first, _, pressed) = &plan.keys[0];
+    let last = first + 600;
+    let over = if pressed.ends_with('#') {
+        last + 200
+    } else {
+        last + KEY_WAIT_MS
+    };
+    let early: Vec<u64> = frames_sent(outcome)
+        .into_iter()
+        .filter(|when| (first + 60..over).contains(when))
+        .collect();
+    if !early.is_empty() {
+        return Err(format!(
+            "frames went out at {early:?}, and the keys were pressed from {first} and over at \
+             {over}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn keys_a_caller_presses_are_one_turn_and_are_answered_once() {
+    let Some(tally) = told(SEEDS, keys_are_one_turn, keys_are_one_turn_ends) else {
+        return;
+    };
+    assert_eq!(tally.keyed, tally.runs, "{tally:?}");
+    assert_eq!(tally.turns, tally.runs, "{tally:?}");
+    // In what the agent was saying, now and then.
+    assert!(tally.cut >= tally.runs / 8, "{tally:?}");
+}
+
+const WHICH: &str = "Sure. What is your account number?";
+const GO_AHEAD: &str = "Go ahead.";
+
+/// Scenario 16: words and keys keep their order, and the agent does not
+/// talk over keys.
+fn keys_after_speech(seed: u64) -> Plan {
+    let mut rng = SimRng::new(Seed(seed)).fork("keys after speech");
+    let mut plan = Plan::new(seed, spec(&[]));
+    weather(&mut plan, &mut rng);
+    quick(&mut plan, &mut rng);
+    plan.llm = Arc::new(|asked| match asked.last_user() {
+        Some("what is my balance") => vec![LlmStep::say(WHICH)],
+        Some("it is") => vec![LlmStep::say(GO_AHEAD)],
+        Some(PRESSED) => vec![LlmStep::say(BALANCE)],
+        _ => vec![LlmStep::say("Sorry?")],
+    });
+    let asked = plan.says(0, 1_000, 300, "what is my balance");
+    // The agent has asked. The caller says two words and presses in one
+    // breath, before the words are in or just after.
+    let said = plan.says(0, asked + rng.range(6_000..9_000), 300, "it is");
+    let pressed = plan.presses(0, said + rng.range(200..900), "4071#");
+    plan.until_ms = pressed + 40_000;
+    plan
+}
+
+fn keys_after_speech_ends(plan: &Plan, outcome: &Outcome) -> Result<(), String> {
+    let turns: Vec<&str> = outcome.turns().iter().map(|(_, text, _)| *text).collect();
+    if turns != ["what is my balance", "it is"] {
+        return Err(format!("the turns are {turns:?}"));
+    }
+    let keys = outcome.keys();
+    if keys != [(ParticipantId(1), "4071")] {
+        return Err(format!("the keys are {keys:?}"));
+    }
+    // The words came before the keys, and are before them.
+    let place = |wanted: fn(&Fact) -> bool| outcome.facts.iter().rposition(|at| wanted(&at.fact));
+    let said = place(|fact| matches!(fact, Fact::TurnCommitted { .. }));
+    let keyed = place(|fact| matches!(fact, Fact::KeysCommitted { .. }));
+    if said >= keyed {
+        return Err(format!(
+            "the words are fact {said:?} and the keys fact {keyed:?}"
+        ));
+    }
+    // The answer that is heard is to the keys, and whoever wrote it was
+    // shown the words and then the keys.
+    let utterances = outcome.utterances();
+    match utterances[..] {
+        [(_, which, false), (_, answer, false)] if which == WHICH && answer == BALANCE => {}
+        // A reply to the words may have begun before the first key.
+        [(_, which, false), (_, begun, true), (_, answer, false)]
+            if which == WHICH && GO_AHEAD.starts_with(begun) && answer == BALANCE => {}
+        _ => return Err(format!("the agent said {utterances:?}")),
+    }
+    let shown: Vec<&str> = outcome
+        .asked
+        .last()
+        .into_iter()
+        .flat_map(|asked| &asked.messages)
+        .filter_map(|said| match said {
+            Said::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    if shown != ["what is my balance", "it is", PRESSED] {
+        return Err(format!("the model was last shown {shown:?}"));
+    }
+    // Nothing is heard while keys are pressed.
+    let (first, _, _) = &plan.keys[0];
+    let over = first + 800;
+    let early: Vec<u64> = frames_sent(outcome)
+        .into_iter()
+        .filter(|when| (first + 60..over).contains(when))
+        .collect();
+    if !early.is_empty() {
+        return Err(format!(
+            "frames went out at {early:?}, and the keys were pressed from {first} to {over}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn words_and_keys_keep_their_order_and_the_agent_does_not_talk_over_keys() {
+    let Some(tally) = told(SEEDS, keys_after_speech, keys_after_speech_ends) else {
+        return;
+    };
+    assert_eq!(tally.keyed, tally.runs, "{tally:?}");
+    assert_eq!(tally.turns, 2 * tally.runs, "{tally:?}");
 }
 
 /// Scenario 14: a line that stays gone ends the session, and not before

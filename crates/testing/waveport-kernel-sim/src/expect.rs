@@ -39,8 +39,7 @@ enum Said {
         text: String,
         truncated: bool,
     },
-    /// Keys of a telephone. No item of a conversation is read as this yet:
-    /// the kernel has no turn of keys.
+    /// Keys of a telephone.
     Keys {
         who: ParticipantId,
         keys: String,
@@ -92,6 +91,10 @@ impl Line {
             ItemView::UserTurn { who, text, .. } => Said::User {
                 who,
                 text: text.to_owned(),
+            },
+            ItemView::Keys { who, keys, .. } => Said::Keys {
+                who,
+                keys: keys.to_owned(),
             },
             ItemView::Utterance {
                 text, truncated, ..
@@ -289,13 +292,29 @@ impl Sim {
     ///
     /// # Errors
     ///
-    /// No turn of keys by `who` is committed. The kernel has no turn of
-    /// keys yet, so for now this is every time.
+    /// No turn of keys by `who` is committed, or the next one has other
+    /// keys.
     #[track_caller]
     pub fn expect_keys(&mut self, who: Person, keys: &str) -> Result<Turn, Box<Failure>> {
         let name = self.world.names.person(who.0).to_owned();
         let expected = format!("a committed turn in which {name} presses {keys}");
-        let outcome = self.wait_for(|_| Probe::NotYet);
+        let outcome = self.wait_for(|sim| {
+            let found = sim.unclaimed(
+                |what| matches!(what, What::Fact(Fact::KeysCommitted { who: by, .. }) if *by == who.0),
+            );
+            match found.and_then(|index| sim.claim(index)) {
+                Some(Seen {
+                    what: What::Fact(Fact::KeysCommitted { turn, .. }),
+                    text: pressed,
+                    ..
+                }) if pressed == keys => Probe::Found(Turn(turn)),
+                Some(seen) => Probe::Wrong(format!(
+                    "the turn of keys that was committed for {name} is {}",
+                    seen.text
+                )),
+                None => Probe::NotYet,
+            }
+        });
         self.settle(expected, outcome)
     }
 
@@ -909,14 +928,40 @@ impl Sim {
         }
     }
 
-    /// The kernel has no turn of keys yet, so every run of keys is one
-    /// that came to nothing.
+    /// Every run of keys that somebody pressed is a turn of keys, and
+    /// there is no other.
     fn check_keys(&self, problems: &mut Vec<String>) {
-        for (who, runs) in self.world.pressings() {
-            problems.push(format!(
-                "{} pressed keys {runs} times, and no turn of keys was committed",
-                self.world.names.person(who)
-            ));
+        let mut people = self
+            .facts()
+            .filter_map(|(fact, _)| match *fact {
+                Fact::KeysCommitted { who, .. } => Some(who),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let pressings = self.world.pressings();
+        people.extend(pressings.iter().map(|(who, _)| *who));
+        people.sort_unstable();
+        people.dedup();
+        for who in people {
+            let runs = pressings
+                .iter()
+                .find(|(by, _)| *by == who)
+                .map_or(0, |(_, runs)| *runs);
+            let turns = self
+                .facts()
+                .filter(
+                    |(fact, _)| matches!(fact, Fact::KeysCommitted { who: by, .. } if *by == who),
+                )
+                .count();
+            // Once the adapters are silent, keys may never reach the
+            // session at all.
+            let lost = self.world.is_silent() && turns < runs;
+            if turns != runs && !lost {
+                problems.push(format!(
+                    "{} pressed keys {runs} times, and {turns} turns of keys were committed",
+                    self.world.names.person(who)
+                ));
+            }
         }
     }
 
@@ -1187,13 +1232,15 @@ mod tests {
     }
 
     #[test]
-    fn keys_have_no_turn_yet() {
+    fn keys_are_a_turn_of_their_own_kind() {
         let mut sim = live(Setup::new());
         let caller = sim.caller();
+        sim.agent_will(crate::say("Thank you."));
         sim.presses(caller, "4071#");
-        let failure = sim.expect_keys(caller, "4071").unwrap_err();
-        assert!(failure.expected.contains("presses 4071"), "{failure}");
-        assert!(failure.found.contains("never happened"), "{failure}");
+        // Other keys than were pressed are not what was expected.
+        let failure = sim.expect_keys(caller, "4072").unwrap_err();
+        assert!(failure.expected.contains("presses 4072"), "{failure}");
+        assert!(failure.found.contains("is 4071"), "{failure}");
         assert!(
             failure
                 .log
@@ -1201,14 +1248,32 @@ mod tests {
                 .any(|line| line.contains("the caller presses 4071#")),
             "{failure}"
         );
-        // And keys that came to nothing are held against the session.
-        let failure = sim.finish().unwrap_err();
-        assert!(
-            failure.found.contains("the caller pressed keys 1 times"),
-            "{failure}"
-        );
-        // A line of keys is like no item a conversation has.
+
+        let mut sim = live(Setup::new());
+        let caller = sim.caller();
+        sim.agent_will(crate::say("Thank you."));
+        sim.presses(caller, "4071#");
+        let keyed = sim.expect_keys(caller, "4071").unwrap();
+        let reply = sim.expect_reply(keyed).unwrap();
+        sim.expect_spoken(reply, "Thank you.", Ending::Complete)
+            .unwrap();
+        // Keys are in the conversation as keys, and not as words.
+        sim.expect_context(&[pressed(caller, "4071"), spoke("Thank you.")])
+            .unwrap();
+        let as_words = sim.expect_context(&[user(caller, "4071"), spoke("Thank you.")]);
+        assert!(as_words.is_err());
+        assert_eq!(sim.finish(), Ok(()));
         assert_ne!(pressed(caller, "4071"), user(caller, "4071"));
+    }
+
+    #[test]
+    fn keys_that_nothing_ends_are_a_turn_when_no_other_follows() {
+        let mut sim = live(Setup::new());
+        let caller = sim.caller();
+        sim.agent_will(crate::say("Thank you."));
+        sim.presses(caller, "40");
+        let keyed = sim.expect_keys(caller, "40").unwrap();
+        sim.expect_reply(keyed).unwrap();
     }
 
     #[test]

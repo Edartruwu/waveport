@@ -348,6 +348,8 @@ impl Transport for LocalAudio {
                 },
             }),
             text: false,
+            // A sound card has no keys to press.
+            keys: None,
         }
     }
 
@@ -462,7 +464,10 @@ impl Transport for LocalAudio {
     }
 
     fn try_control(&mut self, control: TransportControl) -> Result<(), Full> {
-        let TransportControl::Clear { tag } = control;
+        // It says that it presses no keys, and is not asked to.
+        let TransportControl::Clear { tag } = control else {
+            return Ok(());
+        };
         let Some(number) = self
             .runs
             .iter()

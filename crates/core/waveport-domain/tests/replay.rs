@@ -22,14 +22,16 @@ use waveport_kernel_sim::trace::{Trace, replay};
 /// The sessions that are kept: one with four tool calls and their
 /// continuation, one where the floor changes hands among adapters that
 /// misbehave, one where another agent answers a call, one that is closed
-/// with a call nobody can vouch for, and one in which the process dies
-/// twice.
-const KEPT: [(Profile, u64); 5] = [
+/// with a call nobody can vouch for, one in which the process dies
+/// twice, and one in which three people press keys as they speak and a
+/// run of keys ends with what was said after it.
+const KEPT: [(Profile, u64); 6] = [
     (Profile::Calm, 70),
     (Profile::Chaos, 0x1_0000_0123),
     (Profile::Shutdown, 0x4_0000_0002),
     (Profile::Shutdown, 0x4_0000_0059),
     (Profile::Crashes, 0x5_0000_0063),
+    (Profile::Keys, 0x7_0000_03bb),
 ];
 
 fn path(profile: Profile, seed: u64) -> PathBuf {

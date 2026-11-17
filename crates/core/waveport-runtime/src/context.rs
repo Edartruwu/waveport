@@ -21,6 +21,14 @@ use waveport_ports::llm::{Message, ToolDecl};
 /// What stands where the result of a call will be, while the call runs.
 pub const STILL_RUNNING: &str = "(This call has not finished yet.)";
 
+/// What a language model is shown of keys somebody pressed on their
+/// telephone: text of theirs that says it is keys, so that a model does
+/// not take a number that was pressed for one that was said.
+#[must_use]
+pub fn keys_as_text(keys: &str) -> String {
+    format!("(pressed on the telephone's keys: {keys})")
+}
+
 /// What an agent is, beyond what the kernel knows of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentDef {
@@ -70,6 +78,10 @@ impl Item {
             ItemView::UserTurn { who, text, .. } => Self::User {
                 speaker: Some(who),
                 text: text.to_owned(),
+            },
+            ItemView::Keys { who, keys, .. } => Self::User {
+                speaker: Some(who),
+                text: keys_as_text(keys),
             },
             ItemView::Utterance { text, .. } => Self::Assistant {
                 text: text.to_owned(),

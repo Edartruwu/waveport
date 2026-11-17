@@ -31,8 +31,8 @@ use waveport_domain::command::{
 };
 use waveport_domain::config::{AgentSpec, Effect, Executor, KernelConfig, ToolSpec};
 use waveport_domain::event::{
-    CloseReason, ControlInput, Event, Finish, OpEvent, OverlapVerdict, Part, RetryClass, TimerId,
-    ToolEvent, VadEdge,
+    CloseReason, ControlInput, Event, Finish, Key, OpEvent, OverlapVerdict, Part, RetryClass,
+    TimerId, ToolEvent, VadEdge,
 };
 use waveport_domain::fact::Lifecycle;
 use waveport_domain::ids::{AgentId, OpTag, ParticipantId, Prob, Seq, ToolCallId, ToolId, TurnId};
@@ -73,6 +73,9 @@ pub struct Scope {
     /// Times the line drops. Each time it comes back at any moment after,
     /// or never.
     pub drops: u8,
+    /// Keys the people press, in all. Each is a digit or the key that
+    /// ends a run, at any moment.
+    pub keys: u8,
     /// Times the process dies.
     pub crashes: u8,
     /// Language models that go on to report their end after they were
@@ -100,6 +103,7 @@ impl Scope {
             says: 0,
             closes: 1,
             drops: 0,
+            keys: 0,
             crashes: 0,
             late: 0,
             most_states: 2_000_000,
@@ -213,6 +217,7 @@ struct Left {
     says: u8,
     closes: u8,
     drops: u8,
+    keys: u8,
     crashes: u8,
     late: u8,
 }
@@ -296,6 +301,7 @@ impl World {
                 says: scope.says,
                 closes: scope.closes,
                 drops: scope.drops,
+                keys: scope.keys,
                 crashes: scope.crashes,
                 late: scope.late,
             },
@@ -415,6 +421,13 @@ impl World {
                 edge,
                 at: MediaTime::from_ticks(at),
             };
+            if self.left.keys > 0 {
+                // A digit, which begins a run or goes on with one, and
+                // the key that ends one.
+                for key in [Key::One, Key::Hash] {
+                    moves.push(self.then(|next| next.left.keys -= 1, Event::Key { who, key }));
+                }
+            }
             let at = self.media + EDGE;
             match *speaker {
                 Speaker::Quiet if self.left.turns > 0 => moves.push(self.then(
@@ -983,6 +996,7 @@ mod tests {
             says: 0,
             closes: 0,
             drops: 0,
+            keys: 0,
             crashes: 0,
             late: 0,
             most_states: 100_000,

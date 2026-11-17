@@ -571,6 +571,64 @@ fn what_answers_no_turn_has_no_trace_and_a_turn_for_someone_else_has_no_answer()
 }
 
 #[test]
+fn keys_are_a_turn_with_a_trace_and_no_key_of_it_is_sent() {
+    const KEYS: &str = "40719";
+    let collector = Collector::start(200);
+    let otel = collector.adapter();
+    let mut told = Told::new(&otel);
+    // Nobody transcribes keys: the turn is over when its keys are.
+    told.mark(2_000, Stage::TurnEnded(TurnId(1)));
+    let keys = told.text.push(KEYS);
+    told.fact(
+        2_000,
+        Fact::KeysCommitted {
+            turn: TurnId(1),
+            who: ParticipantId(1),
+            keys,
+        },
+    );
+    told.spoken(2_000, 1);
+    told.uttered(4_000, 1, false);
+    told.closed(5_000);
+    otel.shutdown();
+
+    // The turn is traced from where its keys were over to the end of
+    // its answer, and is for the agent, as keys always are.
+    // The two begin at the same moment, so either may come first.
+    let (spans, _) = collector.spans();
+    assert_eq!(spans.len(), 2, "{spans:?}");
+    let named = |name: &str| spans.iter().find(|span| span.name == name).unwrap();
+    let (turn, answered) = (named("turn"), named("response"));
+    assert_eq!(answered.parent_span_id, turn.span_id);
+    assert_eq!(lasted(turn), 2_000);
+    assert_eq!(events(turn), [("turn_ended", 0)]);
+    let of_turn = |key| text(&turn.attributes, key);
+    assert_eq!(of_turn(names::ADDRESSED).as_deref(), Some("true"));
+    assert_eq!(of_turn(names::WAITED).as_deref(), Some("0.325"));
+
+    // It is counted as a turn, and what was waited for its answer as
+    // for any other. Nothing was decided about it: nobody spoke.
+    let metrics = collector.metrics();
+    let turns = format!(
+        "{} {}=true {}=committed",
+        names::TURNS,
+        names::ADDRESSED,
+        names::TURN_OUTCOME
+    );
+    assert_eq!(metrics[&turns], (1, 1.0));
+    assert_eq!(metrics[names::ANSWERING].0, 1);
+    assert!(!metrics.contains_key(names::DECIDING), "{metrics:?}");
+
+    // No key was sent: an account number is as private as words are.
+    let got = collector.got.lock().unwrap();
+    assert!(got.len() >= 2);
+    for (path, body) in got.iter() {
+        let found = body.windows(KEYS.len()).any(|at| at == KEYS.as_bytes());
+        assert!(!found, "{KEYS:?} was sent to {path}");
+    }
+}
+
+#[test]
 fn every_session_has_traces_of_its_own() {
     let collector = Collector::start(200);
     let otel = collector.adapter();

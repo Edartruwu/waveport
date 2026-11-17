@@ -298,6 +298,8 @@ impl Transport for WsTransport {
                 },
             }),
             text: true,
+            // This protocol has no message for a key.
+            keys: None,
         }
     }
 
@@ -330,7 +332,10 @@ impl Transport for WsTransport {
         if self.over {
             return Ok(());
         }
-        let TransportControl::Clear { tag } = control;
+        // It says that it presses no keys, and is not asked to.
+        let TransportControl::Clear { tag } = control else {
+            return Ok(());
+        };
         self.commands.try_send(Command::Clear { tag })
     }
 

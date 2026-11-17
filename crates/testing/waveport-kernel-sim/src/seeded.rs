@@ -23,7 +23,7 @@ use core::time::Duration;
 use waveport_domain::command::{Command, LlmCause, LlmCmd, PlayoutCmd, SenseCmd, ToolCmd, TtsCmd};
 use waveport_domain::config::{AgentSpec, Effect, Executor, Gate, KernelConfig, ToolSpec};
 use waveport_domain::event::{
-    CloseReason, ControlInput, Event, Finish, HandoffContext, OpEvent, OverlapVerdict, Part,
+    CloseReason, ControlInput, Event, Finish, HandoffContext, Key, OpEvent, OverlapVerdict, Part,
     RetryClass, TimerId, ToolEvent, VadEdge,
 };
 use waveport_domain::fact::{Dismissal, EpochCause, Fact, Lifecycle, ToolOutcome};
@@ -79,6 +79,11 @@ pub enum Profile {
     /// never. The session waits for it for a moment, for a few seconds or
     /// not at all.
     Lines,
+    /// People press the keys of their telephones: runs of them, in one
+    /// breath or with pauses, with and without the key that ends one, over
+    /// the agent and over their own words. What makes a run differs from
+    /// session to session.
+    Keys,
 }
 
 impl Profile {
@@ -86,7 +91,7 @@ impl Profile {
     ///
     /// A new one is added at the end: the seeds of a sweep are numbered
     /// from its profile's place here.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Calm,
         Self::Chaos,
         Self::Stalls,
@@ -94,6 +99,7 @@ impl Profile {
         Self::Shutdown,
         Self::Crashes,
         Self::Lines,
+        Self::Keys,
     ];
 
     /// The profile's name, as failures print it.
@@ -107,6 +113,7 @@ impl Profile {
             Self::Shutdown => "shutdown",
             Self::Crashes => "crashes",
             Self::Lines => "lines",
+            Self::Keys => "keys",
         }
     }
 
@@ -166,6 +173,14 @@ impl Profile {
                 lost: 20,
                 stale: 100,
                 nonsense: 3,
+                late: 5,
+            },
+            Self::Keys => Faults {
+                jitter: 120,
+                twice: 20,
+                lost: 20,
+                stale: 100,
+                nonsense: 4,
                 late: 5,
             },
         }
@@ -250,6 +265,10 @@ pub struct Tally {
     pub resumed: u64,
     /// Sessions that closed because their line stayed gone.
     pub abandoned: u64,
+    /// Keys that were pressed.
+    pub keys: u64,
+    /// Turns of keys that entered the conversation.
+    pub keyed: u64,
     /// Times the journal was checked against the kernel.
     pub checks: u64,
     /// A fingerprint of everything the runs emitted, for telling whether
@@ -287,6 +306,8 @@ impl Tally {
         self.returns += other.returns;
         self.resumed += other.resumed;
         self.abandoned += other.abandoned;
+        self.keys += other.keys;
+        self.keyed += other.keyed;
         self.checks += other.checks;
         self.trace = mix(self.trace, other.trace);
     }
@@ -453,6 +474,9 @@ struct Run {
     /// A closing timer that is never delivered.
     lost_timer: Option<TimerId>,
     silent: bool,
+    /// Whether keys are pressed in this session, and made up beside those
+    /// that are.
+    keys: bool,
     /// The highest turn, response and call numbers seen, for making up
     /// events that almost make sense.
     seen: (u32, u32, u64),
@@ -461,6 +485,23 @@ struct Run {
     /// The session as the kernel was given it, when it is being written
     /// down.
     written: Option<Trace>,
+}
+
+/// What makes a run of keys in a session: the key that ends one or none,
+/// a number of keys or none, how long the next may take, and how many a
+/// run has room for.
+fn key_rules(config: &mut KernelConfig, pick: &mut impl FnMut(&[u64]) -> u64) {
+    config.keys.terminator = match pick(&[0, 0, 1, 2]) {
+        0 => Some(Key::Hash),
+        1 => Some(Key::Star),
+        _ => None,
+    };
+    config.keys.count = match pick(&[0, 0, 1, 4]) {
+        0 => None,
+        count => u8::try_from(count).ok(),
+    };
+    config.keys.wait = Duration::from_millis(pick(&[300, 1_000, 3_000]));
+    config.limits.keys = usize::try_from(pick(&[2, 8, 32])).unwrap_or(32);
 }
 
 impl Run {
@@ -488,6 +529,10 @@ impl Run {
             // Asked only here, so that the sessions of the other profiles
             // stay the ones they were.
             config.timing.detach_wait = Duration::from_millis(pick(&[0, 1_000, 5_000, 5_000]));
+        }
+        if profile == Profile::Keys {
+            // And so here.
+            key_rules(&mut config, &mut pick);
         }
 
         // The tools: some run by the application, and perhaps one that a
@@ -559,6 +604,7 @@ impl Run {
             armings: 0,
             lost_timer: None,
             silent: false,
+            keys: profile == Profile::Keys,
             seen: (0, 0, 0),
             tally: Tally {
                 runs: 1,
@@ -707,6 +753,30 @@ impl Run {
             }
         }
 
+        if profile == Profile::Keys {
+            for number in 1..=people {
+                let who = ParticipantId(u16::try_from(number).unwrap_or(1));
+                for _ in 0..self.rng.range(1..4) {
+                    let mut when = self.rng.range(100..horizon);
+                    for _ in 0..self.rng.range(1..7) {
+                        let key = *self.rng.choose(&Key::ALL).unwrap_or(&Key::Zero);
+                        self.at(when, Item::Control(Event::Key { who, key }));
+                        // Mostly in one breath, and now and then after a
+                        // pause that is long enough to end a run.
+                        when += if self.rng.chance(1, 8) {
+                            self.rng.range(1_000..4_000)
+                        } else {
+                            self.rng.range(40..600)
+                        };
+                    }
+                    if self.rng.chance(1, 2) {
+                        let key = Key::Hash;
+                        self.at(when, Item::Control(Event::Key { who, key }));
+                    }
+                }
+            }
+        }
+
         let closes = match profile {
             Profile::Shutdown => Some(self.rng.range(300..horizon)),
             _ if self.rng.chance(1, 4) => Some(self.rng.range(horizon / 2..horizon + 5_000)),
@@ -777,6 +847,7 @@ impl Run {
 
     fn step(&mut self, event: &Event) -> Result<(), Violation> {
         self.tally.steps += 1;
+        self.tally.keys += u64::from(matches!(event, Event::Key { .. }));
         let now = MonoTime::from_millis(self.now);
         let line = self.kernel.view().is_attached();
         if let Event::Durable(seq) = event {
@@ -891,9 +962,13 @@ impl Run {
     }
 
     fn count(&mut self, fact: &Fact) {
+        if let Fact::KeysCommitted { turn, .. } = *fact {
+            self.seen.0 = self.seen.0.max(turn.get());
+        }
         let tally = &mut self.tally;
         match *fact {
             Fact::TurnCommitted { .. } => tally.turns += 1,
+            Fact::KeysCommitted { .. } => tally.keyed += 1,
             Fact::TurnDismissed { reason, .. } => match reason {
                 Dismissal::Backchannel | Dismissal::Noise => tally.asides += 1,
                 Dismissal::Empty => tally.empty += 1,
@@ -1594,6 +1669,19 @@ impl Run {
     /// An event that makes no sense, or almost makes sense.
     #[expect(clippy::too_many_lines, reason = "one arm per kind of event")]
     fn nonsense(&mut self) -> Event {
+        // Asked only where keys are pressed, so that the sessions of the
+        // other profiles stay the ones they were.
+        if self.keys && self.rng.chance(1, 3) {
+            let turn = self.rng.range(0..u64::from(self.seen.0) + 3);
+            let turn = TurnId(u32::try_from(turn).unwrap_or(0));
+            let who = ParticipantId(u16::try_from(self.rng.range(0..6)).unwrap_or(0));
+            let key = *self.rng.choose(&Key::ALL).unwrap_or(&Key::Zero);
+            return if self.rng.chance(1, 2) {
+                Event::Timer(TimerId::Keys(turn))
+            } else {
+                Event::Key { who, key }
+            };
+        }
         let turn =
             TurnId(u32::try_from(self.rng.range(0..u64::from(self.seen.0) + 3)).unwrap_or(0));
         let generation =

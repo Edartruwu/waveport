@@ -30,7 +30,7 @@ use crate::command::{
 };
 use crate::config::{Effect, Executor, KernelConfig};
 use crate::event::{
-    CloseReason, ControlInput, Event, HandoffContext, OpEvent, OverlapVerdict, Part, TimerId,
+    CloseReason, ControlInput, Event, HandoffContext, Key, OpEvent, OverlapVerdict, Part, TimerId,
     ToolEvent, VadEdge,
 };
 use crate::fact::{Dismissal, EpochCause, Fact, Lifecycle, NoticeKind, Stamped, ToolOutcome};
@@ -91,6 +91,7 @@ impl<P: Policies> Step<'_, P> {
             Event::Eou { turn, p } => self.estimated(*turn, *p),
             Event::Overlap { turn, verdict } => self.judged(*turn, *verdict),
             Event::TextIn { who, text } => self.typed(*who, text.as_str()),
+            Event::Key { who, key } => self.key_pressed(*who, *key),
             Event::Op(tag, op) => self.op(*tag, op),
             Event::Timer(id) => self.timer_fired(*id),
             Event::Control(input) => self.control(input),
@@ -149,8 +150,33 @@ impl<P: Policies> Step<'_, P> {
         self.state.turns.iter().position(|open| open.id == turn)
     }
 
+    /// The turn in which `who` is speaking, or was and waits for its end.
     fn turn_of(&self, who: ParticipantId) -> Option<usize> {
-        self.state.turns.iter().position(|open| open.who == who)
+        self.state
+            .turns
+            .iter()
+            .position(|open| open.who == who && !open.keyed)
+    }
+
+    /// Whether the turn at `index`, which is of `who`, has to wait for one
+    /// they began before it.
+    fn waits_its_turn(&self, index: usize, who: ParticipantId) -> bool {
+        self.state
+            .turns
+            .iter()
+            .take(index)
+            .any(|before| before.who == who)
+    }
+
+    /// Whether `who` has pressed keys since they began the turn at
+    /// `index`, which is their turn of speech: a turn of theirs follows
+    /// it.
+    fn pressed_since(&self, index: usize, who: ParticipantId) -> bool {
+        self.state
+            .turns
+            .iter()
+            .skip(index + 1)
+            .any(|open| open.who == who)
     }
 
     fn generation_index(&self, generation: GenId) -> Option<usize> {
@@ -181,7 +207,7 @@ impl<P: Policies> Step<'_, P> {
         let turn_max = self.config.timing.turn_max;
         let mut continued = None;
         if let Some(index) = self.turn_of(who) {
-            let Some(open) = self.state.turns.get_mut(index) else {
+            let Some(open) = self.state.turns.get(index) else {
                 return;
             };
             // Edges are ordered by where they are in the audio, not by
@@ -190,11 +216,14 @@ impl<P: Policies> Step<'_, P> {
             if open.speaking || at < open.span.end {
                 return;
             }
-            if self.now.since(open.begun) >= turn_max {
+            let (turn, ran_out) = (open.id, self.now.since(open.begun) >= turn_max);
+            if ran_out || self.pressed_since(index, who) {
                 // The turn has run out, and is only waiting for its last
-                // words. What is said now is a new turn.
-                self.close_turn(index);
-            } else {
+                // words. Or they have pressed keys since, and what is said
+                // after keys is not said before them. What is said now is
+                // a new turn.
+                self.close_through(turn, who);
+            } else if let Some(open) = self.state.turns.get_mut(index) {
                 // The speaker went on before the turn ended: it is still
                 // the same turn, and whatever was decided about its end
                 // is void.
@@ -277,6 +306,23 @@ impl<P: Policies> Step<'_, P> {
         self.turn_ended(&open, None);
     }
 
+    /// Ends the open turn `turn` of `who` with what it has, and before it
+    /// whatever they began before it: what somebody said and what they
+    /// pressed enter the conversation in the order they began in.
+    fn close_through(&mut self, turn: TurnId, who: ParticipantId) {
+        while let Some(index) = self.state.turns.iter().position(|open| open.who == who) {
+            let last = self
+                .state
+                .turns
+                .get(index)
+                .is_none_or(|open| open.id == turn);
+            self.close_turn(index);
+            if last {
+                break;
+            }
+        }
+    }
+
     fn estimated(&mut self, turn: TurnId, p: Prob) {
         let Some(open) = self
             .turn_index(turn)
@@ -285,8 +331,8 @@ impl<P: Policies> Step<'_, P> {
             return;
         };
         // An estimate for speech that has since gone on, or for a turn
-        // that is already over, is stale.
-        if open.speaking || open.ended.is_some() {
+        // that is already over, is stale. Keys are not estimated.
+        if open.speaking || open.ended.is_some() || open.keyed {
             return;
         }
         open.estimate = Some(p);
@@ -301,7 +347,7 @@ impl<P: Policies> Step<'_, P> {
         else {
             return;
         };
-        if open.speaking || open.ended.is_some() {
+        if open.speaking || open.ended.is_some() || open.keyed {
             return;
         }
         let input = TurnInput {
@@ -347,8 +393,8 @@ impl<P: Policies> Step<'_, P> {
             return;
         };
         // The timer only wakes the session. Whether the turn has run out
-        // is read from the state.
-        if self.now.since(open.begun) < turn_max || open.ended.is_some() {
+        // is read from the state. Keys have their own end.
+        if self.now.since(open.begun) < turn_max || open.ended.is_some() || open.keyed {
             return;
         }
         self.speech_given_up(turn);
@@ -421,6 +467,127 @@ impl<P: Policies> Step<'_, P> {
         let turn = self.state.next_turn;
         self.state.next_turn = turn.next();
         self.commit_turn(turn, who, span, words);
+    }
+
+    // ---- Keys --------------------------------------------------------------
+
+    /// Somebody pressed a key of their telephone. Keys that follow one
+    /// another are one turn, and nothing is said in it: what whoever
+    /// presses was saying is over, with the words it has and those still
+    /// on their way.
+    fn key_pressed(&mut self, who: ParticipantId, key: Key) {
+        if !self.hears(who) {
+            return;
+        }
+        // A key is never a noise of agreement. Whoever presses one while
+        // the agent speaks has the floor at once.
+        let audible = self
+            .floor()
+            .and_then(|index| self.state.generations.get(index))
+            .is_some_and(Generation::is_audible);
+        if audible {
+            self.interrupt(EpochCause::BargeIn);
+        }
+        let policy = self.config.keys;
+        let ends = policy.terminator == Some(key);
+        let under_way = self
+            .state
+            .turns
+            .iter()
+            .find(|open| open.who == who && open.keyed && open.ended.is_none())
+            .map(|open| open.id);
+        let turn = if let Some(turn) = under_way {
+            if ends {
+                // The key that ends a run is not one of its keys.
+                self.keys_are_over(turn);
+                return;
+            }
+            turn
+        } else {
+            if self.state.turns.is_full() {
+                // Too many turns are open at once. The key is not
+                // accepted, and changes nothing.
+                return;
+            }
+            let spoken = self
+                .turn_of(who)
+                .and_then(|index| self.state.turns.get(index))
+                .filter(|open| open.ended.is_none())
+                .map(|open| open.id);
+            if let Some(spoken) = spoken {
+                self.speech_given_up(spoken);
+            }
+            let turn = self.state.next_turn;
+            let mut open = OpenTurn::keys(turn, who, self.now);
+            // Room for the longest run there can be, taken once: the
+            // keys that follow leave the heap alone.
+            open.text.reserve(self.config.limits.keys);
+            if self.state.turns.push(open).is_err() {
+                return;
+            }
+            self.state.next_turn = turn.next();
+            turn
+        };
+        let most = self.config.limits.keys;
+        let Some(open) = self
+            .turn_index(turn)
+            .and_then(|index| self.state.turns.get_mut(index))
+        else {
+            return;
+        };
+        open.text.push(key.as_char());
+        open.quiet_since = self.now;
+        let pressed = open.text.len();
+        let complete = policy
+            .count
+            .is_some_and(|count| pressed >= usize::from(count));
+        // The key that ends runs, pressed when none is under way, is a
+        // run by itself.
+        if ends || complete || pressed >= most {
+            self.keys_are_over(turn);
+        } else {
+            self.set_timer(TimerId::Keys(turn), policy.wait);
+        }
+    }
+
+    /// A run of keys is complete. It enters the conversation when this
+    /// step settles, or when what whoever pressed them said before has.
+    fn keys_are_over(&mut self, turn: TurnId) {
+        let open = self
+            .turn_index(turn)
+            .and_then(|index| self.state.turns.get_mut(index));
+        if let Some(open) = open {
+            open.ended = Some(self.now);
+        }
+    }
+
+    /// The time in which another key could follow may be over. The timer
+    /// only wakes the session: whether it is, is read from the state.
+    fn keys_waited(&mut self, turn: TurnId) {
+        let wait = self.config.keys.wait;
+        let over = self
+            .turn_index(turn)
+            .and_then(|index| self.state.turns.get(index))
+            .is_some_and(|open| {
+                open.keyed && open.ended.is_none() && self.now.since(open.quiet_since) >= wait
+            });
+        if over {
+            self.keys_are_over(turn);
+        }
+    }
+
+    /// Keys that were pressed are over as a turn. They enter the
+    /// conversation as keys, unless the turn is dismissed whatever it
+    /// holds.
+    fn keys_ended(&mut self, open: &OpenTurn, forced: Option<Dismissal>) {
+        self.cancel_timer(TimerId::Keys(open.id));
+        let (turn, who) = (open.id, open.who);
+        if let Some(reason) = forced {
+            self.fact(Fact::TurnDismissed { turn, who, reason });
+        } else {
+            let keys = self.out.text.push(&open.text);
+            self.fact(Fact::KeysCommitted { turn, who, keys });
+        }
     }
 
     // ---- Speech over the agent's speech ------------------------------------
@@ -824,6 +991,7 @@ impl<P: Policies> Step<'_, P> {
             }
             TimerId::Checkpoint => self.checkpoint(),
             TimerId::Detach => self.give_line_up(),
+            TimerId::Keys(turn) => self.keys_waited(turn),
             // These only need the session to look at the time, which
             // `settle` does after every event.
             TimerId::Drain
@@ -935,8 +1103,9 @@ impl<P: Policies> Step<'_, P> {
         if !self.state.participants.contains(&who) {
             return;
         }
-        // What they were saying ends with the words that arrived.
-        if let Some(index) = self.turn_of(who) {
+        // What they were saying ends with the words that arrived, and
+        // what they were pressing with the keys they pressed.
+        while let Some(index) = self.state.turns.iter().position(|open| open.who == who) {
             self.close_turn(index);
         }
         self.cmd(Command::Stt(SttCmd::Close { who }));
@@ -1027,6 +1196,10 @@ impl<P: Policies> Step<'_, P> {
     /// dismissed, once, here and nowhere else. `forced` gives the reason
     /// when the turn is dismissed whatever it holds.
     fn turn_ended(&mut self, open: &OpenTurn, forced: Option<Dismissal>) {
+        if open.keyed {
+            self.keys_ended(open, forced);
+            return;
+        }
         for id in [
             TimerId::Eou(open.id),
             TimerId::Overlap(open.id),
@@ -1090,12 +1263,16 @@ impl<P: Policies> Step<'_, P> {
         }
     }
 
-    /// Ends every turn that can end.
+    /// Ends every turn that can end. What somebody said and what they
+    /// pressed enter the conversation in the order they began in: a turn
+    /// that is over waits for an earlier one of the same person.
     fn end_turns(&mut self) {
         let timing = self.config.timing;
         let mut index = 0;
         while let Some(open) = self.state.turns.get(index) {
-            if open.is_over(self.now, &timing) {
+            // Whether a turn is over is asked in every step, and whether
+            // it has to wait only of one that is.
+            if open.is_over(self.now, &timing) && !self.waits_its_turn(index, open.who) {
                 if let Some(open) = self.state.turns.remove(index) {
                     self.turn_ended(&open, None);
                 }

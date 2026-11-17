@@ -165,6 +165,10 @@ impl Page {
                 }
                 return;
             }
+            Fact::KeysCommitted { keys, .. } => {
+                self.line(&format!("you pressed: {}", text.get(keys)));
+                return;
+            }
             // An answer whose words are on the page is not written
             // again: it ends there, and says so if it was stopped.
             Fact::UtteranceCommitted {

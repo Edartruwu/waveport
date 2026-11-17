@@ -10,23 +10,31 @@
 //! One response is spoken at a time. Text for another response ends the
 //! stream of the one before, and so does a cancellation: a stream that is
 //! dropped is cancelled.
+//!
+//! Keys that the session is to press leave here as well. A transport
+//! that presses keys is asked to. For one that has no way but the audio,
+//! the tone of each key is made and goes out at the pace it is heard:
+//! over what is being said while something is, in frames of its own
+//! while nothing is.
 
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use waveport_domain::event::{Event, OpEvent, Part};
+use waveport_domain::audio::FRAME_MS;
+use waveport_domain::event::{Event, Key, OpEvent, Part};
 use waveport_domain::ids::OpTag;
 use waveport_domain::time::{MediaDur, MonoTime};
 use waveport_media::codec::opus::OpusSettings;
 use waveport_media::codec::{CodecError, Encoder};
+use waveport_media::dtmf::{Dialer, MOST};
 use waveport_media::ledger::{Mark, Spread};
 use waveport_media::playout::{Playout, PlayoutConfig, Position};
 use waveport_ports::audio::PcmBytes;
 use waveport_ports::error::{BoxFuture, PortError};
 use waveport_ports::plan::{Marks, PlaybackPlan, SpeakPlan};
-use waveport_ports::transport::{FrameOut, Transport, TransportControl};
+use waveport_ports::transport::{FrameOut, KeysOut, ToneOut, Transport, TransportControl};
 use waveport_ports::tts::{Tts, TtsConfig, TtsEvent, TtsStream};
 
 type Opening = BoxFuture<'static, Result<TtsStream, PortError>>;
@@ -37,6 +45,9 @@ type Opening = BoxFuture<'static, Result<TtsStream, PortError>>;
 /// that names a word otherwise than it was written leaves it unmarked,
 /// and the rest of the response would wait for that mark for ever.
 const QUIET: Duration = Duration::from_millis(400);
+
+/// How long a frame of audio lasts.
+const FRAME: Duration = Duration::from_millis(FRAME_MS as u64);
 
 enum Stream {
     Opening(Opening),
@@ -189,6 +200,12 @@ pub struct SpeakStats {
     pub frames_refused: u64,
     /// Frames that could not be encoded.
     pub frames_unencodable: u64,
+    /// Keys the session was asked to press and did not: its transport has
+    /// no way to press one, more were waiting than there is room for, or
+    /// they were still to press when the line dropped or the session
+    /// stopped. A frame of a tone that the transport had no room for is
+    /// counted with the frames that were refused.
+    pub keys_unpressed: u64,
 }
 
 /// The voice of a session: synthesis, the outbound path and the encoder.
@@ -204,6 +221,13 @@ pub(crate) struct Voice {
     reported: Option<Position>,
     /// The response whose first frame has gone out.
     started: Option<OpTag>,
+    /// The keys to press whose tones the session makes.
+    dialer: Dialer,
+    /// The keys the transport is still to be asked to press.
+    to_press: VecDeque<Key>,
+    /// When pressing goes on if nothing is said before: the next frame
+    /// of a tone is due, or the transport is asked again.
+    press_at: Option<MonoTime>,
     frame: Vec<i16>,
     packet: Vec<u8>,
     scratch: Vec<i16>,
@@ -232,6 +256,9 @@ impl Voice {
             speaking: None,
             reported: None,
             started: None,
+            dialer: Dialer::new(plan.rate),
+            to_press: VecDeque::with_capacity(MOST),
+            press_at: None,
             frame: vec![0; plan.rate.frame()],
             packet: vec![0; plan.wire.max_packet()],
             scratch: vec![0; plan.rate.frame() * 10],
@@ -251,9 +278,30 @@ impl Voice {
             (Some(speaking), Marks::Timed) => speaking.stalled_at(),
             _ => None,
         };
-        match (self.playout.wake(), stalled) {
+        let speech = match (self.playout.wake(), stalled) {
             (Some(wake), Some(stalled)) => Some(wake.min(stalled)),
             (wake, stalled) => wake.or(stalled),
+        };
+        speech.into_iter().chain(self.press_at).min()
+    }
+
+    /// The session is to press `keys`, after those it was asked to press
+    /// before.
+    pub(crate) fn press(&mut self, keys: &[Key], now: MonoTime) {
+        for &key in keys {
+            let taken = match self.plan.keys {
+                Some(KeysOut::Tones) => self.dialer.press(key),
+                Some(KeysOut::OutOfBand) if self.to_press.len() < MOST => {
+                    self.to_press.push_back(key);
+                    true
+                }
+                Some(KeysOut::OutOfBand) | None => false,
+            };
+            if taken {
+                self.press_at.get_or_insert(now);
+            } else {
+                self.stats.keys_unpressed += 1;
+            }
         }
     }
 
@@ -279,6 +327,17 @@ impl Voice {
         if self.playback.far_end_reports {
             self.playout.ack(tag, played);
         }
+    }
+
+    /// The keys that are still to be pressed are not: nobody is there to
+    /// hear them, or the session may say nothing more.
+    pub(crate) fn forget_keys(&mut self) {
+        let waiting = self.dialer.unsounded() + self.to_press.len();
+        let waiting = u64::try_from(waiting).unwrap_or(u64::MAX);
+        self.stats.keys_unpressed = self.stats.keys_unpressed.saturating_add(waiting);
+        self.dialer.clear();
+        self.to_press.clear();
+        self.press_at = None;
     }
 
     /// The kernel releases a piece of the text of the response `tag`.
@@ -370,6 +429,7 @@ impl Voice {
     /// session that may say nothing more.
     pub(crate) fn halt(&mut self, fade_ms: u16, now: MonoTime, transport: &mut dyn Transport) {
         self.speaking = None;
+        self.forget_keys();
         if let Some(position) = self.playout.position(now)
             && !position.drained
         {
@@ -498,8 +558,11 @@ impl Voice {
     ) -> bool {
         let rate = self.plan.rate;
         let mut sent = false;
+        let mut over = false;
         while let Some(frame) = self.playout.poll(now, &mut self.frame) {
             sent = true;
+            // A key that is being pressed sounds over what is being said.
+            over |= self.dialer.mix(&mut self.frame) > 0;
             let Ok(len) = self.encoder.encode(&self.frame, &mut self.packet) else {
                 self.stats.frames_unencodable += 1;
                 continue;
@@ -520,6 +583,69 @@ impl Voice {
                 milestone(Milestone::FirstFrame(frame.tag));
             }
         }
+        sent | self.press_on(now, transport, over)
+    }
+
+    /// Goes on pressing the keys that are to be pressed. `over` says that
+    /// the tone of one went out just now, over what is being said.
+    /// Returns whether anything went out.
+    fn press_on(&mut self, now: MonoTime, transport: &mut dyn Transport, over: bool) -> bool {
+        let mut sent = false;
+        // The transport presses keys itself, and is asked for each. One
+        // that has no room is asked again a frame later.
+        while let Some(&key) = self.to_press.front() {
+            if transport
+                .try_control(TransportControl::Dtmf { key })
+                .is_err()
+            {
+                self.press_at = Some(now.after(FRAME));
+                return sent;
+            }
+            self.to_press.pop_front();
+            sent = true;
+        }
+        if self.dialer.is_idle() {
+            self.press_at = None;
+            return sent;
+        }
+        if over {
+            // The tone goes on in a frame of its own when the frame it
+            // went out in has been heard, unless more is said by then.
+            self.press_at = Some(now.after(FRAME));
+            return sent;
+        }
+        if self.playout.buffered() > 0 && self.playout.wake().is_some() {
+            // More of what is being said is on its way out, and the tone
+            // goes with it: the outbound path says when.
+            self.press_at = None;
+            return sent;
+        }
+        // The tones of the keys, in frames of their own while nothing is
+        // being said, at the pace they are heard. A session that was not
+        // run for a while does not send what it missed in a burst.
+        let mut due = self.press_at.unwrap_or(now);
+        if now.since(due) > 2 * FRAME {
+            due = now;
+        }
+        let rate = self.plan.rate;
+        while due <= now && !self.dialer.is_idle() {
+            self.frame.fill(0);
+            self.dialer.mix(&mut self.frame);
+            due = due.after(FRAME);
+            let Ok(len) = self.encoder.encode(&self.frame, &mut self.packet) else {
+                self.stats.frames_unencodable += 1;
+                continue;
+            };
+            let tone = ToneOut {
+                length: rate.length_of(self.frame.len()),
+                payload: self.packet.get(..len).unwrap_or_default(),
+            };
+            if transport.try_send_tone(tone).is_err() {
+                self.stats.frames_refused += 1;
+            }
+            sent = true;
+        }
+        self.press_at = (!self.dialer.is_idle()).then_some(due);
         sent
     }
 }

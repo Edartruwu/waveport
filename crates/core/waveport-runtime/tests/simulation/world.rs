@@ -45,7 +45,7 @@ use waveport_ports::error::{BoxFuture, PortError};
 use waveport_ports::journal::{Journal, SessionId};
 use waveport_ports::stt::{SttFinalize, SttTiming};
 use waveport_ports::tool::{ToolExecutor, ToolReply, ToolRequest};
-use waveport_ports::transport::{AudioCaps, RemoteBuffer, Transport, TransportCaps};
+use waveport_ports::transport::{AudioCaps, KeysOut, RemoteBuffer, Transport, TransportCaps};
 use waveport_ports::tts::{Alignment, TtsCaps, TtsInput};
 use waveport_runtime::codec;
 use waveport_runtime::compute::Compute;
@@ -98,11 +98,13 @@ pub(crate) enum Shape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Line {
     /// Plain samples, a far end that says what it played and discards
-    /// what it is told to.
+    /// what it is told to. It has no keys.
     SoundCard,
-    /// A telephone line: G.711, and a far end that does neither.
+    /// A telephone line: G.711, and a far end that does neither. Keys
+    /// are pressed on it as tones in its audio.
     Telephone,
     /// Opus, and a far end that says what it played and cannot discard.
+    /// It presses the keys it is asked to.
     Opus,
 }
 
@@ -119,6 +121,7 @@ impl Line {
                     },
                 }),
                 text: true,
+                keys: None,
             },
             Self::Telephone => TransportCaps {
                 audio: Some(AudioCaps {
@@ -130,6 +133,7 @@ impl Line {
                     },
                 }),
                 text: false,
+                keys: Some(KeysOut::Tones),
             },
             Self::Opus => TransportCaps {
                 audio: Some(AudioCaps {
@@ -141,6 +145,7 @@ impl Line {
                     },
                 }),
                 text: true,
+                keys: Some(KeysOut::OutOfBand),
             },
         }
     }
@@ -188,6 +193,9 @@ pub(crate) struct Plan {
     /// When the line drops, and when it is back, if it is. In order: the
     /// line does not drop again before it is back.
     pub drops: Vec<(u64, Option<u64>)>,
+    /// The keys the callers press: when the first of a run is pressed,
+    /// who presses, and the keys, one every 200 ms.
+    pub keys: Vec<(u64, usize, String)>,
     pub doings: Vec<(u64, Doing)>,
     pub stt: SttScript,
     pub llm: Respond,
@@ -235,6 +243,7 @@ impl Plan {
             mics_until_ms: 0,
             hangs_up_ms: None,
             drops: Vec::new(),
+            keys: Vec::new(),
             doings: Vec::new(),
             stt: SttScript::new(Vec::new()),
             llm: Arc::new(|_| vec![LlmStep::say("Yes.")]),
@@ -262,6 +271,16 @@ impl Plan {
         });
         self.mics_until_ms = self.mics_until_ms.max(to_ms + 3_000);
         to_ms
+    }
+
+    /// Caller `who` presses `keys` of their telephone from `at_ms` on,
+    /// one every 200 ms. Returns when the last is pressed.
+    pub(crate) fn presses(&mut self, who: usize, at_ms: u64, keys: &str) -> u64 {
+        let more = u64::try_from(keys.chars().count()).unwrap_or(1).max(1) - 1;
+        let last = at_ms + 200 * more;
+        self.keys.push((at_ms, who, keys.to_owned()));
+        self.mics_until_ms = self.mics_until_ms.max(last + 3_000);
+        last
     }
 
     /// Caller `who` types `text` at `at_ms`.
@@ -343,6 +362,13 @@ pub(crate) struct Tally {
     pub drops: u64,
     /// Sessions that began to close because nobody was there any more.
     pub abandoned: u64,
+    /// Turns of keys that entered a conversation.
+    pub keyed: u64,
+    /// Keys a line was asked to press, frames of tones a line was sent,
+    /// and keys a session was asked to press and did not.
+    pub pressed: u64,
+    pub tones: u64,
+    pub unpressed: u64,
     pub reopened: u64,
     pub frames: u64,
     /// States the journal stored.
@@ -378,6 +404,10 @@ impl Tally {
             (&mut self.hung_up, other.hung_up),
             (&mut self.drops, other.drops),
             (&mut self.abandoned, other.abandoned),
+            (&mut self.keyed, other.keyed),
+            (&mut self.pressed, other.pressed),
+            (&mut self.tones, other.tones),
+            (&mut self.unpressed, other.unpressed),
             (&mut self.reopened, other.reopened),
             (&mut self.frames, other.frames),
             (&mut self.states, other.states),
@@ -393,6 +423,7 @@ impl Tally {
         for stamped in &out.facts {
             match stamped.fact {
                 Fact::TurnCommitted { .. } => self.turns += 1,
+                Fact::KeysCommitted { .. } => self.keyed += 1,
                 Fact::TurnDismissed { .. } => self.dismissed += 1,
                 Fact::UtteranceCommitted { truncated, .. } => {
                     self.spoken += 1;
@@ -512,6 +543,8 @@ impl ToolExecutor for Guarded {
 /// One life of a session, as it looked from outside.
 pub(crate) struct Life {
     pub wire: TransportLog,
+    /// How many keys the session was asked to press and did not.
+    pub unpressed: u64,
     /// What whoever followed a session of text was told, in order.
     pub told: Vec<SessionEvent>,
     /// How the life ended: by itself, or because the process died, or not
@@ -554,6 +587,17 @@ impl Outcome {
                 Fact::TurnCommitted { who, addressed, .. } => {
                     Some((who, self.text_of(&stamped.fact), addressed))
                 }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The keys that were committed: who pressed, and what.
+    pub(crate) fn keys(&self) -> Vec<(ParticipantId, &str)> {
+        self.facts
+            .iter()
+            .filter_map(|stamped| match stamped.fact {
+                Fact::KeysCommitted { who, .. } => Some((who, self.text_of(&stamped.fact))),
                 _ => None,
             })
             .collect()
@@ -723,6 +767,14 @@ impl Plan {
                 }
                 Some(sent + Duration::from_millis(rng.range(0..jitter + 1)))
             });
+        }
+        // Keys that were being pressed when the process died are not
+        // pressed again either.
+        for (at, caller, keys) in &self.keys {
+            if *at >= began_ms {
+                let who = ParticipantId(u16::try_from(caller + 1).unwrap_or(u16::MAX));
+                far = far.keys(*at - began_ms, who, keys);
+            }
         }
         // A life begins with its line there, whatever became of the line
         // of the life before.
@@ -902,6 +954,10 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         tally.drops += wire.drops as u64;
         tally.reopened += u64::from(session.stats().hearing.recogniser_failures);
         tally.states += u64::from(session.stats().states.stored);
+        let unpressed = session.stats().speaking.keys_unpressed;
+        tally.pressed += wire.pressed.len() as u64;
+        tally.tones += wire.tones.len() as u64;
+        tally.unpressed += unpressed;
         if explain {
             log.push(format!(
                 "{:>7} ms  LIFE {life} IS OVER: ended {ended:?}, died {died}",
@@ -910,6 +966,7 @@ async fn play(plan: &Plan, explain: bool) -> Result<Outcome, Broken> {
         }
         lives.push(Life {
             wire,
+            unpressed,
             told,
             ended: ended.clone(),
             died,
@@ -1139,6 +1196,44 @@ fn heard_as_played(plan: &Plan, outcome: &Outcome) -> Result<(), Broken> {
     Ok(())
 }
 
+/// What must hold of the tones of keys that went out in frames of their
+/// own.
+fn tones_are_sound(wire: &TransportLog) -> Result<(), Broken> {
+    // They go out at the pace they are heard at, as what is said does:
+    // ten frames are a fifth of a second, and are not sent in less than
+    // that but for a little.
+    for (index, pair) in wire.tones.windows(11).enumerate() {
+        let took = pair[10].when.saturating_sub(pair[0].when).as_millis();
+        if took < 140 {
+            return broken(format!(
+                "the ten frames of tones after frame {index} were sent in {took} ms"
+            ));
+        }
+    }
+    // While something is being said the tone of a key is in the frames
+    // of what is said, and not in one of its own between two of them.
+    for tone in &wire.tones {
+        let next = wire.frames.partition_point(|frame| frame.when <= tone.when);
+        let Some(before) = next.checked_sub(1).and_then(|at| wire.frames.get(at)) else {
+            continue;
+        };
+        let Some(after) = wire.frames.get(next) else {
+            continue;
+        };
+        let goes_on = after.tag == before.tag
+            && after.at == before.at.saturating_add(before.length)
+            && after.when.saturating_sub(before.when) <= Duration::from_millis(20);
+        if goes_on {
+            return broken(format!(
+                "a tone went out in a frame of its own at {:?}, between two frames of {:?} \
+                 that follow one another",
+                tone.when, before.tag
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What must hold of everything a session sent in one life.
 fn wire_is_sound(wire: &TransportLog) -> Result<(), Broken> {
     if wire.late > 0 {
@@ -1161,6 +1256,7 @@ fn wire_is_sound(wire: &TransportLog) -> Result<(), Broken> {
             wire.unheard, wire.drops
         ));
     }
+    tones_are_sound(wire)?;
     // The responses that another has taken over from, and the one being
     // sent: when its first frame went out, and its newest frame.
     let mut over = Vec::new();

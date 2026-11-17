@@ -25,7 +25,7 @@ pub use models::{ByLength, LoudVad, ScriptedTurns, TurnLog};
 pub use stt::{ScriptedStt, Spoken, SttLog, SttScript};
 pub use tools::{Called, ScriptedTools};
 pub use transport::{
-    FakeTransport, FakeTransportBuilder, SentFrame, TransportHandle, TransportLog,
+    FakeTransport, FakeTransportBuilder, SentFrame, SentTone, TransportHandle, TransportLog,
 };
 pub use tts::{ScriptedTts, TtsLog, TtsScript};
 

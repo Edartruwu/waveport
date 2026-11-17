@@ -9,7 +9,9 @@
 use std::collections::VecDeque;
 
 use waveport_domain::command::{Command, LlmCmd, PlayoutCmd, SenseCmd, ToolCmd, TtsCmd};
-use waveport_domain::event::{Event, Finish, OpEvent, OverlapVerdict, TimerId, ToolEvent, VadEdge};
+use waveport_domain::event::{
+    Event, Finish, Key, OpEvent, OverlapVerdict, TimerId, ToolEvent, VadEdge,
+};
 use waveport_domain::ids::{AgentId, GenId, OpTag, ParticipantId, Prob, ToolCallId};
 use waveport_domain::text::TextArena;
 use waveport_domain::time::{MediaDur, MediaSpan, MediaTime, MonoTime};
@@ -22,6 +24,9 @@ pub(crate) type Ms = u64;
 
 /// How long one word takes to say, for a person and for the agent.
 pub(crate) const WORD_MS: Ms = 300;
+
+/// How long after a key the next one of a run is pressed.
+pub(crate) const KEY_MS: Ms = 250;
 /// How long after a person stops the final transcript arrives.
 const STT_FINAL_MS: Ms = 200;
 /// How long after the first half of an utterance its interim transcript
@@ -76,6 +81,8 @@ pub(crate) enum Stream {
     Voice(ParticipantId),
     /// Transcripts of one person's speech.
     Transcriber(ParticipantId),
+    /// The keys one person presses.
+    Keypad(ParticipantId),
     /// End-of-turn estimates.
     Estimator,
     /// Verdicts on overlapping speech.
@@ -103,6 +110,7 @@ impl Stream {
             self,
             Self::Voice(_)
                 | Self::Transcriber(_)
+                | Self::Keypad(_)
                 | Self::Estimator
                 | Self::Classifier
                 | Self::Tool(_)
@@ -780,9 +788,28 @@ impl World {
         })
     }
 
-    /// `who` presses a run of keys.
-    pub(crate) fn presses(&mut self, who: ParticipantId) {
+    /// `who` presses `keys` one after the other, the first now and each
+    /// of the others [`KEY_MS`] after the one before. Returns the event of
+    /// the first.
+    pub(crate) fn presses(&mut self, now: Ms, who: ParticipantId, keys: &str) -> Option<Event> {
+        let pressed = keys.chars().map(Key::from_char).collect::<Option<Vec<_>>>();
+        let Some(pressed) = pressed.filter(|pressed| !pressed.is_empty()) else {
+            self.blame(format!(
+                "the scenario has {} press {keys:?}, which are not keys of a telephone",
+                self.names.person(who)
+            ));
+            return None;
+        };
         self.pressed.push(who);
+        if self.silent {
+            return None;
+        }
+        let mut events = pressed.into_iter().map(|key| Event::Key { who, key });
+        let first = events.next();
+        for (later, event) in (1..).zip(events) {
+            self.send(now + KEY_MS * later, Stream::Keypad(who), event);
+        }
+        first
     }
 
     /// Everyone who pressed keys, with how many runs of them.
@@ -1086,7 +1113,7 @@ fn track(millis: Ms) -> MediaTime {
 #[cfg(test)]
 mod tests {
     use waveport_domain::command::{Command, LlmCause, LlmCmd, PlayoutCmd, SenseCmd, TtsCmd};
-    use waveport_domain::event::{Event, Finish, OpEvent, OverlapVerdict, TimerId, VadEdge};
+    use waveport_domain::event::{Event, Finish, Key, OpEvent, OverlapVerdict, TimerId, VadEdge};
     use waveport_domain::ids::{
         AgentId, ContextVersion, Epoch, GenId, OpTag, ParticipantId, Prob, Seq, ToolCallId, ToolId,
         TurnId,
@@ -1094,7 +1121,7 @@ mod tests {
     use waveport_domain::text::TextArena;
     use waveport_domain::time::{MediaDur, MonoTime};
 
-    use super::{Arrival, Manner, Ms, Timer, World};
+    use super::{Arrival, KEY_MS, Manner, Ms, Timer, World};
     use crate::script::say;
     use crate::setup::Setup;
     use waveport_domain::config::Effect;
@@ -1229,10 +1256,48 @@ mod tests {
     fn runs_of_keys_are_counted_by_who_pressed_them() {
         let mut world = world();
         assert_eq!(world.pressings(), []);
-        world.presses(ParticipantId(2));
-        world.presses(CALLER);
-        world.presses(ParticipantId(2));
+        let key = |who, key| Some(Event::Key { who, key });
+        assert_eq!(
+            world.presses(0, ParticipantId(2), "4"),
+            key(ParticipantId(2), Key::Four)
+        );
+        assert_eq!(world.presses(0, CALLER, "#"), key(CALLER, Key::Hash));
+        assert_eq!(
+            world.presses(0, ParticipantId(2), "*"),
+            key(ParticipantId(2), Key::Star)
+        );
         assert_eq!(world.pressings(), [(CALLER, 1), (ParticipantId(2), 2)]);
+        assert_eq!(world.fault(), None);
+    }
+
+    #[test]
+    fn keys_are_pressed_one_after_the_other() {
+        let mut world = world();
+        let first = world.presses(1_000, CALLER, "40#");
+        assert_eq!(
+            first,
+            Some(Event::Key {
+                who: CALLER,
+                key: Key::Four
+            })
+        );
+        let mut later = Vec::new();
+        while let Some(pending) = world.queue.pop_due(10_000) {
+            later.push((pending.at, pending.arrival));
+        }
+        let key = |key| Arrival::Event(Event::Key { who: CALLER, key });
+        assert_eq!(
+            later,
+            [
+                (1_000 + KEY_MS, key(Key::Zero)),
+                (1_000 + 2 * KEY_MS, key(Key::Hash))
+            ]
+        );
+        // What is no key of a telephone is the scenario's mistake.
+        assert_eq!(world.presses(2_000, CALLER, "4x"), None);
+        assert!(world.fault().unwrap().contains("not keys of a telephone"));
+        assert_eq!(world.presses(2_000, CALLER, ""), None);
+        assert_eq!(world.pressings(), [(CALLER, 1)]);
     }
 
     #[test]

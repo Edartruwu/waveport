@@ -9,6 +9,10 @@
 //! The line between the two can be scripted to drop and to come back.
 //! While it is gone nothing gets through either way: what the far end
 //! says is lost, and so is what it is sent.
+//!
+//! The person can be scripted to press keys of a telephone, and the
+//! transport keeps the keys it is asked to press at the far end, or the
+//! frames of their tones, whichever it is set up to say it takes.
 
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -18,6 +22,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use tokio::time::{Instant, Sleep};
+use waveport_domain::event::Key;
 use waveport_domain::ids::{OpTag, ParticipantId};
 use waveport_domain::time::MediaDur;
 use waveport_media::codec::Encoder;
@@ -25,7 +30,8 @@ use waveport_media::codec::opus::OpusSettings;
 use waveport_ports::audio::{Codec, Rate};
 use waveport_ports::error::Full;
 use waveport_ports::transport::{
-    AudioCaps, FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
+    AudioCaps, FrameOut, KeysOut, RemoteBuffer, ToneOut, Transport, TransportCaps,
+    TransportControl, TransportEvent,
 };
 
 use super::tts::tone;
@@ -48,6 +54,18 @@ pub struct SentFrame {
     pub payload: Bytes,
     /// Whether it is the last frame of the response.
     pub last: bool,
+}
+
+/// A frame of no response that a fake transport was given to send: the
+/// tone of a key, or the pause after one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentTone {
+    /// When, since the transport was made.
+    pub when: Duration,
+    /// How long it lasts.
+    pub length: MediaDur,
+    /// The packet.
+    pub payload: Bytes,
 }
 
 /// What a fake transport was asked to do.
@@ -75,6 +93,10 @@ pub struct TransportLog {
     /// them. A session that is told its line is gone fades out what it
     /// was saying, which is one frame for each time the line drops.
     pub unheard: usize,
+    /// The keys it was asked to press at the far end, and when.
+    pub pressed: Vec<(Duration, Key)>,
+    /// The frames of no response it was given to send: the tones of keys.
+    pub tones: Vec<SentTone>,
 }
 
 impl TransportLog {
@@ -189,6 +211,28 @@ impl FakeTransportBuilder {
     pub fn line_returns(mut self, at_ms: u64) -> Self {
         self.events
             .push((Duration::from_millis(at_ms), TransportEvent::Attached));
+        self
+    }
+
+    /// From `at_ms` on, `who` presses `keys` of their telephone, one
+    /// every 200 ms. A character that is no key is not pressed.
+    #[must_use]
+    pub fn keys(mut self, at_ms: u64, who: ParticipantId, keys: &str) -> Self {
+        let pressed = keys.chars().filter_map(Key::from_char);
+        for (at_ms, key) in (at_ms..).step_by(200).zip(pressed) {
+            self.events.push((
+                Duration::from_millis(at_ms),
+                TransportEvent::Dtmf { who, key },
+            ));
+        }
+        self
+    }
+
+    /// The transport says that keys the session presses reach the far
+    /// end in the way `how`, and keeps what it is given for them.
+    #[must_use]
+    pub const fn pressing(mut self, how: KeysOut) -> Self {
+        self.caps.keys = Some(how);
         self
     }
 
@@ -404,6 +448,7 @@ impl FakeTransport {
                 },
             }),
             text: true,
+            keys: None,
         })
     }
 
@@ -452,7 +497,9 @@ impl FakeTransport {
                     }
                 }
                 TransportEvent::Attached => self.line = Line::There,
-                TransportEvent::Audio { .. } | TransportEvent::Text { .. }
+                TransportEvent::Audio { .. }
+                | TransportEvent::Text { .. }
+                | TransportEvent::Dtmf { .. }
                     if self.line == Line::Gone =>
                 {
                     continue;
@@ -619,8 +666,14 @@ impl Transport for FakeTransport {
             return Ok(());
         }
         let now = Instant::now();
-        let TransportControl::Clear { tag } = control;
         let when = now.saturating_duration_since(self.start);
+        let tag = match control {
+            TransportControl::Clear { tag } => tag,
+            TransportControl::Dtmf { key } => {
+                self.log().pressed.push((when, key));
+                return Ok(());
+            }
+        };
         self.log().cleared.push((when, tag));
         if self.remote_buffer().clearable
             && let Some(playing) = &mut self.playing
@@ -633,6 +686,24 @@ impl Transport for FakeTransport {
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
+        Ok(())
+    }
+
+    fn try_send_tone(&mut self, tone: ToneOut<'_>) -> Result<(), Full> {
+        if self.line == Line::Closed {
+            self.log().after_close += 1;
+            return Ok(());
+        }
+        let sent = SentTone {
+            when: Instant::now().saturating_duration_since(self.start),
+            length: tone.length,
+            payload: Bytes::copy_from_slice(tone.payload),
+        };
+        let gone = self.line == Line::Gone;
+        let mut log = self.log();
+        // Sent into a line that is gone, nobody hears it.
+        log.unheard += usize::from(gone);
+        log.tones.push(sent);
         Ok(())
     }
 

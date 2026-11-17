@@ -8,7 +8,7 @@
 
 use waveport_alloc_counter::{CountingAllocator, is_installed, measure};
 use waveport_domain::event::{
-    ControlInput, Event, Finish, OpEvent, OverlapVerdict, TimerId, ToolEvent, VadEdge,
+    ControlInput, Event, Finish, Key, OpEvent, OverlapVerdict, TimerId, ToolEvent, VadEdge,
 };
 use waveport_domain::ids::{Epoch, GenId, OpTag, ParticipantId, Prob, Seq, ToolCallId, TurnId};
 use waveport_domain::kernel::Kernel;
@@ -237,6 +237,30 @@ fn the_frequent_steps_do_not_touch_the_heap() {
     let view = session.kernel.view();
     assert!(view.is_live(tag));
     assert_eq!(view.turns().count(), 1);
+}
+
+#[test]
+fn keys_that_go_on_with_a_run_do_not_touch_the_heap() {
+    assert!(is_installed(), "nothing would be counted");
+    let mut session = warm();
+    let key = |key| Event::Key { who: ANA, key };
+    // The first key of a run begins a turn, and takes the room its run
+    // may need. It may use the heap, as whatever begins something may.
+    session.step(3_400, key(Key::Four));
+    let turn = TurnId(3);
+    assert!(session.kernel.view().turns().any(|open| open.keys));
+    // The keys that follow do not, up to the last a run has room for,
+    // and neither does a timer of the run that fires before its time.
+    let early = Event::Timer(TimerId::Keys(turn));
+    for n in 1..31_u64 {
+        let event = key(Key::ALL[usize::try_from(n % 10).unwrap()]);
+        session.quiet_step("a key that goes on with a run", 3_400 + 100 * n, &event);
+        session.quiet_step("a timer of keys before its time", 3_450 + 100 * n, &early);
+    }
+    let open: Vec<_> = session.kernel.view().turns().collect();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].turn, turn);
+    assert!(session.out.facts.is_empty(), "the run is still under way");
 }
 
 #[test]

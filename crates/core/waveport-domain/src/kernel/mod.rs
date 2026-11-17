@@ -209,6 +209,11 @@ impl State {
                 }
                 self.saw_turn(turn);
             }
+            Fact::KeysCommitted { turn, who, keys } => {
+                self.conversation.push_keys(turn, who, text.get(keys));
+                self.owed = Some((self.conversation.version(), LlmCause::Reply { turn }));
+                self.saw_turn(turn);
+            }
             Fact::TurnDismissed { turn, .. } => self.saw_turn(turn),
             Fact::NoticeAppended { kind, text: note } => {
                 self.conversation.push_notice(kind, text.get(note));
@@ -734,6 +739,7 @@ impl Snapshot {
                     text,
                     addressed,
                 } => conversation.push_user_turn(turn, who, text, addressed),
+                ItemView::Keys { turn, who, keys } => conversation.push_keys(turn, who, keys),
                 ItemView::Utterance {
                     generation,
                     agent,

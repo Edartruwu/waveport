@@ -51,6 +51,9 @@ pub(super) struct OpenTurn {
     /// Why the turn will be dismissed instead of committed, once speech
     /// over the agent's has been judged not to ask for the floor.
     pub(super) aside: Option<Dismissal>,
+    /// Whether the turn is keys that were pressed, and not speech. Its
+    /// text is then the keys, as they are written.
+    pub(super) keyed: bool,
 }
 
 impl OpenTurn {
@@ -70,6 +73,18 @@ impl OpenTurn {
             heard_through: None,
             overlap: None,
             aside: None,
+            keyed: false,
+        }
+    }
+
+    /// A turn that begins with a key. Nobody speaks in it, and it waits
+    /// for no words: it is over when its keys are.
+    pub(super) fn keys(id: TurnId, who: ParticipantId, now: MonoTime) -> Self {
+        Self {
+            speaking: false,
+            heard_through: Some(MediaTime::ZERO),
+            keyed: true,
+            ..Self::begin(id, who, MediaTime::ZERO, now)
         }
     }
 

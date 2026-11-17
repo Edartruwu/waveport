@@ -7,8 +7,11 @@
 //!
 //! The rules that keep that possible:
 //!
-//! - A record says which version of the format it was written in
-//!   ([`VERSION`]). A reader refuses a version above its own.
+//! - A record says which version of the format it was written in: the
+//!   first that has everything the record holds ([`Fact::since`]), and not
+//!   the newest its writer knows. A reader refuses a version above its own
+//!   ([`VERSION`]). So a build that is rolled back reads every record it
+//!   could have written, and refuses only what it would misread.
 //! - A field may be added to a fact without a new version, if a reader
 //!   that does not know it can leave it out. Readers skip fields they do
 //!   not know.
@@ -20,6 +23,12 @@
 //! rebuilt from there and the records before it forgotten. The same rules
 //! hold for it, and it says its version as a record does.
 //!
+//! The versions there are:
+//!
+//! 1. The format of phase 1.
+//! 2. Keys of a telephone: the fact `keys_committed`, and the item `keys`
+//!    of a state.
+//!
 //! The types here hold plain numbers and text. What the numbers mean is
 //! the session kernel's business, and this crate does not depend on it:
 //! the runtime turns a kernel fact into a record and back, and a kernel
@@ -29,8 +38,8 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-/// The version of the format this build writes.
-pub const VERSION: u32 = 1;
+/// The newest version of the format this build reads and writes.
+pub const VERSION: u32 = 2;
 
 /// One record: a fact and where it stands in the session's journal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +101,18 @@ pub enum Fact<'a> {
         text: Cow<'a, str>,
         /// Whether it was meant for the agent.
         addressed: bool,
+    },
+    /// Keys of a telephone that a user pressed one after the other entered
+    /// the conversation, and are owed a reply. Since version 2.
+    KeysCommitted {
+        /// The turn.
+        turn: u32,
+        /// Who pressed them.
+        who: u16,
+        /// The keys as they are written, in the order they were pressed:
+        /// digits, `*`, `#` and `A` to `D`.
+        #[serde(borrow)]
+        keys: Cow<'a, str>,
     },
     /// A user turn ended without entering the conversation.
     TurnDismissed {
@@ -187,6 +208,18 @@ pub enum Fact<'a> {
         /// The agent.
         agent: u8,
     },
+}
+
+impl Fact<'_> {
+    /// The first version of the format that has this fact, which is the
+    /// version a record of it is written in.
+    #[must_use]
+    pub const fn since(&self) -> u32 {
+        match self {
+            Self::KeysCommitted { .. } => 2,
+            _ => 1,
+        }
+    }
 }
 
 /// A session's state as of one of its facts: everything the facts up to
@@ -285,6 +318,19 @@ pub struct OpenBatch {
     pub ran: bool,
 }
 
+impl State<'_> {
+    /// The first version of the format that has everything this state
+    /// holds, which is the version it is written in.
+    #[must_use]
+    pub fn since(&self) -> u32 {
+        let keys = self
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Keys { .. }));
+        if keys { 2 } else { 1 }
+    }
+}
+
 /// One item of a conversation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -300,6 +346,16 @@ pub enum Item<'a> {
         text: Cow<'a, str>,
         /// Whether it was meant for the agent.
         addressed: bool,
+    },
+    /// Keys of a telephone that a user pressed. Since version 2.
+    Keys {
+        /// The turn.
+        turn: u32,
+        /// Who pressed them.
+        who: u16,
+        /// The keys as they are written.
+        #[serde(borrow)]
+        keys: Cow<'a, str>,
     },
     /// What an agent said, as far as it was heard.
     Utterance {
@@ -491,7 +547,7 @@ mod tests {
         // The format is a promise to builds that are not written yet. A
         // change here is a change to that promise.
         let turn = Record {
-            v: VERSION,
+            v: 1,
             seq: 7,
             fact: Fact::TurnCommitted {
                 turn: 2,
@@ -507,7 +563,7 @@ mod tests {
         );
 
         let running = Record {
-            v: VERSION,
+            v: 1,
             seq: 1,
             fact: Fact::LifecycleChanged {
                 to: Lifecycle::Draining,
@@ -519,7 +575,7 @@ mod tests {
             r#"{"v":1,"seq":1,"fact":{"kind":"lifecycle_changed","to":"draining"}}"#
         );
         let closing = Record {
-            v: VERSION,
+            v: 1,
             seq: 2,
             fact: Fact::LifecycleChanged {
                 to: Lifecycle::Closing,
@@ -534,7 +590,7 @@ mod tests {
 
     fn state() -> State<'static> {
         State {
-            v: VERSION,
+            v: 1,
             upto: 17,
             heard_until: 96_000,
             epoch: 3,
@@ -664,6 +720,57 @@ mod tests {
         assert!(written.contains(r#""closed_for":"requested","front":0,"handoff":1,"#));
         assert!(!written.contains("owed") && !written.contains("speech"));
         assert_eq!(serde_json::from_str::<State<'_>>(&written).unwrap(), quiet);
+    }
+
+    #[test]
+    fn keys_are_written_in_the_version_that_has_them() {
+        assert_eq!(VERSION, 2);
+        let keys = Fact::KeysCommitted {
+            turn: 3,
+            who: 1,
+            keys: Cow::Borrowed("4071"),
+        };
+        assert_eq!(keys.since(), 2);
+        let record = Record {
+            v: keys.since(),
+            seq: 9,
+            fact: keys,
+        };
+        let text = written(&record);
+        assert_eq!(
+            text,
+            r#"{"v":2,"seq":9,"fact":{"kind":"keys_committed","turn":3,"who":1,"keys":"4071"}}"#
+        );
+        assert_eq!(serde_json::from_str::<Record<'_>>(&text).unwrap(), record);
+
+        // What version 1 had is written as version 1, so that the build
+        // before this one reads it.
+        let turn = Fact::TurnCommitted {
+            turn: 2,
+            who: 1,
+            span: [0, 0],
+            text: Cow::Borrowed("4071"),
+            addressed: true,
+        };
+        assert_eq!(turn.since(), 1);
+        assert_eq!(state().since(), 1);
+
+        // And so with a state: it is of version 2 once it holds keys.
+        let mut pressed = state();
+        pressed.items.push(Item::Keys {
+            turn: 3,
+            who: 1,
+            keys: Cow::Borrowed("4071"),
+        });
+        assert_eq!(pressed.since(), 2);
+        pressed.v = pressed.since();
+        let text = serde_json::to_string(&pressed).unwrap();
+        assert!(text.starts_with(r#"{"v":2,"#), "{text}");
+        assert!(
+            text.contains(r#"{"kind":"keys","turn":3,"who":1,"keys":"4071"}"#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<State<'_>>(&text).unwrap(), pressed);
     }
 
     #[test]
