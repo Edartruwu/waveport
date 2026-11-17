@@ -1057,6 +1057,10 @@ fn line(slip: Slip) -> (Line, LineFar) {
 
 impl Wire {
     fn tell_session(&mut self, event: TransportEvent) {
+        // What the far end lost is said at any time, by a line whose
+        // far end says so. No check waits for it, and none is put off
+        // by it.
+        self.events.push_back(TransportEvent::Loss { percent: 3 });
         self.events.push_back(event);
         if let Some(waker) = self.session.take() {
             waker.wake();

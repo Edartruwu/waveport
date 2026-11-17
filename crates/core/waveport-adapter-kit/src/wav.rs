@@ -168,7 +168,7 @@ mod tests {
                 samples
             })
         );
-        assert_eq!(read(&write(48_000, &[])).unwrap().samples, []);
+        assert_eq!(read(&write(48_000, &[])).unwrap().samples, [0_i16; 0]);
     }
 
     #[test]

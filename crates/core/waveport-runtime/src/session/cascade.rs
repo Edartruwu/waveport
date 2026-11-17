@@ -148,6 +148,11 @@ impl Cascade {
         self.voice.acked(tag, played);
     }
 
+    /// The far end says how much of what it was sent did not arrive.
+    pub(crate) fn lost(&mut self, percent: u8) {
+        self.voice.lost(percent);
+    }
+
     /// Moves on what hears the participants, and adds to `events` what
     /// the kernel is to be told. Returns whether anything changed that may
     /// have made more work.

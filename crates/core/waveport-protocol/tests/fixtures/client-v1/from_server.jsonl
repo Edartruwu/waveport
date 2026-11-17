@@ -3,6 +3,8 @@
 {"type":"welcome","v":1,"session":"0000000000000000000000000000002a","life":1,"resumed":false,"resume_token":"wpr1_madeup","features":["said"],"next_seq":1}
 {"type":"mark","run":3,"generation":5}
 {"type":"mark","run":3,"generation":5,"end":true}
+{"type":"mark","run":4,"generation":6,"ts":4294967295}
+{"type":"mark","run":4,"generation":6,"end":true,"ts":959}
 {"type":"clear","run":3}
 {"type":"fact","seq":1,"kind":"participant_joined","who":1}
 {"type":"fact","seq":2,"kind":"turn_committed","turn":1,"who":1,"text":"What time do you close on Sundays?","addressed":true}

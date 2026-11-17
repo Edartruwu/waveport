@@ -793,6 +793,8 @@ impl Far {
                 run,
                 generation,
                 end,
+                // It is where the audio is.
+                ts: None,
             };
             here.conn.send_text(wire::write(&mark)).await?;
         }
@@ -806,6 +808,8 @@ impl Far {
                 run,
                 generation,
                 end,
+                // It is where the audio is.
+                ts: None,
             };
             here.conn.send_text(wire::write(&mark)).await?;
         }

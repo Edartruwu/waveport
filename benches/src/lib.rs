@@ -17,6 +17,7 @@ pub mod journal;
 pub mod kernel;
 pub mod media;
 pub mod targets;
+pub mod webrtc;
 
 use waveport_sim::{Seed, SimRng};
 

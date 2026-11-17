@@ -25,6 +25,7 @@ waveport-runtime = { workspace = true }
 waveport-sim = { workspace = true }
 waveport-store-journal = { workspace = true }
 waveport-testkit = { workspace = true }
+waveport-transport-webrtc = { workspace = true }
 
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"] }
@@ -69,6 +70,11 @@ harness = false
 [[bench]]
 name = "ir_journal"
 path = "ir/journal.rs"
+harness = false
+
+[[bench]]
+name = "ir_webrtc"
+path = "ir/webrtc.rs"
 harness = false
 
 [lints]

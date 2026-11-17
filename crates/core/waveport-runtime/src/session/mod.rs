@@ -1111,6 +1111,9 @@ impl<P: Policies> Session<P> {
                     self.driver.packet(now, who, packet);
                 }
                 Some(TransportEvent::Played { tag, played }) => self.driver.acked(tag, played),
+                // What is sent from here on is made to survive it. The
+                // kernel is told nothing: nothing it decides changes.
+                Some(TransportEvent::Loss { percent }) => self.driver.lost(percent),
                 Some(TransportEvent::Dtmf { who, key }) => {
                     self.queue.push(Event::Key { who, key });
                 }

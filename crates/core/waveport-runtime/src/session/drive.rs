@@ -99,6 +99,15 @@ impl Driver {
         }
     }
 
+    /// The far end says how much of the audio it was sent did not
+    /// arrive.
+    pub(crate) fn lost(&mut self, percent: u8) {
+        match self {
+            Self::Cascade(parts) => parts.lost(percent),
+            Self::Text(_) => {}
+        }
+    }
+
     /// Moves on what takes in what the participants say, and adds to
     /// `events` what the kernel is to be told. Returns whether anything
     /// changed that may have made more work.

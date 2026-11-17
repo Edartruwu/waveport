@@ -136,6 +136,13 @@ pub enum TransportEvent {
         /// The key.
         key: Key,
     },
+    /// The far end says how much of the audio it was sent lately did
+    /// not arrive. It is said again and again, by a transport whose far
+    /// end says so, and by no other.
+    Loss {
+        /// How many packets in a hundred.
+        percent: u8,
+    },
     /// The connection dropped. It may come back.
     Detached,
     /// The connection is back.

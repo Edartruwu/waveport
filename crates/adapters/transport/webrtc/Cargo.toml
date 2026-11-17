@@ -1,0 +1,46 @@
+[package]
+name = "waveport-transport-webrtc"
+description = "Waveport adapter: a session whose far end is a browser on a WebRTC call."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "adapter"
+stability = "experimental"
+
+[lib]
+bench = false
+
+[dependencies]
+waveport-adapter-kit = { workspace = true }
+waveport-domain = { workspace = true }
+waveport-ports = { workspace = true }
+waveport-protocol = { workspace = true }
+
+aes = { workspace = true }
+aes-gcm = { workspace = true }
+bytes = { workspace = true }
+ctr = { workspace = true }
+dimpl = { workspace = true }
+getrandom = { workspace = true }
+hmac = { workspace = true }
+p256 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+str0m = { workspace = true }
+str0m-proto = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+x509-cert = { workspace = true }
+
+[dev-dependencies]
+waveport-testkit = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true

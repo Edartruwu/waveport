@@ -146,6 +146,67 @@ impl Default for OpusSettings {
     }
 }
 
+/// What an encoder is to expect of a line, from what the far end says
+/// it lost.
+///
+/// A far end says every second or so how much of what it was sent
+/// lately did not arrive. An encoder that is told to expect loss spends
+/// part of every packet on a copy of the one before, so it is told only
+/// when it is worth it, and not at every change:
+///
+/// - It expects the worst of the last four things it was told, so it is
+///   ready at the first sign of loss and stays ready until a line has
+///   been well for a while.
+/// - Less than two in a hundred is expected as none: a packet now and
+///   then is made up for well enough without a copy.
+/// - What it expects is rounded up to five in a hundred, and is no more
+///   than thirty, past which an encoder does nothing more.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LossWatch {
+    /// What the far end said last, the newest last.
+    said: [u8; 4],
+    expects: u8,
+}
+
+impl LossWatch {
+    /// Below this, in percent, no loss is expected.
+    const FROM: u8 = 2;
+    /// What is expected is a multiple of this.
+    const STEP: u8 = 5;
+    /// No more than this is expected.
+    const MOST: u8 = 30;
+
+    /// What an encoder is to expect now, in percent.
+    #[must_use]
+    pub const fn expects(&self) -> u8 {
+        self.expects
+    }
+
+    /// The far end says that `percent` of what it was sent lately did
+    /// not arrive. Returns what an encoder is to expect from here on,
+    /// when that is not what it expected before.
+    pub fn told(&mut self, percent: u8) -> Option<u8> {
+        self.said.rotate_left(1);
+        if let Some(newest) = self.said.last_mut() {
+            *newest = percent.min(100);
+        }
+        let worst = self.said.iter().copied().max().unwrap_or(0);
+        let expects = if worst < Self::FROM {
+            0
+        } else {
+            worst
+                .div_ceil(Self::STEP)
+                .saturating_mul(Self::STEP)
+                .min(Self::MOST)
+        };
+        if expects == self.expects {
+            return None;
+        }
+        self.expects = expects;
+        Some(expects)
+    }
+}
+
 /// Encodes one Opus stream of speech.
 pub struct OpusEncoder {
     inner: ::opus::Encoder,
@@ -181,6 +242,23 @@ impl OpusEncoder {
         self.rate
     }
 
+    /// Expects this share of packets to be lost from here on, in
+    /// percent, as [`OpusSettings::expected_loss`] says for an encoder
+    /// that is new: above 0 each packet carries a coarse copy of the one
+    /// before it, at the cost of some of its own quality.
+    ///
+    /// # Errors
+    ///
+    /// It is more than all of them.
+    pub fn expect_loss(&mut self, percent: u8) -> Result<(), CodecError> {
+        if percent > 100 {
+            return Err(CodecError::Settings);
+        }
+        let set = |done: ::opus::Result<()>| done.map_err(|_| CodecError::Settings);
+        set(self.inner.set_inband_fec(percent > 0))?;
+        set(self.inner.set_packet_loss_perc(i32::from(percent)))
+    }
+
     /// Encodes `pcm` as one packet at the start of `out`, and returns the
     /// packet's length. `pcm` must be 2.5, 5, 10, 20, 40 or 60 ms long.
     ///
@@ -206,7 +284,7 @@ impl fmt::Debug for OpusEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PACKET, OpusDecoder, OpusEncoder, OpusSettings};
+    use super::{LossWatch, MAX_PACKET, OpusDecoder, OpusEncoder, OpusSettings};
     use crate::codec::CodecError;
     use crate::rate::Rate;
     use crate::testing::{share_at, tone};
@@ -295,6 +373,80 @@ mod tests {
         assert_eq!(decoder.recover(&sent[11], &mut rebuilt), Ok(320));
         assert!(share_at(rate, 440.0, &rebuilt) > 0.5);
         assert_eq!(decoder.decode(&sent[11], &mut frame), Ok(320));
+    }
+
+    #[test]
+    fn an_encoder_that_is_told_of_loss_begins_to_send_copies_and_stops_when_told() {
+        let rate = Rate::Hz16000;
+        let mut encoder = OpusEncoder::new(rate, OpusSettings::default()).unwrap();
+        // A low tone and a high one, turn and turn about: what a frame
+        // holds cannot be guessed from the one before it.
+        let pitch = |frame: usize| {
+            if frame.is_multiple_of(2) {
+                440.0
+            } else {
+                1_320.0
+            }
+        };
+        let mut sent = Vec::new();
+        for at in 0..60 {
+            // A line that is well, one that loses a fifth, and one that
+            // is well again.
+            match at {
+                20 => encoder.expect_loss(20).unwrap(),
+                40 => encoder.expect_loss(0).unwrap(),
+                _ => {}
+            }
+            let mut packet = [0; MAX_PACKET];
+            let pcm = tone(rate, pitch(at), rate.frame());
+            let len = encoder.encode(&pcm, &mut packet).unwrap();
+            sent.push(packet[..len].to_vec());
+        }
+        assert_eq!(encoder.expect_loss(101), Err(CodecError::Settings));
+
+        // How much of what is rebuilt of a lost packet, from the one
+        // after it, is the tone the lost one held.
+        let rebuilt = |lost: usize| {
+            let mut decoder = OpusDecoder::new(rate).unwrap();
+            let mut frame = [0; 320];
+            for packet in &sent[..lost] {
+                decoder.decode(packet, &mut frame).unwrap();
+            }
+            let mut rebuilt = [0; 320];
+            assert_eq!(decoder.recover(&sent[lost + 1], &mut rebuilt), Ok(320));
+            share_at(rate, pitch(lost), &rebuilt)
+        };
+        // With a copy in the next packet much of it is that tone, for a
+        // copy is coarse. Without one a decoder makes something up from
+        // what it heard before, which was the other tone.
+        let (well, lossy, well_again) = (rebuilt(11), rebuilt(31), rebuilt(51));
+        assert!(lossy > 0.3, "{well} {lossy} {well_again}");
+        assert!(
+            well < 0.05 && well_again < 0.05,
+            "{well} {lossy} {well_again}"
+        );
+    }
+
+    #[test]
+    fn what_an_encoder_expects_follows_what_the_far_end_says_it_lost() {
+        let mut watch = LossWatch::default();
+        assert_eq!(watch.expects(), 0);
+        // A line that is well, and one that loses a packet now and then.
+        assert_eq!([0, 0, 1, 0, 1].map(|said| watch.told(said)), [None; 5]);
+        // The first sign of loss is acted on, rounded up.
+        assert_eq!(watch.told(2), Some(5));
+        assert_eq!(watch.told(7), Some(10));
+        assert_eq!(watch.told(10), None);
+        assert_eq!(watch.told(11), Some(15));
+        // It is expected for as long as the worst of the last four says.
+        assert_eq!([0, 0, 0].map(|said| watch.told(said)), [None; 3]);
+        assert_eq!(watch.expects(), 15);
+        assert_eq!(watch.told(0), Some(0));
+        assert_eq!(watch.told(0), None);
+        // No more is expected than an encoder does anything about.
+        assert_eq!(watch.told(64), Some(30));
+        assert_eq!(watch.told(255), None);
+        assert_eq!(watch.expects(), 30);
     }
 
     #[test]

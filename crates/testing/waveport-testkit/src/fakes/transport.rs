@@ -214,6 +214,17 @@ impl FakeTransportBuilder {
         self
     }
 
+    /// At `at_ms` the far end says that `percent` in a hundred of the
+    /// packets it was sent lately did not arrive.
+    #[must_use]
+    pub fn loses(mut self, at_ms: u64, percent: u8) -> Self {
+        self.events.push((
+            Duration::from_millis(at_ms),
+            TransportEvent::Loss { percent },
+        ));
+        self
+    }
+
     /// From `at_ms` on, `who` presses `keys` of their telephone, one
     /// every 200 ms. A character that is no key is not pressed.
     #[must_use]
@@ -500,6 +511,7 @@ impl FakeTransport {
                 TransportEvent::Audio { .. }
                 | TransportEvent::Text { .. }
                 | TransportEvent::Dtmf { .. }
+                | TransportEvent::Loss { .. }
                     if self.line == Line::Gone =>
                 {
                     continue;

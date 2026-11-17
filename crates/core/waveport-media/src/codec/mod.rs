@@ -344,6 +344,21 @@ impl Encoder {
         self.resampler.from()
     }
 
+    /// Expects this share of packets to be lost from here on, in
+    /// percent ([`OpusEncoder::expect_loss`]). A codec that has nothing
+    /// to do about loss takes it and does nothing.
+    ///
+    /// # Errors
+    ///
+    /// It is more than all of them.
+    pub fn expect_loss(&mut self, percent: u8) -> Result<(), CodecError> {
+        match &mut self.writes {
+            Writes::Opus(encoder) => encoder.expect_loss(percent),
+            Writes::G711(_) | Writes::Pcm if percent > 100 => Err(CodecError::Settings),
+            Writes::G711(_) | Writes::Pcm => Ok(()),
+        }
+    }
+
     /// The length of what a packet's timestamp counts, for a frame of
     /// `samples` samples given to [`encode`](Self::encode): how far the
     /// timestamp of the next packet is from this one's, in units of the
