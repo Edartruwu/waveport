@@ -230,6 +230,10 @@ pub struct Sim {
     /// Whether it says a mark back when the caller has been played
     /// everything before it, as a carrier does.
     by_itself: bool,
+    /// The marks it has to say back and has not yet.
+    owed: VecDeque<String>,
+    /// What it was sent and has not yet told whoever asks.
+    taken: Option<Sent>,
     complaints: Vec<String>,
 }
 
@@ -260,6 +264,8 @@ impl Sim {
             said: 0,
             held: VecDeque::new(),
             by_itself: true,
+            owed: VecDeque::new(),
+            taken: None,
             complaints: Vec::new(),
         })
     }
@@ -294,11 +300,21 @@ impl Sim {
         self.by_itself = false;
     }
 
-    /// Says a mark back that the caller has been played up to, unless
-    /// the test does that itself.
-    async fn reached(&mut self, name: &str) -> Result<(), PortError> {
+    /// The caller has been played up to the mark `name`, or it was
+    /// thrown away: it is to be said back, unless the test does that
+    /// itself.
+    fn reached(&mut self, name: String) {
         if self.by_itself {
-            self.echoes(name).await?;
+            self.owed.push_back(name);
+        }
+    }
+
+    /// Says back the marks that are owed. One that is being said when
+    /// whoever waits gives up is on its way, and the rest are said the
+    /// next time.
+    async fn settles(&mut self) -> Result<(), PortError> {
+        while let Some(name) = self.owed.pop_front() {
+            self.echoes(&name).await?;
         }
         Ok(())
     }
@@ -428,11 +444,21 @@ impl Sim {
     /// before it is said back at once. `None` when the server has closed
     /// the stream, which is how a session ends a call.
     ///
+    /// Whoever gives up waiting for this loses nothing: a message is
+    /// taken whole or not at all.
+    ///
     /// # Errors
     ///
     /// The connection dropped.
     pub async fn next(&mut self) -> Result<Option<Sent>, PortError> {
         loop {
+            // What a message owes is said back before the message is
+            // told of: whoever gave up waiting while that was done
+            // finds it here.
+            self.settles().await?;
+            if let Some(sent) = self.taken.take() {
+                return Ok(Some(sent));
+            }
             let Some(conn) = self.conn.as_mut() else {
                 return Ok(None);
             };
@@ -456,19 +482,19 @@ impl Sim {
             };
             match &sent {
                 Sent::Audio(audio) => self.held.push_back(Held::Audio(audio.clone())),
-                Sent::Mark(name) if self.held.is_empty() => self.reached(&name.clone()).await?,
+                Sent::Mark(name) if self.held.is_empty() => self.reached(name.clone()),
                 Sent::Mark(name) => self.held.push_back(Held::Mark(name.clone())),
                 Sent::Clear => {
                     // Everything goes, and every mark that goes is said
                     // back.
                     for held in core::mem::take(&mut self.held) {
                         if let Held::Mark(name) = held {
-                            self.reached(&name).await?;
+                            self.reached(name);
                         }
                     }
                 }
             }
-            return Ok(Some(sent));
+            self.taken = Some(sent);
         }
     }
 
@@ -516,7 +542,7 @@ impl Sim {
         let mut played = Vec::new();
         loop {
             match self.held.pop_front() {
-                Some(Held::Mark(name)) => self.reached(&name).await?,
+                Some(Held::Mark(name)) => self.reached(name),
                 Some(Held::Audio(mut audio)) if left > 0 => {
                     let now = audio.split_to(left.min(audio.len()));
                     left -= now.len();
@@ -527,11 +553,13 @@ impl Sim {
                 }
                 Some(audio) => {
                     self.held.push_front(audio);
-                    return Ok(played.into());
+                    break;
                 }
-                None => return Ok(played.into()),
+                None => break,
             }
         }
+        self.settles().await?;
+        Ok(played.into())
     }
 
     /// How many samples it holds that the caller has not been played.

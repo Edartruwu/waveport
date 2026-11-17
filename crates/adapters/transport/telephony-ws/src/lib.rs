@@ -188,6 +188,22 @@ impl Carrier {
         }
     }
 
+    /// Which call a carrier asks about, as the form it posts says it.
+    /// `None` for a form that names no call.
+    #[must_use]
+    pub fn asks_about(self, form: &[(String, String)]) -> Option<AskedAbout<'_>> {
+        let field = |name: &str| {
+            let found = form.iter().find(|(known, _)| known == name);
+            found.map(|(_, value)| value.as_str())
+        };
+        match self {
+            Self::Twilio => Some(AskedAbout {
+                call: field("CallSid").filter(|call| !call.is_empty())?,
+                account: field("AccountSid"),
+            }),
+        }
+    }
+
     /// The header the carrier's signature is in, in lower case.
     #[must_use]
     pub const fn signed_in(self) -> &'static str {
@@ -225,6 +241,16 @@ impl fmt::Display for Carrier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// The call a carrier asks about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AskedAbout<'a> {
+    /// The carrier's name for the call, which its stream says again as
+    /// it begins ([`Started::call`]).
+    pub call: &'a str,
+    /// The account the call is of, where the carrier says.
+    pub account: Option<&'a str>,
 }
 
 /// What a carrier says as the audio of a call begins.
@@ -394,5 +420,30 @@ mod tests {
         }
         assert_eq!(Carrier::named("Twilio"), None);
         assert_eq!(Carrier::named(""), None);
+    }
+
+    #[test]
+    fn a_form_says_which_call_it_asks_about() {
+        let form = |fields: &[(&str, &str)]| -> Vec<(String, String)> {
+            let owned = |(name, value): &(&str, &str)| ((*name).to_owned(), (*value).to_owned());
+            fields.iter().map(owned).collect()
+        };
+        let whole = form(&[
+            ("To", "+15550101"),
+            ("CallSid", "CA1"),
+            ("AccountSid", "AC1"),
+        ]);
+        let about = Carrier::Twilio.asks_about(&whole).unwrap();
+        assert_eq!((about.call, about.account), ("CA1", Some("AC1")));
+        let bare = form(&[("CallSid", "CA1")]);
+        assert_eq!(Carrier::Twilio.asks_about(&bare).unwrap().account, None);
+        // A form that names no call asks about none.
+        for none in [
+            form(&[]),
+            form(&[("CallSid", "")]),
+            form(&[("callsid", "CA1")]),
+        ] {
+            assert_eq!(Carrier::Twilio.asks_about(&none), None);
+        }
     }
 }

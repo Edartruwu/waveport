@@ -114,11 +114,18 @@ pub fn unfinished(words: &[&str]) -> HttpAnswer {
     }
 }
 
-/// 400 ms of a tone at 24 kHz, as the synthesiser sends a piece of
-/// audio.
-fn tone() -> String {
-    let tone: Vec<i16> = (0..Rate::Hz24000.samples_in_millis(400))
-        .map(|n| if n % 48 < 24 { 3_000 } else { -3_000 })
+/// 400 ms of a tone of 500 Hz at `rate`, as the synthesiser sends a
+/// piece of audio.
+fn tone(rate: Rate) -> String {
+    let period = rate.samples_in_millis(2);
+    let tone: Vec<i16> = (0..rate.samples_in_millis(400))
+        .map(|n| {
+            if n % period < period / 2 {
+                3_000
+            } else {
+                -3_000
+            }
+        })
         .collect();
     let mut data = String::new();
     write_base64(&tone, &mut data);
@@ -147,7 +154,15 @@ const DONE: &str = "< {\"type\":\"done\",\"done\":true,\"status_code\":206,\
 /// given it, and does not wait for the rest.
 #[must_use]
 pub fn spoken() -> Vec<WsStep> {
-    let chunk = tone();
+    spoken_at(Rate::Hz24000)
+}
+
+/// [`spoken`] at `rate`. A synthesiser speaks at the rate it is asked
+/// for, and a script answers whatever it is asked: a session on a line
+/// of another rate than 24 kHz is given this one.
+#[must_use]
+pub fn spoken_at(rate: Rate) -> Vec<WsStep> {
+    let chunk = tone(rate);
     let first = timed(
         "\"It\",\"is\",\"ten\",\"past\",\"three.\"",
         "0.0,0.1,0.2,0.4,0.6",
@@ -176,9 +191,15 @@ pub fn spoken() -> Vec<WsStep> {
 /// with where the two words are.
 #[must_use]
 pub fn greeted() -> Vec<WsStep> {
+    greeted_at(Rate::Hz24000)
+}
+
+/// [`greeted`] at `rate`, as [`spoken_at`] is [`spoken`] at it.
+#[must_use]
+pub fn greeted_at(rate: Rate) -> Vec<WsStep> {
     let script = [
         "> \"transcript\":\"Good morning.",
-        &tone(),
+        &tone(rate),
         &timed("\"Good\",\"morning.\"", "0.0,0.2", "0.2,0.4"),
         "> \"continue\":false",
         DONE,
@@ -189,7 +210,12 @@ pub fn greeted() -> Vec<WsStep> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GREETING, HEARD, SAID, answer_text, greeted, spoken, unfinished};
+    use waveport_ports::audio::Rate;
+
+    use super::{
+        GREETING, HEARD, SAID, answer_text, greeted, greeted_at, spoken, spoken_at, tone,
+        unfinished,
+    };
     use crate::servers::{End, HttpAnswer, WsStep};
 
     #[test]
@@ -234,6 +260,28 @@ mod tests {
         assert!(WsStep::script(HEARD).len() >= 3);
         assert_eq!(spoken().len(), 9);
         assert_eq!(greeted().len(), 5);
+    }
+
+    #[test]
+    fn a_voice_is_at_the_rate_it_is_asked_for() {
+        // 400 ms of samples of two bytes, written in base64.
+        let written = |rate: Rate| {
+            let piece = tone(rate);
+            let (_, data) = piece.split_once("\"data\":\"").unwrap();
+            data.split_once('"').unwrap().0.len()
+        };
+        assert_eq!(written(Rate::Hz24000), (9_600_usize * 2).div_ceil(3) * 4);
+        assert_eq!(written(Rate::Hz8000), (3_200_usize * 2).div_ceil(3) * 4);
+        assert_eq!(written(Rate::Hz48000), (19_200_usize * 2).div_ceil(3) * 4);
+        // The voice there was before is the one at 24 kHz, and one at
+        // another rate says the same in as many steps.
+        let same = |one: &[WsStep], other: &[WsStep]| format!("{one:?}") == format!("{other:?}");
+        assert!(same(&spoken(), &spoken_at(Rate::Hz24000)));
+        assert!(same(&greeted(), &greeted_at(Rate::Hz24000)));
+        assert!(!same(&spoken(), &spoken_at(Rate::Hz8000)));
+        assert!(!same(&greeted(), &greeted_at(Rate::Hz8000)));
+        assert_eq!(spoken_at(Rate::Hz8000).len(), spoken().len());
+        assert_eq!(greeted_at(Rate::Hz8000).len(), greeted().len());
     }
 
     #[test]

@@ -143,6 +143,15 @@ impl Tickets {
         (ticket.until > Instant::now()).then_some(ticket.session)
     }
 
+    /// Whether a token that was made for `session` is still good and
+    /// was not used.
+    pub(crate) fn waits_for(&self, session: SessionId) -> bool {
+        let now = Instant::now();
+        let held = self.held();
+        held.values()
+            .any(|ticket| ticket.session == session && ticket.until > now)
+    }
+
     /// Lets go of every token that was made for `session`.
     pub(crate) fn revoke(&self, session: SessionId) {
         self.held().retain(|_, ticket| ticket.session != session);
@@ -293,6 +302,26 @@ mod tests {
         let revoked = tickets.mint(b, Duration::from_secs(60)).unwrap();
         tickets.revoke(b);
         assert_eq!(tickets.redeem_for_its_session(&revoked), None);
+    }
+
+    #[test]
+    fn a_session_is_waited_for_while_a_token_of_its_own_is_good_and_unused() {
+        let tickets = Tickets::default();
+        let (a, b) = (SessionId(1), SessionId(2));
+        assert!(!tickets.waits_for(a));
+        let for_a = tickets.mint(a, Duration::from_secs(60)).unwrap();
+        assert!(tickets.waits_for(a));
+        assert!(!tickets.waits_for(b), "the token is another session's");
+        // Used, it is waited for no more.
+        assert_eq!(tickets.redeem_for_its_session(&for_a), Some(a));
+        assert!(!tickets.waits_for(a));
+        // One that nobody came for in time is none, and neither is one
+        // that was taken back.
+        let _late = tickets.mint(a, Duration::ZERO).unwrap();
+        assert!(!tickets.waits_for(a));
+        let _revoked = tickets.mint(b, Duration::from_secs(60)).unwrap();
+        tickets.revoke(b);
+        assert!(!tickets.waits_for(b));
     }
 
     #[test]

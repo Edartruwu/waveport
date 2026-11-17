@@ -26,7 +26,7 @@ use crate::{Served, answer, desk};
 const PACKET: usize = 960;
 
 /// Where the models that listen are.
-fn assets() -> PathBuf {
+pub(crate) fn assets() -> PathBuf {
     std::env::var_os("WAVEPORT_ASSETS").map_or_else(
         || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/assets"),
         PathBuf::from,
@@ -57,19 +57,19 @@ fn config(stt: &WsServer, llm: &HttpServer, tts: &WsServer) -> String {
 
 /// What a client heard of a call.
 #[derive(Debug, Default)]
-struct Call {
-    facts: Vec<Fact>,
+pub(crate) struct Call {
+    pub(crate) facts: Vec<Fact>,
     /// How many of the samples it decoded were of a voice.
-    loud: usize,
+    pub(crate) loud: usize,
     /// How many runs of audio began, and how many ended.
-    runs: (usize, usize),
-    reason: Option<ByeReason>,
+    pub(crate) runs: (usize, usize),
+    pub(crate) reason: Option<ByeReason>,
 }
 
 /// Says `speech` to the agent, a packet every 20 ms, and then nothing,
 /// for as long as the call lasts. What the agent says is decoded, and
 /// said to have been played as it arrives.
-async fn talks(client: &mut Client, speech: &[i16]) -> Call {
+pub(crate) async fn talks(client: &mut Client, speech: &[i16]) -> Call {
     let mut encoder = OpusEncoder::new(Rate::Hz48000, OpusSettings::default()).unwrap();
     let mut decoder = OpusDecoder::new(Rate::Hz48000).unwrap();
     let mut frames = speech.chunks(PACKET);
