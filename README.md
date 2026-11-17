@@ -6,7 +6,7 @@ Waveport is an open-source platform for real-time voice and multimodal AI agents
 
 **Foundations, the first measurements, the session kernel, the audio path, the ports, the runtime, an agent to talk to, with a choice of providers, a journal that outlasts its process, and a session that says what it did and is held to what it may cost.** The repository holds the workspace, the quality gates, the test and benchmark harnesses, and the first product code. The session kernel decides who has the floor, what the agent says and how much of it was heard, which tool calls run and what became of each, and what a session is after its process died. The audio path turns the packets of a transport into audio in order and the audio of speech synthesis into frames handed over at the pace they are heard, and knows how much of a response has been heard. Both are libraries with no I/O. The ports are the traits that a provider, a transport, a store or a tool implements, each with a statement of what it can do, and a planner that decides from those statements how a session is run and names what it will do less well. The runtime runs sessions: each is one task on a thread it never leaves, which drives the kernel and the audio path through the ports, keeps a journal and goes on from it after its process has died, while the models that listen are shared by all sessions. Behind the ports there is every part a voice agent needs, and for some a choice: the two models that listen for speech and for the end of a turn, speech recognition by OpenAI, Deepgram or AssemblyAI, any language model behind an OpenAI-compatible API, speech synthesis by Cartesia or ElevenLabs, and for a transport the microphone and loudspeaker of the machine or a WebSocket. The `waveport` command puts them together into an agent you can talk to, at the machine it runs on or from another terminal. It keeps its calls in a journal in a file: a call whose process was killed is gone on with by the next one, with `--resume last`.
 
-Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel is the second: it passes the six scenarios written before it, and its invariants are checked on random sessions and on every path through small ones. The audio path is the third: Opus and G.711, the change of rate, a reorder buffer, pacing and the playout ledger, with no allocation per frame. The ports are the fourth, with the plumbing adapters share: a stream helper, WebSocket and HTTP clients and a parser for server-sent events. The runtime is the fifth: shards, the session actor and the compute plane, tried every night on ten thousand sessions made up from seeds, with parts that fail, lines that lose packets and processes that die. The first voice loop is the sixth: the listening models, the first three providers, the local-audio transport and the `waveport` command, with a whole call run from a script on every platform against servers that stand in for the providers. The seventh adds three providers (Deepgram and AssemblyAI to hear, ElevenLabs to speak), a transport whose far end connects over a WebSocket, with its client, and a workflow that runs the tests against the providers themselves every night. All six adapters have been tried against their providers, the four that were written from documentation on 16 November 2026, which changed two of them (the [architecture](docs/architecture.md), section 8.5). The eighth is the journal on disk: one file, one sync for everything that is stored together, a session's state kept beside its records, and a resume token that is the right to go on with a call. It is tried on a disk that loses its power in the middle of a commit, and the command itself is killed at six places in a call and has to go on with it. The ninth is what a session tells and what it is held to: traces and metrics for a collector, a report of each call, and gates on how long the parts of a turn take, what a session holds in memory and how much of a thread it takes. With that the code of phase 1 is written. **Phase 1 is not done until its exit criteria have been shown**, and one thing still waits for a person: talking to the agent. One target of the design is not met: a session that listens holds 528 to 586 KB, above the 300 KB asked of the usual one (the [architecture](docs/architecture.md), section 12, says why and what the choice is).
+Phase 1 of the [roadmap](ROADMAP.md) is under way. Its first step, a throwaway [density spike](docs/decisions/0001-density-spike.md), chose the inference backend and the allocator and measured what one voice session costs. The kernel is the second: it passes the six scenarios written before it, and its invariants are checked on random sessions and on every path through small ones. The audio path is the third: Opus and G.711, the change of rate, a reorder buffer, pacing and the playout ledger, with no allocation per frame. The ports are the fourth, with the plumbing adapters share: a stream helper, WebSocket and HTTP clients and a parser for server-sent events. The runtime is the fifth: shards, the session actor and the compute plane, tried every night on ten thousand sessions made up from seeds, with parts that fail, lines that lose packets and processes that die. The first voice loop is the sixth: the listening models, the first three providers, the local-audio transport and the `waveport` command, with a whole call run from a script on every platform against servers that stand in for the providers. The seventh adds three providers (Deepgram and AssemblyAI to hear, ElevenLabs to speak), a transport whose far end connects over a WebSocket, with its client, and a workflow that runs the tests against the providers themselves every night. All six adapters have been tried against their providers, the four that were written from documentation on 16 November 2026, which changed two of them (the [architecture](docs/architecture.md), section 8.5). The eighth is the journal on disk: one file, one sync for everything that is stored together, a session's state kept beside its records, and a resume token that is the right to go on with a call. It is tried on a disk that loses its power in the middle of a commit, and the command itself is killed at six places in a call and has to go on with it. The ninth is what a session tells and what it is held to: traces and metrics for a collector, a report of each call, and gates on how long the parts of a turn take, what a session holds in memory and how much of a thread it takes. With that the code of phase 1 is written. **Phase 1 is not done until its exit criteria have been shown**, and one thing still waits for a person: talking to the agent. One target of the design is not met: a session that listens holds 528 to 586 KB, above the 300 KB asked of the usual one (the [architecture](docs/architecture.md), section 12, says why and what the choice is). Phase 2, which makes the agent reachable from a browser, a phone and a text client, has started: an agent can be written to as well as spoken to, and the `waveportd` daemon runs the agents of a file and serves sessions of text over HTTP ([below](#running-the-daemon)).
 
 ## Documents
 
@@ -45,6 +45,7 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/adapters/store/journal` | A journal in a file on this machine, from which a session goes on after its process died |
 | `apps/waveport-assembly` | What an agent is made of, as one definition, and a session put together from it. Whatever runs agents does it here |
 | `apps/waveport-cli` | The `waveport` command: an agent defined on a command line, at this machine's sound devices, over a WebSocket or in writing |
+| `apps/waveportd` | The `waveportd` daemon: agents defined in a file, and sessions of them for whoever asks over HTTP |
 | `crates/testing/waveport-sim` | Deterministic simulation: seeded runs with a virtual clock |
 | `crates/testing/waveport-kernel-sim` | The session kernel under test: scenarios explored along every path, random sessions, every path through small sessions, and recorded sessions replayed, with the invariants checked at every step |
 | `crates/testing/waveport-alloc-counter` | Counting allocator, to prove a code path does not allocate |
@@ -88,6 +89,7 @@ The command prints what it heard, what the agent said and how long the first sou
 | `waveport serve` | The same agent for callers who are somewhere else: it takes calls over a WebSocket, at `127.0.0.1:9283` unless `--listen` says otherwise, as many at a time as come. Nothing asks a caller who they are, so it takes calls from other machines only with `--exposed` |
 | `waveport client` | Calls an agent that `waveport serve` runs, from this machine's microphone and loudspeaker or from a script |
 | `waveport chat` | The same agent in writing, at the terminal: it needs the language model alone. What it writes is shown as it is written, and a line typed while it writes stops it there. Lines from a file or another command are said one at a time, each when the one before is answered |
+| `waveport calls` | Lists the calls that broke off and are kept, for `--resume` |
 | `waveport devices` | Lists the sound devices, for `--microphone` and `--loudspeaker` |
 
 `--stt openai|deepgram|assemblyai` and `--tts cartesia|elevenlabs` say who hears and who speaks. Each provider brings its own model, voice and the name of the variable that holds its key (`DEEPGRAM_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`):
@@ -109,6 +111,59 @@ cargo run --release -p waveport-cli -- dev --resume last
 ```
 
 The agent then knows what was said before, is told that something was lost, and gives the answer it still owed. To see it, kill the command in the middle of an answer (`kill -9`, not Ctrl-C, which ends the call) and run the line above. A call that ended is taken out of the file; one that broke off stays there until it has been gone on with to its end, and deleting the file lets go of them all. `--journal <file>` keeps the calls somewhere else and `--no-journal` keeps none. A call over a WebSocket cannot be gone on with yet.
+
+## Running the daemon
+
+`waveportd` runs the agents a file defines and is asked for sessions over HTTP. So far a session of the daemon is one of text: it is written to and followed, and nothing carries audio to it yet.
+
+```toml
+# waveportd.toml
+listen = "127.0.0.1:7070"
+
+[journal]
+file = "sessions.redb"          # without one, sessions are kept in memory
+
+[agents.front-desk]
+instructions = "You answer for a bakery, briefly."
+greeting = "Good morning. What can I do for you?"
+```
+
+```sh
+export OPENAI_API_KEY=…
+cargo run --release -p waveportd -- --config waveportd.toml
+```
+
+An application makes a session and is given a token for the session's far end. The far end connects with it, is told what the session does as server-sent events, and types:
+
+```sh
+curl -s -X POST localhost:7070/v1/sessions \
+  -H 'Content-Type: application/json' -d '{"agent":"front-desk"}'
+# {"session":"…","client_token":"wpc1_…","connect_within_ms":60000}
+
+curl -N "localhost:7070/v1/sessions/$SESSION/events?features=said" \
+  -H "Authorization: Bearer $CLIENT_TOKEN"
+# event: welcome
+# data: {"type":"welcome","v":1,"session":"…","life":1,"resumed":false,"resume_token":"wpr1_…",…}
+
+curl -s -X POST "localhost:7070/v1/sessions/$SESSION/input" \
+  -H "Authorization: Bearer $RESUME_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"type":"text","text":"Are you open on Sundays?"}'
+```
+
+The stream is the server's half of client protocol v1 (the [architecture](docs/architecture.md), sections 8.6 and 8.7). A stream that was cut is come back to with the resume token and the `id` of the last event (`Last-Event-ID`), and the client is sent what it missed. That holds across daemons too: stop this one (Ctrl-C lets an answer end first; `kill -9` does not), start it again, and connect as before. The session goes on, in its next life, and the client is told what it has come to.
+
+A daemon that listens on this machine alone asks for no key, and still refuses a page from elsewhere. One that listens anywhere else needs a control key, which the file names and never holds:
+
+```toml
+listen = "0.0.0.0:7070"
+hosts = ["voice.example"]                  # the names it is reached by
+allowed_origins = ["https://app.example"]  # the pages that may ask from a browser
+
+[control]
+key_env = ["WAVEPORTD_KEY"]                # the environment variable that holds the key
+```
+
+It serves HTTP without TLS, and is to stand behind something that ends TLS. `waveportd --config <file> --check` reads a file and says what is wrong with it.
 
 ## Licence
 

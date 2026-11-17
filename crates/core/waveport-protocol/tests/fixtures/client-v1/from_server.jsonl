@@ -1,5 +1,6 @@
 {"type":"welcome","v":1,"session":"0000000000000000000000000000002a","life":1,"resumed":false,"resume_token":"wpr1_madeup","audio":{"codec":"pcm16","rate":24000},"features":["said","hearing"],"next_seq":1,"grace_ms":30000}
 {"type":"welcome","v":1,"session":"0000000000000000000000000000002a","life":3,"resumed":true,"next_seq":42,"grace_ms":30000}
+{"type":"welcome","v":1,"session":"0000000000000000000000000000002a","life":1,"resumed":false,"resume_token":"wpr1_madeup","features":["said"],"next_seq":1}
 {"type":"mark","run":3,"generation":5}
 {"type":"mark","run":3,"generation":5,"end":true}
 {"type":"clear","run":3}

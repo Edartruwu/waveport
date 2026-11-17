@@ -12,6 +12,13 @@
 //! later version is not opened. The count is how the journal tells, after
 //! a commit failed, whether the file has it all the same.
 //!
+//! A fifth table, `labels`, has what whoever keeps sessions here wants
+//! kept with a session, such as which agent it is a session of. The
+//! journal does not read it. The table came after the others, without a
+//! new version of the layout: a file from before has none and gets one
+//! when it is next written to, and a build from before leaves the table
+//! alone.
+//!
 //! Numbers are written little-endian. Every row a later build might want
 //! to change begins with a byte that says how it is written.
 
@@ -33,6 +40,10 @@ pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta")
 pub(crate) const HEADS: TableDefinition<u128, &[u8]> = TableDefinition::new("heads");
 pub(crate) const BATCHES: TableDefinition<(u128, u64), &[u8]> = TableDefinition::new("batches");
 pub(crate) const STATES: TableDefinition<u128, &[u8]> = TableDefinition::new("snapshots");
+pub(crate) const LABELS: TableDefinition<u128, &[u8]> = TableDefinition::new("labels");
+
+/// How many bytes a label may have.
+pub(crate) const LABEL_MOST: usize = 1024;
 
 /// How a head is written: the only way there is so far.
 const HEAD_V1: u8 = 1;

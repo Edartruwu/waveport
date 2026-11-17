@@ -8,9 +8,10 @@
 //! such a thing, and nothing prints a token.
 
 use core::time::Duration;
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use waveport_ports::journal::{Journal, SessionId};
@@ -56,10 +57,21 @@ struct InFile {
     last: PathBuf,
 }
 
+/// What is held, where sessions are kept in memory, of a session that
+/// somebody is to come back to: the hash of its token, and its label.
+#[derive(Default)]
+struct Held {
+    token: Option<[u8; 32]>,
+    label: Option<String>,
+}
+
 /// Where sessions are kept.
 pub struct Kept {
     journal: Arc<dyn Journal>,
     file: Option<InFile>,
+    /// What a journal in a file would hold beside the records, where
+    /// there is none.
+    held: Mutex<BTreeMap<SessionId, Held>>,
 }
 
 /// The file that holds the token of the call last begun with the journal
@@ -168,6 +180,7 @@ impl Kept {
                         last: last_of(&path),
                         path,
                     }),
+                    held: Mutex::default(),
                 };
                 Ok((kept, Vec::new()))
             }
@@ -196,7 +209,91 @@ impl Kept {
         Self {
             journal: Arc::new(MemoryJournal::new()),
             file: None,
+            held: Mutex::default(),
         }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<SessionId, Held>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A token for whoever is to come back to the session `id`, in
+    /// place of the one before: the far end of a session, whose line
+    /// may drop. Where sessions are kept in a file it also lets the
+    /// session be gone on with by the process after this one. Where
+    /// they are kept in memory it is good for as long as this process.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be written to, or the operating system gave no
+    /// entropy.
+    pub async fn credential(&self, id: SessionId) -> Result<ResumeToken, Failure> {
+        if let Some(token) = self.issue(id).await? {
+            return Ok(token);
+        }
+        let token = ResumeToken::new(id).with(|| "no token could be made".to_owned())?;
+        self.held().entry(id).or_default().token = Some(token.hash());
+        Ok(token)
+    }
+
+    /// Whether `token` is the one that was last made for its session,
+    /// here or by a process before this one.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read.
+    pub async fn admits(&self, token: &ResumeToken) -> Result<bool, Failure> {
+        if self.file.is_some() {
+            return Ok(self.admit(token).await?.is_some());
+        }
+        let held = self.held();
+        let hash = held.get(&token.session()).and_then(|held| held.token);
+        Ok(hash.is_some_and(|hash| token.is(&hash)))
+    }
+
+    /// Keeps `label` with the session `id`: what whoever goes on with
+    /// the session has to know of it, such as which agent it is a
+    /// session of.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be written to, or the label is longer than a
+    /// label may be.
+    pub async fn label(&self, id: SessionId, label: &str) -> Result<(), Failure> {
+        let Some(file) = &self.file else {
+            self.held().entry(id).or_default().label = Some(label.to_owned());
+            return Ok(());
+        };
+        file.journal
+            .label(id, label.as_bytes())
+            .await
+            .with(|| format!("{} cannot be written to", file.path.display()))
+    }
+
+    /// The sessions that are kept, each with its label if it has one:
+    /// the ones that run, and the ones that broke off and can be gone on
+    /// with.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read.
+    pub async fn labelled(&self) -> Result<Vec<(SessionId, Option<String>)>, Failure> {
+        let Some(file) = &self.file else {
+            let held = self.held();
+            return Ok(held
+                .iter()
+                .map(|(id, held)| (*id, held.label.clone()))
+                .collect());
+        };
+        let kept = file
+            .journal
+            .labelled()
+            .await
+            .with(|| format!("{} cannot be read", file.path.display()))?;
+        Ok(kept
+            .into_iter()
+            .map(|(id, label)| (id, label.and_then(|label| String::from_utf8(label).ok())))
+            .collect())
     }
 
     /// The journal, for a session to write to.
@@ -342,6 +439,7 @@ impl Kept {
     /// the one that [`Resume::Last`] finds either way.
     pub async fn forget(&self, id: SessionId) -> Result<(), Failure> {
         let Some(file) = &self.file else {
+            self.held().remove(&id);
             return Ok(());
         };
         let forgotten = file.journal.forget(id).await.map_err(|error| {
@@ -407,6 +505,56 @@ mod tests {
             Path::new(".waveport/journal.last")
         );
         assert_eq!(last_of(Path::new("calls")), Path::new("calls.last"));
+    }
+
+    #[tokio::test]
+    async fn whoever_is_to_come_back_has_a_token_wherever_sessions_are_kept() {
+        let folder = folder("credentials");
+        let journal = folder.join("calls.redb");
+        let memory = Kept::open(&Keeps::Memory, &SAID, &Halt::Nowhere, false)
+            .unwrap()
+            .0;
+        for kept in [kept_in(&journal), memory] {
+            let (a, b) = (SessionId(0xA), SessionId(0xB));
+            let first = kept.credential(a).await.unwrap();
+            assert_eq!(first.session(), a);
+            assert!(kept.admits(&first).await.unwrap());
+            // A new one takes the place of the one before, and a token
+            // is good for its own session alone.
+            let second = kept.credential(a).await.unwrap();
+            assert!(!kept.admits(&first).await.unwrap());
+            assert!(kept.admits(&second).await.unwrap());
+            let other = kept.credential(b).await.unwrap();
+            assert!(kept.admits(&other).await.unwrap());
+            let forged = format!("wpr1_{:032x}{}", a.0, "0".repeat(32));
+            assert!(!kept.admits(&forged.parse().unwrap()).await.unwrap());
+
+            // What is kept with a session says what it is a session of.
+            kept.label(a, "front-desk").await.unwrap();
+            assert_eq!(
+                kept.labelled().await.unwrap(),
+                [(a, Some("front-desk".to_owned())), (b, None)]
+            );
+            // A session that is over is let go of, with all of it.
+            kept.forget(a).await.unwrap();
+            assert!(!kept.admits(&second).await.unwrap());
+            assert_eq!(kept.labelled().await.unwrap(), [(b, None)]);
+        }
+
+        // In a file, both are there for the process after this one.
+        let kept = kept_in(&journal);
+        let token = kept.credential(SessionId(0xC)).await.unwrap();
+        kept.label(SessionId(0xC), "night-desk").await.unwrap();
+        drop(kept);
+        let kept = kept_in(&journal);
+        assert!(kept.admits(&token).await.unwrap());
+        assert_eq!(
+            kept.labelled().await.unwrap(),
+            [
+                (SessionId(0xB), None),
+                (SessionId(0xC), Some("night-desk".to_owned()))
+            ]
+        );
     }
 
     #[tokio::test]

@@ -30,11 +30,16 @@ pub struct ResumeToken {
 
 impl ResumeToken {
     /// A new token for `session`, from the operating system's entropy.
+    /// A journal in a file makes its own ([`LocalJournal::issue`]):
+    /// this is for whoever keeps sessions where there is no such
+    /// journal, and holds the hash itself.
+    ///
+    /// [`LocalJournal::issue`]: crate::LocalJournal::issue
     ///
     /// # Errors
     ///
     /// The operating system gave no entropy.
-    pub(crate) fn new(session: SessionId) -> Result<Self, PortError> {
+    pub fn new(session: SessionId) -> Result<Self, PortError> {
         let mut secret = [0; 16];
         getrandom::fill(&mut secret).map_err(|error| {
             PortError::transient(format!("the operating system gave no entropy: {error}"))
@@ -48,8 +53,17 @@ impl ResumeToken {
         self.session
     }
 
-    /// What a journal keeps of the token.
-    pub(crate) fn hash(&self) -> [u8; 32] {
+    /// Whether `hash` is the hash of this token, found out in the same
+    /// time whether it is or not.
+    #[must_use]
+    pub fn is(&self, hash: &[u8; 32]) -> bool {
+        same(&self.hash(), hash)
+    }
+
+    /// What is kept of the token by whoever is to know it again: from
+    /// this the token cannot be had.
+    #[must_use]
+    pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(DOMAIN);
         hasher.update(self.session.0.to_be_bytes());

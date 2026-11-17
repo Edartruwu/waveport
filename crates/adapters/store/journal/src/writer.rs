@@ -36,8 +36,8 @@ use waveport_ports::error::PortError;
 use waveport_ports::journal::{Batch, JournalError, Lease, Recovered, Seq, SessionId, Snapshot};
 
 use crate::layout::{
-    BATCHES, COMMITS_KEY, FORMAT, FORMAT_KEY, HEADS, Head, META, STATES, batch_len, read_batch,
-    unreadable, write_batch,
+    BATCHES, COMMITS_KEY, FORMAT, FORMAT_KEY, HEADS, Head, LABEL_MOST, LABELS, META, STATES,
+    batch_len, read_batch, unreadable, write_batch,
 };
 use crate::token::same;
 use crate::{JournalStats, OpenError, Probe, Seen};
@@ -82,10 +82,22 @@ pub(crate) enum Request {
     },
     /// The sessions the journal holds anything of.
     Sessions { reply: Reply<Vec<SessionId>> },
+    /// Keeps `label` with the session, in place of the one before.
+    Label {
+        session: SessionId,
+        label: Vec<u8>,
+        reply: Reply<()>,
+    },
+    /// The sessions the journal holds anything of, each with its label.
+    Labelled { reply: Reply<Vec<Labelled>> },
     /// Someone is held up by what was asked: commit without waiting for
     /// more.
     Hurry,
 }
+
+/// A session the journal holds something of, and the label that is kept
+/// with it, if one is.
+pub type Labelled = (SessionId, Option<Vec<u8>>);
 
 /// A request that has been worked out, and the answer it gets if its
 /// group is committed.
@@ -95,6 +107,7 @@ enum Answer {
     Done(Reply<()>, Result<(), JournalError>),
     Admitted(Reply<bool>, Result<bool, JournalError>),
     Sessions(Reply<Vec<SessionId>>, Result<Vec<SessionId>, JournalError>),
+    Labelled(Reply<Vec<Labelled>>, Result<Vec<Labelled>, JournalError>),
 }
 
 impl Answer {
@@ -106,6 +119,7 @@ impl Answer {
             Self::Done(reply, answer) => drop(reply.send(answer)),
             Self::Admitted(reply, answer) => drop(reply.send(answer)),
             Self::Sessions(reply, answer) => drop(reply.send(answer)),
+            Self::Labelled(reply, answer) => drop(reply.send(answer)),
         }
     }
 
@@ -118,6 +132,7 @@ impl Answer {
             Self::Done(reply, _) => drop(reply.send(Err(failed()))),
             Self::Admitted(reply, _) => drop(reply.send(Err(failed()))),
             Self::Sessions(reply, _) => drop(reply.send(Err(failed()))),
+            Self::Labelled(reply, _) => drop(reply.send(Err(failed()))),
         }
     }
 }
@@ -132,11 +147,13 @@ impl Request {
             Self::Append { reply, .. } => drop(reply.send(Err(failed()))),
             Self::Snapshot { reply, .. }
             | Self::Issue { reply, .. }
-            | Self::Forget { reply, .. } => {
+            | Self::Forget { reply, .. }
+            | Self::Label { reply, .. } => {
                 drop(reply.send(Err(failed())));
             }
             Self::Admit { reply, .. } => drop(reply.send(Err(failed()))),
             Self::Sessions { reply } => drop(reply.send(Err(failed()))),
+            Self::Labelled { reply } => drop(reply.send(Err(failed()))),
             Self::Hurry => {}
         }
     }
@@ -187,6 +204,7 @@ struct Tables<'txn> {
     heads: Table<'txn, u128, &'static [u8]>,
     batches: Table<'txn, (u128, u64), &'static [u8]>,
     states: Table<'txn, u128, &'static [u8]>,
+    labels: Table<'txn, u128, &'static [u8]>,
     /// Whether anything was written.
     wrote: bool,
     /// The records that were written, for a probe, if there is one.
@@ -202,6 +220,7 @@ impl<'txn> Tables<'txn> {
             heads: txn.open_table(HEADS).map_err(broke)?,
             batches: txn.open_table(BATCHES).map_err(broke)?,
             states: txn.open_table(STATES).map_err(broke)?,
+            labels: txn.open_table(LABELS).map_err(broke)?,
             wrote: false,
             records: watched.then(Vec::new),
             stored: 0,
@@ -379,9 +398,36 @@ impl<'txn> Tables<'txn> {
         Ok(held.is_some_and(|held| same(&held, hash)))
     }
 
+    fn label(&mut self, session: SessionId, label: &[u8]) -> Result<(), Stop> {
+        if label.len() > LABEL_MOST {
+            return refused(JournalError::Store(PortError::permanent(format!(
+                "a label of {} bytes is longer than the {LABEL_MOST} a session is kept with",
+                label.len()
+            ))));
+        }
+        let _ = self.labels.insert(session.0, label)?;
+        self.wrote = true;
+        Ok(())
+    }
+
+    fn labelled(&self) -> Result<Vec<Labelled>, Stop> {
+        let mut sessions = Vec::new();
+        for row in self.heads.iter()? {
+            let (session, _) = row?;
+            let session = session.value();
+            let label = self
+                .labels
+                .get(session)?
+                .map(|label| label.value().to_vec());
+            sessions.push((SessionId(session), label));
+        }
+        Ok(sessions)
+    }
+
     fn forget(&mut self, session: SessionId) -> Result<(), Stop> {
         let mut held = self.heads.remove(session.0)?.is_some();
         held |= self.states.remove(session.0)?.is_some();
+        held |= self.labels.remove(session.0)?.is_some();
         let all = (session.0, 0)..=(session.0, u64::MAX);
         self.batches.retain_in(all, |_, _| {
             held = true;
@@ -457,6 +503,10 @@ impl<'txn> Tables<'txn> {
             }
             Request::Forget { session, .. } => settle(self.forget(*session)).map(Outcome::Done),
             Request::Sessions { .. } => settle(self.sessions()).map(Outcome::Sessions),
+            Request::Label { session, label, .. } => {
+                settle(self.label(*session, label)).map(Outcome::Done)
+            }
+            Request::Labelled { .. } => settle(self.labelled()).map(Outcome::Labelled),
             Request::Hurry => return Ok(None),
         };
         let worked = match answer {
@@ -473,9 +523,13 @@ impl<'txn> Tables<'txn> {
             (
                 Request::Snapshot { reply, .. }
                 | Request::Issue { reply, .. }
-                | Request::Forget { reply, .. },
+                | Request::Forget { reply, .. }
+                | Request::Label { reply, .. },
                 Outcome::Done(answer),
             ) => Some(Answer::Done(reply, answer)),
+            (Request::Labelled { reply }, Outcome::Labelled(answer)) => {
+                Some(Answer::Labelled(reply, answer))
+            }
             (Request::Admit { reply, .. }, Outcome::Admitted(answer)) => {
                 Some(Answer::Admitted(reply, answer))
             }
@@ -496,6 +550,7 @@ enum Outcome {
     Done(Result<(), JournalError>),
     Admitted(Result<bool, JournalError>),
     Sessions(Result<Vec<SessionId>, JournalError>),
+    Labelled(Result<Vec<Labelled>, JournalError>),
 }
 
 /// What a group did in the tables.

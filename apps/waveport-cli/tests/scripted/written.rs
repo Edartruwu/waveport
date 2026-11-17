@@ -13,14 +13,14 @@
 
 use core::time::Duration;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use waveport_testkit::servers::HttpServer;
 
-use super::{ANSWER, answer, desk, ended, lines_of};
+use super::{ANSWER, answer, desk, ended, lines_of, waveport_at};
 
 /// The command in a chat, what is typed to it and what it has said.
 struct Chatting {
@@ -236,6 +236,18 @@ async fn a_chat_that_broke_off_is_gone_on_with() {
     ])
     .await;
     let desk = desk();
+    // What is kept, as the command lists it.
+    let kept = |desk: PathBuf| async move {
+        let listed = waveport_at(&desk, &["calls"]).await;
+        assert_eq!(listed.status.code(), Some(0), "{listed:?}");
+        let listed = String::from_utf8(listed.stdout).unwrap();
+        listed.lines().map(str::to_owned).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kept(desk.clone()).await,
+        ["no call is kept: there is no .waveport/journal.redb"]
+    );
+    assert!(!desk.join(".waveport").exists());
     // The command dies as `kill -9` kills it, once its journal has the
     // answer.
     let stored = "after:utterance_committed";
@@ -245,6 +257,14 @@ async fn a_chat_that_broke_off_is_gone_on_with() {
     first.tells(&format!("halted: {stored}")).await;
     first.child.kill().unwrap();
     first.child.wait().unwrap();
+    // The chat is there to go on with, by its name.
+    let listed = kept(desk.clone()).await;
+    assert_eq!(
+        listed[0],
+        "1 call that broke off is kept in .waveport/journal.redb"
+    );
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(listed[1].len() == 32 && listed[1].bytes().all(|byte| byte.is_ascii_hexdigit()));
 
     let mut second = Chatting::start(&desk, &llm, &["--resume", "last"]);
     second.types("what is my name");
@@ -284,6 +304,10 @@ async fn a_chat_that_broke_off_is_gone_on_with() {
     );
 
     // A chat that is over is not there to go on with.
+    assert_eq!(
+        kept(desk.clone()).await,
+        ["no call is kept in .waveport/journal.redb"]
+    );
     let mut third = Chatting::start(&desk, &llm, &["--resume", "last"]);
     third.stops_typing();
     assert_eq!(third.ended().await, Some(1), "{}", third.all());

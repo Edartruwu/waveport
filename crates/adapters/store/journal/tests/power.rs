@@ -415,6 +415,15 @@ struct Known {
     asked_state: Option<u64>,
     /// Whether the session was being taken over in that commit.
     asked_lease: bool,
+    /// The label the journal said was kept with the session, by the
+    /// round it was given in, and the one that was asked for.
+    label: Option<u64>,
+    asked_label: Option<u64>,
+}
+
+/// The label a session is given in a round.
+fn label_of(session: SessionId, round: u64) -> Vec<u8> {
+    format!("session {} in round {round}", session.0).into_bytes()
 }
 
 fn state_of(session: SessionId, upto: u64) -> Bytes {
@@ -457,6 +466,8 @@ async fn power_goes(seed: u64, mut rng: SimRng) -> Result<Cut, String> {
             asked_next: 1,
             asked_state: None,
             asked_lease: false,
+            label: None,
+            asked_label: None,
         });
     }
     // The token the journal last said it had issued, and whether one
@@ -494,6 +505,7 @@ async fn power_goes(seed: u64, mut rng: SimRng) -> Result<Cut, String> {
             knows.asked_next = knows.next;
             knows.asked_state = knows.state;
             knows.asked_lease = false;
+            knows.asked_label = knows.label;
             let session = knows.session;
             match rng.range(0..8) {
                 // Most of the time, records.
@@ -518,6 +530,12 @@ async fn power_goes(seed: u64, mut rng: SimRng) -> Result<Cut, String> {
                 6 => {
                     knows.asked_lease = true;
                     asked.push(Asked::Owner(journal.acquire(session)));
+                }
+                // Another label.
+                7 => {
+                    knows.asked_label = Some(round);
+                    let kept = journal.label(session, &label_of(session, round));
+                    asked.push(Asked::Label(Box::pin(kept)));
                 }
                 _ => asked.push(Asked::Nothing),
             }
@@ -567,6 +585,11 @@ async fn power_goes(seed: u64, mut rng: SimRng) -> Result<Cut, String> {
                     Err(JournalError::Store(_)) => dead = true,
                     Err(refused) => return Err(format!("an owner was refused: {refused}")),
                 },
+                Asked::Label(kept) => match soon(kept).await {
+                    Ok(()) => knows.label = knows.asked_label,
+                    Err(JournalError::Store(_)) => dead = true,
+                    Err(refused) => return Err(format!("a label was refused: {refused}")),
+                },
                 Asked::Nothing => {}
             }
         }
@@ -585,16 +608,36 @@ async fn power_goes(seed: u64, mut rng: SimRng) -> Result<Cut, String> {
     };
     // The commit that was cut short is there whole or not at all: every
     // session of it says the same.
+    let labelled = soon(journal.labelled())
+        .await
+        .map_err(|error| format!("the labels cannot be read: {error}"))?;
     let mut whole: Option<bool> = None;
     for knows in &known {
         let session = knows.session;
+        // The label that is kept with it is one it was given, whole.
+        let label = labelled.iter().find(|(labelled, _)| *labelled == session);
+        let label = label.and_then(|(_, label)| label.clone());
+        let label_of = |round: Option<u64>| round.map(|round| label_of(session, round));
+        let label_as_before = label == label_of(knows.label);
+        let label_as_asked = label == label_of(knows.asked_label);
+        check(
+            label_as_before || label_as_asked,
+            format!(
+                "session {} has the label {label:?}: it had that of round {:?}, and asked for \
+                 that of round {:?}",
+                session.0, knows.label, knows.asked_label
+            ),
+        )?;
         let found = soon(journal.acquire(session))
             .await
             .map_err(|error| format!("session {} cannot be taken: {error}", session.0))?;
         let next = found.next.get();
         let state = found.snapshot.as_ref().map(|state| state.upto.get());
-        let asked =
-            knows.asked_next != knows.next || knows.asked_state != knows.state || knows.asked_lease;
+        let asked_label = knows.asked_label != knows.label;
+        let asked = knows.asked_next != knows.next
+            || knows.asked_state != knows.state
+            || knows.asked_lease
+            || asked_label;
         let as_before = next == knows.next && state == knows.state;
         let as_asked = next == knows.asked_next && state == knows.asked_state;
         check(
@@ -615,6 +658,8 @@ async fn power_goes(seed: u64, mut rng: SimRng) -> Result<Cut, String> {
         if asked {
             let took = if knows.asked_lease {
                 lease_as_asked
+            } else if asked_label {
+                label_as_asked
             } else {
                 as_asked && !as_before
             };
@@ -709,6 +754,7 @@ enum Asked<'a> {
             Result<waveport_ports::journal::Recovered, JournalError>,
         >,
     ),
+    Label(waveport_ports::error::BoxFuture<'a, Result<(), JournalError>>),
     Nothing,
 }
 

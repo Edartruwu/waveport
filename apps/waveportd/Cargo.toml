@@ -1,0 +1,51 @@
+[package]
+name = "waveportd"
+description = "Waveport daemon: agents that are reached over HTTP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.waveport]
+layer = "composition"
+stability = "experimental"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "waveportd"
+path = "src/main.rs"
+bench = false
+
+[dependencies]
+waveport-assembly = { workspace = true }
+waveport-domain = { workspace = true }
+waveport-ports = { workspace = true }
+waveport-protocol = { workspace = true }
+
+axum = { workspace = true }
+clap = { workspace = true, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+futures-util = { workspace = true }
+getrandom = { workspace = true }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["service", "tokio"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+waveport-testkit = { workspace = true }
+
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
+
+[[test]]
+name = "served"
+path = "tests/served/main.rs"
+
+[lints]
+workspace = true

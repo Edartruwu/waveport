@@ -227,6 +227,13 @@ mod tests {
         ) -> Result<core::pin::Pin<Box<dyn EventRx>>, ControlError> {
             Err(ControlError::NoSuchSession)
         }
+
+        fn subscribe_from_state(
+            &self,
+            _session: SessionId,
+        ) -> Result<core::pin::Pin<Box<dyn EventRx>>, ControlError> {
+            Err(ControlError::NoSuchSession)
+        }
     }
 
     fn request(session: u128, tool: u16) -> ToolRequest<'static> {

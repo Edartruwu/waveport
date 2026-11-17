@@ -33,7 +33,8 @@
 //!
 //! These are three things. [`FromClient::Interrupt`] stops the agent and
 //! the session goes on. A connection that drops leaves the session
-//! waiting, for as long as the welcome's `grace_ms` says: a client that
+//! waiting, for as long as the welcome's `grace_ms` says, or for as
+//! long as it takes where the welcome names no time: a client that
 //! comes back says so in its hello ([`Resume`]) and is told what it
 //! missed. [`FromClient::Bye`] ends the session.
 //!
@@ -326,8 +327,11 @@ pub enum FromServer {
         /// seen it.
         next_seq: u64,
         /// How long the session waits for a client whose connection
-        /// dropped, in milliseconds.
-        grace_ms: u32,
+        /// dropped, in milliseconds, before it ends. Left out where a
+        /// session does not end for that: one that is followed and
+        /// written to, and is on no line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grace_ms: Option<u32>,
     },
     /// Where the audio of one response begins, or that all of it has
     /// been sent.
