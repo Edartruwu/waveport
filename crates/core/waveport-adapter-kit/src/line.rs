@@ -7,7 +7,9 @@
 //! them by.
 //!
 //! What the far end sends is audio that is cut wherever its messages
-//! end. [`Inbound`] cuts it into the packets a session takes.
+//! end. [`Inbound`] cuts it into the packets a session takes. A far end
+//! that sends Opus sends a packet a message, and [`OpusInbound`] numbers
+//! and places those.
 
 use std::collections::VecDeque;
 
@@ -94,6 +96,13 @@ impl Runs {
         if self.open == Some(number) {
             self.open = None;
         }
+    }
+
+    /// The far end is one that holds nothing of what was sent, as one
+    /// that came back on another connection: the audio that follows has
+    /// to say whose it is, whatever was said last.
+    pub const fn begin_anew(&mut self) {
+        self.open = None;
     }
 
     /// How many responses are remembered.
@@ -222,6 +231,101 @@ impl Inbound {
     }
 }
 
+/// The rate the place of an Opus packet is counted at, whatever rate
+/// its audio was made from.
+const OPUS_CLOCK: u64 = 48_000;
+
+/// The most samples one Opus packet may hold: 120 ms.
+const OPUS_AT_MOST: u32 = 5_760;
+
+/// How many samples an Opus packet holds, at 48 kHz, as its first bytes
+/// say (RFC 6716, section 3.1). `None` for what is no packet.
+#[must_use]
+pub fn opus_samples(packet: &[u8]) -> Option<u32> {
+    let (&toc, rest) = packet.split_first()?;
+    let config = toc >> 3;
+    // The length of a frame, by how the packet was made: 10 to 60 ms of
+    // SILK, 10 or 20 ms of both, 2.5 to 20 ms of CELT.
+    let frame = match config {
+        0..=11 => match config % 4 {
+            0 => 480,
+            1 => 960,
+            2 => 1_920,
+            _ => 2_880,
+        },
+        12..=15 => {
+            if config % 2 == 0 {
+                480
+            } else {
+                960
+            }
+        }
+        _ => match config % 4 {
+            0 => 120,
+            1 => 240,
+            2 => 480,
+            _ => 960,
+        },
+    };
+    let frames = match toc & 0b11 {
+        0 => 1,
+        1 | 2 => 2,
+        // As many as the next byte says.
+        _ => u32::from(rest.first()? & 0b11_1111),
+    };
+    let samples = frame * frames;
+    (frames > 0 && samples <= OPUS_AT_MOST).then_some(samples)
+}
+
+/// A far end's Opus, a packet a message: each is numbered, and placed
+/// where its first sample is in the stream.
+#[derive(Debug, Default)]
+pub struct OpusInbound {
+    sequence: u16,
+    /// How many samples came before the next packet, at 48 kHz.
+    position: u64,
+    /// When the first packet arrived.
+    began: Option<Instant>,
+}
+
+impl OpusInbound {
+    /// Takes a packet, which arrived at `now`.
+    ///
+    /// A far end that stopped sending for more than a second is heard
+    /// from when it goes on, as with [`Inbound`].
+    ///
+    /// # Errors
+    ///
+    /// The message is no Opus packet.
+    pub fn take(&mut self, packet: Bytes, now: Instant) -> Result<Packet, &'static str> {
+        let Some(samples) = opus_samples(&packet) else {
+            return Err("a message of audio has to hold one Opus packet");
+        };
+        let samples = u64::from(samples);
+        let began = *self.began.get_or_insert(now);
+        let since = now.saturating_duration_since(began);
+        let due = u64::try_from(since.as_micros() * u128::from(OPUS_CLOCK) / 1_000_000)
+            .unwrap_or(u64::MAX);
+        if due > self.position + samples + OPUS_CLOCK {
+            self.position = due.saturating_sub(samples);
+        }
+        let sequence = self.sequence;
+        // Both wrap round, as the port has them.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the place in a stream wraps round"
+        )]
+        let timestamp = self.position as u32;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.position += samples;
+        Ok(Packet {
+            sequence,
+            timestamp,
+            payload: packet,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
@@ -230,7 +334,9 @@ mod tests {
     use waveport_domain::ids::{Epoch, GenId, OpTag};
     use waveport_ports::audio::Rate;
 
-    use super::{Inbound, MOST_RUNS, Packet, Runs};
+    use bytes::Bytes;
+
+    use super::{Inbound, MOST_RUNS, OpusInbound, Packet, Runs, opus_samples};
 
     fn tag(generation: u32) -> OpTag {
         OpTag {
@@ -341,6 +447,90 @@ mod tests {
             placed(&inbound.next_packet().unwrap()),
             (1, 5 * 8_000 - 160, 160)
         );
+    }
+
+    #[test]
+    fn an_opus_packet_says_how_long_it_is() {
+        // How a packet was made is in the top five bits of its first
+        // byte, and how many frames it holds in the bottom two.
+        for (packet, samples) in [
+            // One frame: 10 and 60 ms of SILK, 20 ms of both, 2.5 and
+            // 20 ms of CELT.
+            (&[0x00][..], Some(480)),
+            (&[0x18], Some(2_880)),
+            (&[0x78], Some(960)),
+            (&[0x80], Some(120)),
+            (&[0xF8, 1, 2, 3], Some(960)),
+            // Two frames, of one length or of two.
+            (&[0xF9], Some(1_920)),
+            (&[0xFA], Some(1_920)),
+            // As many as the second byte says, whose top bits say other
+            // things.
+            (&[0xFB, 0x03], Some(2_880)),
+            (&[0xFB, 0xC6], Some(5_760)),
+            // More than a packet may hold, none at all, and a count that
+            // is not there.
+            (&[0xFB, 0x07], None),
+            (&[0x1B, 0x03], None),
+            (&[0xFB, 0x00], None),
+            (&[0xFB], None),
+            (&[], None),
+        ] {
+            assert_eq!(opus_samples(packet), samples, "{packet:02X?}");
+        }
+    }
+
+    #[test]
+    fn opus_packets_are_numbered_and_placed_by_what_they_hold() {
+        let mut inbound = OpusInbound::default();
+        let start = Instant::now();
+        let twenty = Bytes::from_static(&[0xF8, 9, 9]);
+        let ten = Bytes::from_static(&[0xF0]);
+        let first = inbound.take(twenty.clone(), start).unwrap();
+        assert_eq!(placed(&first), (0, 0, 3));
+        assert_eq!(first.payload, twenty);
+        // The next is placed after what the one before it held.
+        assert_eq!(
+            placed(&inbound.take(ten.clone(), start).unwrap()),
+            (1, 960, 1)
+        );
+        assert_eq!(
+            placed(&inbound.take(twenty.clone(), start).unwrap()),
+            (2, 1_440, 3)
+        );
+        // What is no packet is refused, and counts for nothing.
+        assert!(inbound.take(Bytes::new(), start).is_err());
+        assert!(inbound.take(Bytes::from_static(&[0xFB]), start).is_err());
+        // A far end that is a little late is not taken to have paused.
+        let late = start + Duration::from_millis(900);
+        assert_eq!(
+            placed(&inbound.take(twenty.clone(), late).unwrap()),
+            (3, 2_400, 3)
+        );
+        // One that paused is heard when it goes on: five seconds in.
+        let later = start + Duration::from_secs(5);
+        assert_eq!(
+            placed(&inbound.take(twenty, later).unwrap()),
+            (4, 5 * 48_000 - 960, 3)
+        );
+        assert_eq!(
+            placed(&inbound.take(ten, later).unwrap()),
+            (5, 5 * 48_000, 1)
+        );
+    }
+
+    #[test]
+    fn a_far_end_that_came_back_is_told_again_whose_audio_follows() {
+        let mut runs = Runs::default();
+        let number = runs.of(tag(1)).number;
+        assert!(runs.begins(number));
+        assert!(!runs.begins(number));
+        runs.begin_anew();
+        // It is the same response under the same number, and is said to
+        // begin once more.
+        assert_eq!(runs.of(tag(1)).number, number);
+        assert!(runs.begins(number));
+        assert!(!runs.begins(number));
     }
 
     #[test]

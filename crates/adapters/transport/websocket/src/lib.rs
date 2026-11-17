@@ -4,58 +4,97 @@
 //!
 //! The transport of a session that runs in one process and is talked to
 //! from another: a command at a developer's desk, a page in a browser, a
-//! test that kills the server in the middle of a call. A [`Listener`]
-//! takes connections, each connection that says hello becomes a
-//! [`Caller`], and a caller becomes the [`WsTransport`] of one session.
-//! [`Client`] is the other side.
+//! test that kills the server in the middle of a call. It speaks client
+//! protocol v1 ([`waveport_protocol::client::v1`]), which says what
+//! every message means. This page says how the protocol is carried
+//! here, and what a server does with this crate.
 //!
-//! **This is not the protocol clients will be promised.** It is version
-//! zero, it changes without notice, and it carries no key: a listener
-//! takes only an address of this machine unless it is told otherwise.
+//! # On the wire
 //!
-//! # The protocol
+//! A client connects to `/v1/client` and names the subprotocol
+//! `waveport.client.v1`. A text message holds one message of the
+//! protocol as JSON. A binary message holds audio, as the client's
+//! `hello` said it would be written, the same both ways:
 //!
-//! A client connects to `/v0/session` and names the protocol
-//! `waveport.ws.v0`. Text messages hold one JSON object each, and binary
-//! messages hold audio: one channel of 16-bit samples, the low byte
-//! first, at the rate the client named.
+//! | `audio.codec` | A binary message holds |
+//! |---|---|
+//! | `pcm16` | One channel of 16-bit samples, the low byte first, at `audio.rate`. From the client: any whole number of samples, up to a second. To the client: 20 ms |
+//! | `opus` | One Opus packet, of 120 ms at most. `audio.rate` is the rate the client plays and records at, and what it says it played is counted at that rate |
 //!
-//! | Who says it | Message | What it means |
-//! |---|---|---|
-//! | client | `{"type":"hello","rate":24000}` | The first message. The rate is 8,000, 16,000, 24,000 or 48,000, both ways |
-//! | server | `{"type":"ready","session":"…","rate":24000}` | The session is there |
-//! | client | binary | What the microphone heard, in pieces of any length up to a second |
-//! | server | `{"type":"mark","run":7}` | The audio that follows is that of response 7 |
-//! | server | binary | A piece of a response, 20 ms long, to be played after the piece before |
-//! | server | `{"type":"mark","run":7,"end":true}` | All of response 7 has been sent |
-//! | client | `{"type":"played","run":7,"samples":4800}` | How much of response 7 has been played so far |
-//! | server | `{"type":"clear","run":7}` | Discard what is held of response 7, and of any before it, and has not been played |
-//! | client | `{"type":"text","text":"…"}` | Something typed in place of speech |
-//! | server | `{"type":"event","text":"…"}` | A line about the call, for a person to read |
-//! | either | `{"type":"bye"}` | The call is over. A server gives a `reason` |
+//! A hello with no `audio` is a line of text: nothing binary is taken,
+//! and none is sent.
 //!
 //! What a client has to do for the session to know what was heard:
 //!
 //! - **Say what it played.** A session takes a response as heard up to
-//!   what the client says it played, and waits for the client to say that
-//!   it played all of it. A client says so as it plays, a few times a
-//!   second, and once more when a response has been played to its end.
+//!   what the client says it played (`played`), and waits for the client
+//!   to say that it played all of it. A client says so as it plays, a
+//!   few times a second, and once more when a run has been played to its
+//!   end.
 //! - **Discard at once.** After `clear` the client plays nothing more of
-//!   that response, and says how much of it had been played.
+//!   that run, and says how much of it had been played.
 //! - **Send its audio all the time,** silence too, at the pace it is
 //!   heard. A client that falls more than a second behind the clock is
 //!   taken to have paused: what it sends next is taken as heard when it
 //!   arrives.
 //!
-//! A connection that closes without a `bye` from the server means that
-//! the server is gone, not that the call is over.
+//! A message that cannot be taken is answered with an `error`, and the
+//! connection goes on. Of the protocol's messages one is not taken
+//! here: `played_rtp`, which is how a WebRTC call says what it played.
+//!
+//! # A connection that drops
+//!
+//! A connection that ends without a `bye` from either side has dropped.
+//! The session is not over: the transport tells it that the line is
+//! gone ([`TransportEvent::Detached`]), and the session decides how
+//! long to wait. The client comes back on a new connection and says
+//! where it was (`hello.resume`), and whoever serves it attaches it to
+//! the transport of its session, which tells the session that the line
+//! is back ([`TransportEvent::Attached`]). Run numbers go on from where
+//! they were, and the audio that follows says again whose it is.
+//!
+//! A client that is attached while another is still there takes its
+//! place: the one before is told `bye` with `replaced`.
+//!
+//! # For a server
+//!
+//! A [`Listener`] takes connections, and each connection that says hello
+//! becomes a [`Caller`]. A server that has an HTTP server of its own
+//! hands the upgraded connection to [`Caller::of`] instead. What the
+//! hello holds is the server's to judge ([`Caller::hello`]): this crate
+//! checks that a token looks like one, and never whether it is good.
+//!
+//! ```text
+//! let caller = listener.accept().await?.greet(GREETING_TIMEOUT).await?;
+//! let (transport, handle) = caller.transport(who);   // nobody is on it yet
+//! // ... start the session with the transport ...
+//! let link = handle.attach(caller, welcome).await?;   // the client is welcomed
+//! // ... and when it comes back on another connection:
+//! let link = handle.attach(caller_again, welcome).await?;
+//! ```
+//!
+//! The [`Link`] is the rest of the connection: what the client is told
+//! of the session (`fact`, `told`, `gap`, `state`), which whoever
+//! follows the session says through it, and what the client asks that
+//! is not the transport's to do (`interrupt`). When the session ends,
+//! the client is told `bye` once the link is let go of, so that what is
+//! told last, how the session ended, is told before the goodbye.
+//!
+//! [`Client`] is the other side, for a command and for tests.
+//!
+//! **A listener asks nobody who they are.** It takes only an address of
+//! this machine unless it is told otherwise.
+//!
+//! [`TransportEvent::Detached`]: waveport_ports::transport::TransportEvent::Detached
+//! [`TransportEvent::Attached`]: waveport_ports::transport::TransportEvent::Attached
 
 mod client;
 mod server;
 mod wire;
 
-pub use crate::client::{Client, Heard};
+pub use crate::client::{Client, Heard, Unconnected};
 pub use crate::server::{
-    Caller, GREETING_TIMEOUT, Knock, Lines, ListenError, Listener, WsTransport,
+    Caller, GREETING_TIMEOUT, Gone, Handle, Knock, Link, ListenError, Listener, Unattached,
+    WsTransport,
 };
-pub use crate::wire::{FromClient, FromServer, PATH, PROTOCOL};
+pub use crate::wire::{Hello, PATH, PROTOCOL, Welcome};

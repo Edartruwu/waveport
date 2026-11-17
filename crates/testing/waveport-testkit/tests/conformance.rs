@@ -6,12 +6,19 @@
 //! fit to stand in for an adapter. The second half shows that the checks
 //! check: each part there breaks one rule, and the check has to name it.
 
+use core::future::{poll_fn, ready};
 use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use bytes::Bytes;
 use waveport_adapter_kit::stream;
+use waveport_domain::event::Key;
+use waveport_domain::ids::{OpTag, ParticipantId};
 use waveport_domain::time::{MediaDur, MediaSpan, MediaTime};
-use waveport_ports::audio::{PcmBytes, Rate, RateSet};
+use waveport_ports::audio::{Codec, PcmBytes, Rate, RateSet};
 use waveport_ports::error::{BoxFuture, Full, PortError};
 use waveport_ports::journal::{
     Batch, Journal, JournalError, Lease, Recovered, Seq, SessionId, Snapshot,
@@ -20,11 +27,16 @@ use waveport_ports::llm::{Finish, Llm, LlmCaps, LlmEvent, LlmRequest, LlmRx, Mes
 use waveport_ports::stt::{
     Stt, SttCaps, SttConfig, SttEvent, SttFinalize, SttStream, SttTiming, SttTx, Transcript,
 };
+use waveport_ports::transport::{
+    AudioCaps, FrameOut, RemoteBuffer, Transport, TransportCaps, TransportControl, TransportEvent,
+};
 use waveport_ports::tts::{
     Alignment, Tts, TtsCaps, TtsConfig, TtsEvent, TtsInput, TtsMark, TtsStream, TtsTx,
 };
 use waveport_testkit::conformance::{
-    Talk, journal_session, llm_abandoned, llm_response, stt_utterance, tts_abandoned, tts_utterance,
+    Broken, FarEnd, FarHeard, Talk, journal_session, llm_abandoned, llm_response, stt_utterance,
+    transport_hears, transport_is_left, transport_says_goodbye, transport_speaks, tts_abandoned,
+    tts_utterance,
 };
 use waveport_testkit::fakes::{
     LlmStep, MemoryJournal, ScriptedLlm, ScriptedStt, ScriptedTts, Spoken, SttScript, TtsScript,
@@ -931,4 +943,499 @@ async fn a_journal_that_breaks_a_rule_is_told_which() {
         assert!(broken.0.contains(rule), "expected `{rule}`, got `{broken}`");
     }
     journal_session(&Lax::new(), SessionId(1)).await.unwrap();
+}
+
+// ---------------------------------------------------------------------
+// Transports
+// ---------------------------------------------------------------------
+
+/// Who is at the far end of the line these tests have.
+const FAR: ParticipantId = ParticipantId(4);
+
+/// A rule of transports, for a line to break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slip {
+    /// None: the line keeps the rules.
+    Kept,
+    /// Nothing is said of the far end joining.
+    NobodyJoins,
+    /// Somebody else is said to have joined, and to speak.
+    SomebodyElse,
+    /// Two packets are given one number.
+    OneNumber,
+    /// Every packet is placed where the first was.
+    OnePlace,
+    /// The end of what was said is lost.
+    CutShort,
+    /// What was said arrives as something else.
+    Garbled,
+    /// What is typed arrives in capitals.
+    Capitals,
+    /// Keys arrive in the order they were not pressed in.
+    KeysBackwards,
+    /// Audio is sent before it is said whose it is.
+    Unannounced,
+    /// The pieces of a response arrive in the order they were not sent
+    /// in.
+    AudioBackwards,
+    /// Whatever the far end says it played is believed.
+    Believed,
+    /// A report about a run that never was is told of the first.
+    Imagined,
+    /// A response that is discarded is not said to be.
+    Undiscarded,
+    /// The response after the first is known to the far end by the
+    /// number of the first.
+    SecondAsFirst,
+    /// The third response is known to the far end by the number of the
+    /// first.
+    ThirdAsFirst,
+    /// The goodbye is said before what was sent before it.
+    ByeFirst,
+    /// Saying goodbye never comes to an end.
+    NeverSaid,
+    /// A line that is over has something more to say.
+    GoesOn,
+    /// A far end that left is not said to have.
+    NobodyLeft,
+    /// Something is said after the far end left.
+    AfterLeaving,
+}
+
+/// What a line holds between its two ends.
+#[derive(Default)]
+struct Wire {
+    /// What the session's end has to say.
+    events: VecDeque<TransportEvent>,
+    /// What the far end is sent.
+    heard: VecDeque<FarHeard>,
+    /// The responses that were sent of: what the session calls each, the
+    /// number the far end knows it by, and how much of it was sent.
+    runs: Vec<(OpTag, u32, MediaDur)>,
+    /// The run whose audio the far end was last told follows.
+    open: Option<u32>,
+    /// The number and the place of the next packet of what the far end
+    /// says.
+    next: (u16, u32),
+    joined: bool,
+    /// Whether the far end left, or the session said goodbye.
+    over: bool,
+    /// Whether the far end's connection is closed.
+    closed: bool,
+    /// What a line that goes on when it is over still has to say.
+    more: Option<TransportEvent>,
+    session: Option<Waker>,
+    far: Option<Waker>,
+}
+
+/// A line that keeps the rules of transports, or breaks one of them.
+struct Line {
+    wire: Arc<Mutex<Wire>>,
+    slip: Slip,
+}
+
+/// The far end of a [`Line`].
+struct LineFar {
+    wire: Arc<Mutex<Wire>>,
+    slip: Slip,
+}
+
+/// What a line holds, for one of its ends to look at.
+fn held(wire: &Mutex<Wire>) -> MutexGuard<'_, Wire> {
+    wire.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A line and its far end.
+fn line(slip: Slip) -> (Line, LineFar) {
+    let wire = Arc::new(Mutex::new(Wire::default()));
+    let far = LineFar {
+        wire: Arc::clone(&wire),
+        slip,
+    };
+    (Line { wire, slip }, far)
+}
+
+impl Wire {
+    fn tell_session(&mut self, event: TransportEvent) {
+        self.events.push_back(event);
+        if let Some(waker) = self.session.take() {
+            waker.wake();
+        }
+    }
+
+    fn tell_far(&mut self, heard: FarHeard) {
+        self.heard.push_back(heard);
+        if let Some(waker) = self.far.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl Transport for Line {
+    fn caps(&self) -> TransportCaps {
+        let codec = Codec::Pcm(Rate::Hz16000);
+        TransportCaps {
+            audio: Some(AudioCaps {
+                inbound: codec,
+                outbound: codec,
+                remote_buffer: RemoteBuffer {
+                    clearable: true,
+                    reports_played: true,
+                },
+            }),
+            text: true,
+            keys: None,
+        }
+    }
+
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TransportEvent>> {
+        let mut wire = held(&self.wire);
+        if !wire.joined {
+            wire.joined = true;
+            let who = match self.slip {
+                Slip::NobodyJoins => None,
+                Slip::SomebodyElse => Some(ParticipantId(9)),
+                _ => Some(FAR),
+            };
+            if let Some(who) = who {
+                return Poll::Ready(Some(TransportEvent::Joined { who }));
+            }
+        }
+        if let Some(event) = wire.events.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+        if wire.over {
+            return Poll::Ready(wire.more.take());
+        }
+        wire.session = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    fn try_send(&mut self, frame: FrameOut<'_>) -> Result<(), Full> {
+        let mut wire = held(&self.wire);
+        if wire.over {
+            return Ok(());
+        }
+        let known = wire.runs.iter().position(|(tag, _, _)| *tag == frame.tag);
+        if known.is_none() {
+            let number = match (self.slip, wire.runs.len()) {
+                (Slip::SecondAsFirst, 1) | (Slip::ThirdAsFirst, 2) => 0,
+                (_, known) => u32::try_from(known).unwrap_or(u32::MAX),
+            };
+            wire.runs.push((frame.tag, number, MediaDur::ZERO));
+        }
+        let Some(run) = wire.runs.iter_mut().find(|(tag, _, _)| *tag == frame.tag) else {
+            return Ok(());
+        };
+        run.2 = run.2.saturating_add(frame.length);
+        let number = run.1;
+        if wire.open != Some(number) || known.is_none() {
+            wire.open = Some(number);
+            if self.slip != Slip::Unannounced {
+                wire.tell_far(FarHeard::Begins(number));
+            }
+        }
+        let piece = FarHeard::Audio(Bytes::copy_from_slice(frame.payload));
+        match self.slip {
+            // Before the piece that was sent before it.
+            Slip::AudioBackwards if matches!(wire.heard.back(), Some(FarHeard::Audio(_))) => {
+                let before = wire.heard.len() - 1;
+                wire.heard.insert(before, piece);
+            }
+            _ => wire.tell_far(piece),
+        }
+        if frame.last {
+            wire.open = None;
+            wire.tell_far(FarHeard::Ends(number));
+        }
+        Ok(())
+    }
+
+    fn try_control(&mut self, control: TransportControl) -> Result<(), Full> {
+        let mut wire = held(&self.wire);
+        let TransportControl::Clear { tag } = control else {
+            return Ok(());
+        };
+        let known = wire.runs.iter().find(|(of, _, _)| *of == tag).copied();
+        if let Some((_, number, _)) = known.filter(|_| !wire.over) {
+            wire.open = None;
+            if self.slip == Slip::Undiscarded {
+                wire.tell_far(FarHeard::Ends(number));
+            } else {
+                wire.tell_far(FarHeard::Clear(number));
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+        let mut wire = held(&self.wire);
+        if self.slip == Slip::NeverSaid {
+            return Poll::Pending;
+        }
+        if !wire.over {
+            wire.over = true;
+            wire.events.clear();
+            if self.slip == Slip::GoesOn {
+                let text = "one more thing".to_owned();
+                wire.more = Some(TransportEvent::Text { who: FAR, text });
+            }
+            if self.slip == Slip::ByeFirst {
+                wire.heard.push_front(FarHeard::Bye);
+            }
+            wire.tell_far(FarHeard::Bye);
+        }
+        Poll::Ready(())
+    }
+}
+
+impl FarEnd for LineFar {
+    fn speak(&mut self, n: u16) -> impl Future<Output = Result<Bytes, PortError>> {
+        // 20 ms at 16 kHz, every sample of it its own number.
+        let samples = (0..320_u16).flat_map(|at| (n * 320 + at).to_le_bytes());
+        let piece: Bytes = samples.collect::<Vec<u8>>().into();
+        let mut wire = held(&self.wire);
+        let (sequence, timestamp) = wire.next;
+        wire.next = (
+            match self.slip {
+                Slip::OneNumber => sequence,
+                _ => sequence.wrapping_add(1),
+            },
+            match self.slip {
+                Slip::OnePlace => timestamp,
+                _ => timestamp + 320,
+            },
+        );
+        let payload = match self.slip {
+            Slip::CutShort if n == 4 => piece.slice(..600),
+            Slip::Garbled if n == 2 => Bytes::from(vec![0; piece.len()]),
+            _ => piece.clone(),
+        };
+        let who = match self.slip {
+            Slip::SomebodyElse => ParticipantId(9),
+            _ => FAR,
+        };
+        wire.tell_session(TransportEvent::Audio {
+            who,
+            sequence,
+            timestamp,
+            payload,
+        });
+        ready(Ok(piece))
+    }
+
+    fn played(
+        &mut self,
+        run: u32,
+        played: MediaDur,
+    ) -> impl Future<Output = Result<(), PortError>> {
+        let mut wire = held(&self.wire);
+        let known = wire.runs.iter().find(|(_, number, _)| *number == run);
+        let told = match (known.copied(), self.slip) {
+            (Some((tag, _, _)), Slip::Believed) => Some((tag, played)),
+            (Some((tag, _, sent)), _) => Some((tag, played.min(sent))),
+            (None, Slip::Imagined) => wire.runs.first().map(|(tag, _, _)| (*tag, played)),
+            (None, _) => None,
+        };
+        if let Some((tag, played)) = told {
+            wire.tell_session(TransportEvent::Played { tag, played });
+        }
+        ready(Ok(()))
+    }
+
+    fn write(&mut self, text: &str) -> impl Future<Output = Result<(), PortError>> {
+        let text = match self.slip {
+            Slip::Capitals => text.to_uppercase(),
+            _ => text.to_owned(),
+        };
+        let mut wire = held(&self.wire);
+        wire.tell_session(TransportEvent::Text { who: FAR, text });
+        ready(Ok(()))
+    }
+
+    fn press(&mut self, keys: &str) -> impl Future<Output = Result<bool, PortError>> {
+        let mut keys: Vec<Key> = keys.chars().filter_map(Key::from_char).collect();
+        if self.slip == Slip::KeysBackwards {
+            keys.reverse();
+        }
+        let mut wire = held(&self.wire);
+        for key in keys {
+            wire.tell_session(TransportEvent::Dtmf { who: FAR, key });
+        }
+        ready(Ok(true))
+    }
+
+    async fn hear(&mut self) -> Result<Option<FarHeard>, PortError> {
+        poll_fn(|cx| {
+            let mut wire = held(&self.wire);
+            if let Some(heard) = wire.heard.pop_front() {
+                return Poll::Ready(Ok(Some(heard)));
+            }
+            if wire.closed {
+                return Poll::Ready(Ok(None));
+            }
+            wire.far = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+
+    fn leave(&mut self) -> impl Future<Output = Result<(), PortError>> {
+        let mut wire = held(&self.wire);
+        wire.over = true;
+        wire.closed = true;
+        if self.slip != Slip::NobodyLeft {
+            wire.tell_session(TransportEvent::Left { who: FAR });
+        }
+        if self.slip == Slip::AfterLeaving {
+            let text = "and another thing".to_owned();
+            wire.tell_session(TransportEvent::Text { who: FAR, text });
+        }
+        if let Some(waker) = wire.session.take() {
+            waker.wake();
+        }
+        ready(Ok(()))
+    }
+}
+
+/// Which of the checks of transports a line is put through.
+#[derive(Clone, Copy, Debug)]
+enum Check {
+    Hears,
+    Speaks,
+    SaysGoodbye,
+    IsLeft,
+}
+
+/// Puts a line that slips as `slip` says through `check`.
+async fn checked(check: Check, slip: Slip) -> Result<(), Broken> {
+    let (mut line, mut far) = line(slip);
+    match check {
+        Check::Hears => transport_hears(&mut line, &mut far, FAR).await,
+        Check::Speaks => transport_speaks(&mut line, &mut far, FAR).await,
+        Check::SaysGoodbye => transport_says_goodbye(&mut line, &mut far, FAR).await,
+        Check::IsLeft => transport_is_left(&mut line, &mut far, FAR).await,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_line_that_keeps_the_rules_of_transports_passes() {
+    for check in [
+        Check::Hears,
+        Check::Speaks,
+        Check::SaysGoodbye,
+        Check::IsLeft,
+    ] {
+        let passed = checked(check, Slip::Kept).await;
+        assert_eq!(passed, Ok(()), "{check:?}");
+    }
+}
+
+/// Each way a line breaks a rule, the check that is to notice, and what
+/// it is to say.
+const SLIPS: [(Check, Slip, &str); 21] = [
+    (
+        Check::Hears,
+        Slip::NobodyJoins,
+        "that the far end joined did not arrive",
+    ),
+    (
+        Check::Speaks,
+        Slip::NobodyJoins,
+        "that the far end joined did not arrive",
+    ),
+    (
+        Check::IsLeft,
+        Slip::SomebodyElse,
+        "is that ParticipantId(4) joined",
+    ),
+    (
+        Check::Hears,
+        Slip::OneNumber,
+        "numbered one after the other",
+    ),
+    (
+        Check::Hears,
+        Slip::OnePlace,
+        "placed where the one before ended",
+    ),
+    (
+        Check::Hears,
+        Slip::CutShort,
+        "what the far end said did not arrive",
+    ),
+    (
+        Check::Hears,
+        Slip::Garbled,
+        "hold together what the far end sent",
+    ),
+    (Check::Hears, Slip::Capitals, "arrives as it was typed"),
+    (
+        Check::Hears,
+        Slip::KeysBackwards,
+        "in the order they were pressed",
+    ),
+    (
+        Check::Speaks,
+        Slip::Unannounced,
+        "told whose audio follows before",
+    ),
+    (
+        Check::Speaks,
+        Slip::AudioBackwards,
+        "in order, and as it was sent",
+    ),
+    (Check::Speaks, Slip::Believed, "no more than was sent of it"),
+    (
+        Check::Speaks,
+        Slip::Imagined,
+        "told of the response it was the audio of",
+    ),
+    (Check::Speaks, Slip::Undiscarded, "is followed by Clear("),
+    (
+        Check::Speaks,
+        Slip::SecondAsFirst,
+        "not known to the far end by one number",
+    ),
+    (
+        Check::Speaks,
+        Slip::ThirdAsFirst,
+        "not known to the far end by one number",
+    ),
+    (
+        Check::SaysGoodbye,
+        Slip::ByeFirst,
+        "arrives before the goodbye",
+    ),
+    (
+        Check::SaysGoodbye,
+        Slip::NeverSaid,
+        "a goodbye, said and heard did not arrive",
+    ),
+    (
+        Check::SaysGoodbye,
+        Slip::GoesOn,
+        "is over says nothing more",
+    ),
+    (
+        Check::IsLeft,
+        Slip::NobodyLeft,
+        "a far end that says goodbye has left",
+    ),
+    (
+        Check::IsLeft,
+        Slip::AfterLeaving,
+        "nothing follows a far end that left",
+    ),
+];
+
+#[tokio::test(start_paused = true)]
+async fn a_line_that_breaks_a_rule_of_transports_is_told_which() {
+    for (check, slip, rule) in SLIPS {
+        let broken = checked(check, slip).await.unwrap_err();
+        assert!(
+            broken.0.contains(rule),
+            "{check:?} of {slip:?}: expected `{rule}`, got `{broken}`"
+        );
+    }
 }

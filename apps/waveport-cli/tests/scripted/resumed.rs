@@ -31,9 +31,11 @@ use std::time::Instant;
 use waveport_adapter_kit::pcm::write_base64;
 use waveport_adapter_kit::wav;
 use waveport_ports::audio::Rate;
+use waveport_protocol::client::v1::{ErrorCode, Resume};
 use waveport_testkit::servers::{End, HttpAnswer, HttpServer, WsServer, WsStep};
+use waveport_transport_websocket::{Client, Heard, Hello, Unconnected};
 
-use super::{HEARD, assets, ended, folder, lines_of, one_question, piece, started_at};
+use super::{HEARD, Serving, assets, ended, folder, lines_of, one_question, piece, started_at};
 
 /// What the caller asks, as the recogniser was recorded hearing it.
 const QUESTION: &str = "What time is it right now?";
@@ -284,6 +286,15 @@ impl Set {
         arguments.extend(more);
         arguments.extend(self.common.iter().map(String::as_str));
         started_at(&self.folder, &arguments, halt)
+    }
+
+    /// What the command is told to take calls over a WebSocket with,
+    /// and with what `more` says besides.
+    fn serve(&self, more: &[&str]) -> Vec<String> {
+        let mut arguments = vec!["serve".to_owned()];
+        arguments.extend(more.iter().map(|word| (*word).to_owned()));
+        arguments.extend(self.common.iter().cloned());
+        arguments
     }
 
     /// What the model was shown, each time it was asked so far.
@@ -712,4 +723,266 @@ async fn a_call_killed_after_its_state_was_stored_goes_on() {
     // It is the same call as from the records.
     went.told("the call goes on, from what it had come to by record 2 and 0 records after that");
     went.first_shown_is(&[question()]);
+}
+
+/// Writes the script of a caller who asks the question, waits to be
+/// answered, asks it again, and waits again. Returns where the script
+/// is.
+fn asks_twice(folder: &Path) -> PathBuf {
+    one_question(folder);
+    let script = folder.join("twice.call");
+    std::fs::write(
+        &script,
+        "# A caller who asks, is answered, and asks again.\n\
+         silence 400\n\
+         say question.wav\n\
+         listen 1500 40000\n\
+         say question.wav\n\
+         listen 1500 40000\n",
+    )
+    .unwrap();
+    script
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one call, told from the agent that was killed to the caller's last answer"
+)]
+async fn a_call_from_elsewhere_goes_on_when_its_agent_was_killed_and_is_back() {
+    // The agent takes calls over a WebSocket, and its caller is a
+    // command of its own. The agent is killed while the model answers
+    // the caller's question: what the caller asked is stored, and
+    // nothing after it.
+    let place = "after:turn_committed";
+    let set = Set::up(Killed {
+        name: "killed-with-its-caller-elsewhere",
+        place,
+        answers: vec![stops_short(), says(false)],
+        state_every: 256,
+    })
+    .await;
+    let script = asks_twice(&set.folder);
+    let serve = |more: &[&str]| set.serve(more);
+
+    let arguments = serve(&["--listen", "127.0.0.1:0"]);
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let (mut first, address) = Serving::start_at(&set.folder, &arguments, Some(place)).await;
+
+    // The caller, who is not killed, and is there to the end of the
+    // call.
+    let calls = [
+        "client",
+        "--url",
+        &address,
+        "--script",
+        script.to_str().unwrap(),
+        "--record",
+        set.recording.to_str().unwrap(),
+    ];
+    let mut caller = started_at(&set.folder, &calls, None);
+    let told = lines_of(caller.stdout.take().unwrap());
+    let errors = lines_of(caller.stderr.take().unwrap());
+
+    first.says(&format!("halted: {place}")).await;
+    first.killed();
+    let asked_before = set.asked_once_quiet().await;
+
+    // The agent is started again where it was, and told to go on with
+    // the calls that broke off: one, and then it is to stop. Nobody
+    // tells it which call, and nobody tells the caller that it is back.
+    let listen = address.strip_prefix("ws://").unwrap();
+    let arguments = serve(&["--listen", listen, "--resume", "--calls", "1"]);
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let (mut second, again) = Serving::start_at(&set.folder, &arguments, None).await;
+    assert_eq!(again, address);
+
+    ended(&mut caller).await;
+    let status = caller.wait().unwrap();
+    let code = second.ended().await;
+    let told = told.lock().unwrap().clone();
+    let errors = errors.lock().unwrap().join("\n");
+    let asked = set.asked();
+    let mut all = format!(
+        "--- the agent that was killed ---\n{}--- the agent that went on ---\n{}\
+         --- the caller told ---\n{}\n--- the caller's errors ---\n{errors}\n",
+        first.all(),
+        second.all(),
+        told.join("\n"),
+    );
+    for (n, shown) in asked.iter().enumerate() {
+        let _ = writeln!(all, "--- the model, request {n} ---");
+        for said in shown {
+            let _ = writeln!(all, "{said:?}");
+        }
+    }
+    assert!(status.success(), "{all}");
+    assert_eq!(code, Some(0), "{all}");
+
+    // The caller noticed that its line had dropped, came back by
+    // itself, and was told that the call goes on.
+    assert!(errors.contains("the line to the agent dropped"), "{all}");
+    assert!(!errors.contains("is gone"), "{all}");
+    let at = |lines: &[String], start: &str, from: usize| {
+        lines
+            .iter()
+            .skip(from)
+            .position(|line| line.starts_with(start))
+            .map_or_else(
+                || panic!("no line after {from} begins with {start:?}\n{all}"),
+                |found| found + from,
+            )
+    };
+    let began = at(&told, "the call has begun", 0);
+    let went_on = at(&told, "the call goes on", began);
+    // It was told of another life of the call, and so is told how the
+    // call stands now: its question, and nothing of the half answer.
+    let stands = at(&told, "the call as it stands:", went_on);
+    assert_eq!(told[stands + 1], format!("  caller: {QUESTION}"), "{all}");
+    // The answer that was owed is given at once, before the caller says
+    // anything. Then the caller asks again, and is answered again.
+    let answer = format!("agent: {}", SAID.concat());
+    let owed = at(&told, &answer, stands);
+    let asked_again = at(&told, &format!("caller: {QUESTION}"), owed);
+    let answered = at(&told, &answer, asked_again);
+    assert!(stands + 1 < owed && asked_again < answered, "{all}");
+    assert!(!told.iter().any(|line| line.contains("[cut off]")), "{all}");
+
+    // The agent that went on found the call, and began no other.
+    let served = second.told.lock().unwrap().clone();
+    at(
+        &served,
+        "note: 1 call that broke off earlier is kept in ",
+        0,
+    );
+    let goes_on = at(
+        &served,
+        "[1] the call goes on, from its 2 records, from 127.0.0.1:",
+        0,
+    );
+    let over = at(&served, "[1] the call ended: the caller left", goes_on);
+    assert!(
+        at(&served, &format!("[1] {answer}"), goes_on) < over,
+        "{all}"
+    );
+    assert!(
+        !served.iter().any(|line| line.contains("has begun")),
+        "{all}"
+    );
+
+    // The model was asked once by the agent that was killed. When it was
+    // asked last, it was shown both questions, and told between them
+    // that the session had been restarted.
+    assert_eq!(asked_before, [vec![question()]], "{all}");
+    let last = asked.last().unwrap();
+    let questions: Vec<usize> = (0..last.len())
+        .filter(|at| last[*at].role == "user" && last[*at].content == QUESTION)
+        .collect();
+    assert_eq!(questions.len(), 2, "{all}");
+    let restored = last
+        .iter()
+        .position(|said| said.role == "system" && said.content.contains(RESTORED))
+        .unwrap_or_else(|| panic!("the model was not told of the restart\n{all}"));
+    assert!(questions[0] < restored && restored < questions[1], "{all}");
+
+    // The caller was played both answers, on the line it came back on:
+    // 2.4 s of the tone, twice.
+    let played = wav::read(&std::fs::read(&set.recording).unwrap()).unwrap();
+    let loud = played.samples.iter().filter(|s| s.abs() > 1_000).count();
+    assert!(loud >= 220_000, "{loud} loud samples\n{all}");
+
+    // The call is over, and is not there to go on with: an agent that
+    // is started now is told of no call that broke off.
+    let arguments = serve(&["--listen", "127.0.0.1:0", "--resume"]);
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let (third, _) = Serving::start_at(&set.folder, &arguments, None).await;
+    let said = third.told.lock().unwrap().join("\n");
+    assert!(!said.contains("broke off"), "{said}\n{all}");
+}
+
+#[tokio::test]
+async fn a_caller_is_given_its_call_back_only_by_an_agent_that_was_told_to() {
+    let set = Set::up(Killed {
+        name: "comes-back-to-an-agent-that-was-not-told",
+        place: "nowhere",
+        answers: vec![says(false)],
+        state_every: 256,
+    })
+    .await;
+    let soon = Duration::from_secs(10);
+    let serving = async |more: &[&str]| {
+        let arguments = set.serve(more);
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        Serving::start_at(&set.folder, &arguments, None).await
+    };
+
+    // A caller that writes, on a call that says nothing by itself. The
+    // agent is killed with the call under way.
+    let (mut first, address) = serving(&["--listen", "127.0.0.1:0"]).await;
+    let hello = Hello::new(None);
+    let caller = Client::connect(&address, &hello, soon).await.unwrap();
+    let welcome = caller.welcome().clone();
+    let token = welcome.resume_token.clone().unwrap();
+    first.killed();
+    drop(caller);
+    let back = Hello {
+        resume: Some(Resume {
+            token: token.clone(),
+            life: welcome.life,
+            seen: 0,
+        }),
+        ..hello
+    };
+
+    // An agent that was not told to go on with the calls that broke off
+    // has the call in its file, and says so, and refuses its caller.
+    let listen = address.strip_prefix("ws://").unwrap();
+    let (mut second, _) = serving(&["--listen", listen]).await;
+    let kept = second.told.lock().unwrap().join("\n");
+    assert!(
+        kept.contains("1 call that broke off earlier is kept"),
+        "{kept}"
+    );
+    let refused = Client::connect(&address, &back, soon).await;
+    let Err(Unconnected::Refused { code, message }) = refused else {
+        panic!("the caller was taken\n{}", second.all());
+    };
+    assert_eq!(code, ErrorCode::NoSession, "{message}");
+    assert!(message.contains("are not gone on with"), "{message}");
+    second.killed();
+
+    // One that was told gives it the call, in the call's next life,
+    // with the token it holds to come back with again.
+    let (mut third, _) = serving(&["--listen", listen, "--resume", "--calls", "1"]).await;
+    let mut caller = Client::connect(&address, &back, soon).await.unwrap();
+    let again = caller.welcome().clone();
+    let all = third.all();
+    assert!(again.resumed, "{again:?}\n{all}");
+    assert_eq!(
+        (again.session, again.life, again.resume_token),
+        (welcome.session, welcome.life + 1, Some(token)),
+        "{all}"
+    );
+    // It was told of another life of the call, so it is sent how the
+    // call stands before anything else.
+    let heard = tokio::time::timeout(soon, async {
+        let gap = caller.next().await.unwrap();
+        (gap, caller.next().await.unwrap())
+    });
+    let (gap, state) = heard.await.unwrap();
+    assert!(matches!(gap, Some(Heard::Gap { .. })), "{gap:?}\n{all}");
+    assert!(matches!(state, Some(Heard::State(_))), "{state:?}\n{all}");
+
+    // It leaves, and the agent, which was to take one call, stops.
+    caller.bye().await;
+    let code = third.ended().await;
+    let all = third.all();
+    assert_eq!(code, Some(0), "{all}");
+    let served = third.told.lock().unwrap().join("\n");
+    assert!(served.contains(", from 127.0.0.1:"), "{all}");
+    assert!(
+        served.contains("[1] the call ended: the caller left"),
+        "{all}"
+    );
+    assert!(!served.contains("[1] the call has begun, from"), "{all}");
 }

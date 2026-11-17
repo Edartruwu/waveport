@@ -41,14 +41,14 @@ use waveport_domain::ids::{AgentId, ParticipantId};
 use waveport_ports::control::{ControlError, SessionInput};
 use waveport_ports::journal::SessionId;
 use waveport_protocol::client::v1::{
-    self as client, CLIENT_TOKEN, ErrorCode, FromClient, FromServer, RESUME_TOKEN, Refusal, Show,
-    features,
+    self as client, CLIENT_TOKEN, ErrorCode, FromClient, FromServer, RESUME_TOKEN, Refusal,
 };
 use waveport_protocol::control::v1::{Context, CreateSession, Input, Problem, SessionState};
 
 use crate::auth::From;
 use crate::daemon::{Shared, failed};
-use crate::events::{Asked, Following, Position};
+use crate::events::Following;
+use waveport_assembly::shown::{Asked, Position};
 
 /// The daemon, for a request.
 type Daemon = State<Arc<Shared>>;
@@ -552,21 +552,9 @@ async fn events(
     };
 
     let wanted: Vec<String> = values(query, "features").collect();
-    let wants = |feature: &str| wanted.iter().any(|wanted| wanted == feature);
-    let tools = wants(features::TOOLS);
-    let asked = Asked {
-        said: wants(features::SAID),
-        hearing: wants(features::HEARING),
-        show: Show {
-            tools,
-            tool_text: tools && who == Who::Control && daemon.show_tool_text,
-        },
-    };
-    let granted = features::ALL
-        .iter()
-        .filter(|feature| wants(feature))
-        .map(|feature| (*feature).to_owned())
-        .collect();
+    let tool_text = who == Who::Control && daemon.show_tool_text;
+    let asked = Asked::of(wanted.iter().map(String::as_str), tool_text);
+    let granted = asked.features();
     let next_seq = daemon
         .stack
         .status(id)

@@ -22,6 +22,7 @@ waveport-domain = { workspace = true }
 waveport-llm-openai-compat = { workspace = true }
 waveport-models-onnx = { workspace = true }
 waveport-ports = { workspace = true }
+waveport-protocol = { workspace = true }
 waveport-runtime = { workspace = true }
 waveport-store-journal = { workspace = true }
 waveport-store-memory = { workspace = true }

@@ -70,8 +70,6 @@ pub(crate) struct Shared {
     pub(crate) show_tool_text: bool,
     pub(crate) stack: Stack,
     agents: BTreeMap<String, Agent>,
-    /// What the tools are called, in the kernel's order.
-    pub(crate) tools: Vec<String>,
     pub(crate) keys: Keys,
     pub(crate) tickets: Tickets,
     pub(crate) gate: Gate,
@@ -470,7 +468,6 @@ impl Daemon {
         let shared = Arc::new(Shared {
             limits: config.limits,
             show_tool_text: config.control.show_tool_text,
-            tools: stack.tools(),
             stack,
             agents,
             keys,

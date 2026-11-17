@@ -87,6 +87,11 @@ impl Setup {
         Ok(Self { stack, agent })
     }
 
+    /// What calls share: where they run, and where they are kept.
+    pub(crate) const fn stack(&self) -> &Stack {
+        &self.stack
+    }
+
     /// What whoever ran the command should know before any call.
     pub(crate) fn notes(&self) -> &[String] {
         &self.stack.notes

@@ -17,17 +17,21 @@
 
 use core::fmt;
 use core::future::poll_fn;
-use core::pin::Pin;
-use core::task::Poll;
+use core::pin::{Pin, pin};
+use core::task::{Context, Poll};
 use core::time::Duration;
+use std::collections::VecDeque;
 
 use bytes::Bytes;
+use waveport_domain::event::Key;
+use waveport_domain::ids::{Epoch, GenId, OpTag, ParticipantId};
 use waveport_domain::time::{MediaDur, MediaSpan, MediaTime};
-use waveport_ports::audio::{AudioRef, Rate};
+use waveport_ports::audio::{AudioRef, Codec, Rate};
 use waveport_ports::error::PortError;
 use waveport_ports::journal::{Batch, Journal, JournalError, Seq, SessionId, Snapshot};
 use waveport_ports::llm::{Finish, Llm, LlmEvent, LlmRequest, LlmRx, Usage};
 use waveport_ports::stt::{Stt, SttCaps, SttConfig, SttEvent, SttFinalize, SttRx, Transcript};
+use waveport_ports::transport::{AudioCaps, FrameOut, Transport, TransportControl, TransportEvent};
 use waveport_ports::tts::{Alignment, Tts, TtsConfig, TtsEvent, TtsMark};
 
 use crate::drive::{next_llm, next_stt, next_tts};
@@ -523,6 +527,560 @@ pub async fn tts_abandoned(tts: &dyn Tts, rate: Rate, pieces: &[&str]) -> Result
     let _ = stream.tx.try_speak("and this is never heard.");
     drop(stream.tx);
     tts_utterance(tts, rate, pieces).await
+}
+
+// ---------------------------------------------------------------------
+// Transports
+// ---------------------------------------------------------------------
+
+/// How long one piece of audio is that a check sends, either way.
+const PIECE: MediaDur = MediaDur::from_millis(20);
+
+/// Something the far end of a transport is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FarHeard {
+    /// The audio that follows is that of a run, which the far end knows
+    /// by this number.
+    Begins(u32),
+    /// Audio of the run that began last, as the session sent it.
+    Audio(Bytes),
+    /// All of a run has been sent.
+    Ends(u32),
+    /// What the far end holds of a run and has not played is to be
+    /// discarded.
+    Clear(u32),
+    /// The session is over. Nothing follows.
+    Bye,
+}
+
+/// The far end of a transport, as a check has it act. A transport's own
+/// tests have a client for it, and that client is one of these.
+///
+/// A check waits for each of these while it looks at the transport as a
+/// session does: a transport that does its work when it is looked at
+/// has done it by the time the far end is answered.
+pub trait FarEnd {
+    /// Says 20 ms of something, as the line carries audio, and returns
+    /// the bytes as they were sent. No two pieces are alike: `n` tells
+    /// them apart.
+    fn speak(&mut self, n: u16) -> impl Future<Output = Result<Bytes, PortError>>;
+
+    /// Says how much of the run `run` has been played so far.
+    fn played(&mut self, run: u32, played: MediaDur)
+    -> impl Future<Output = Result<(), PortError>>;
+
+    /// Types `text` in place of speech.
+    fn write(&mut self, text: &str) -> impl Future<Output = Result<(), PortError>>;
+
+    /// Presses `keys` of a telephone, one after the other. Returns
+    /// whether the far end has a way to: one that has none presses
+    /// nothing.
+    fn press(&mut self, keys: &str) -> impl Future<Output = Result<bool, PortError>>;
+
+    /// The next thing the far end is sent that a check looks at. `None`
+    /// when its connection is closed and nothing said that the session
+    /// is over.
+    fn hear(&mut self) -> impl Future<Output = Result<Option<FarHeard>, PortError>>;
+
+    /// Leaves: says goodbye, as a far end does that ends the session.
+    fn leave(&mut self) -> impl Future<Output = Result<(), PortError>>;
+}
+
+/// A transport, looked at as a session looks at it.
+struct Watched<'a> {
+    transport: &'a mut dyn Transport,
+    /// What it said that no check has looked at yet.
+    said: VecDeque<TransportEvent>,
+    /// Whether it said that it is over.
+    over: bool,
+}
+
+impl<'a> Watched<'a> {
+    fn new(transport: &'a mut dyn Transport) -> Self {
+        Self {
+            transport,
+            said: VecDeque::new(),
+            over: false,
+        }
+    }
+
+    fn look(&mut self, cx: &mut Context<'_>) {
+        while !self.over {
+            match self.transport.poll_event(cx) {
+                Poll::Ready(Some(event)) => self.said.push_back(event),
+                Poll::Ready(None) => self.over = true,
+                Poll::Pending => break,
+            }
+        }
+    }
+
+    /// Has the far end do `work` while the transport is looked at.
+    async fn during<T>(
+        &mut self,
+        what: &str,
+        work: impl Future<Output = Result<T, PortError>>,
+    ) -> Result<T, Broken> {
+        let mut work = pin!(work);
+        let both = poll_fn(|cx| {
+            self.look(cx);
+            work.as_mut().poll(cx)
+        });
+        match patiently(what, both).await? {
+            Ok(done) => Ok(done),
+            Err(error) => broken(format!("the far end failed at {what}: {error}")),
+        }
+    }
+
+    /// The next thing the transport says. `None` once it is over.
+    async fn next(&mut self, what: &str) -> Result<Option<TransportEvent>, Broken> {
+        let next = poll_fn(|cx| {
+            self.look(cx);
+            match self.said.pop_front() {
+                Some(event) => Poll::Ready(Some(event)),
+                None if self.over => Poll::Ready(None),
+                None => Poll::Pending,
+            }
+        });
+        patiently(what, next).await
+    }
+
+    /// The first thing a transport says: that its far end joined.
+    async fn joined(&mut self, who: ParticipantId) -> Result<(), Broken> {
+        match self.next("that the far end joined").await? {
+            Some(TransportEvent::Joined { who: joined }) if joined == who => Ok(()),
+            other => broken(format!(
+                "the first thing a transport says is that {who:?} joined: it said {other:?}"
+            )),
+        }
+    }
+
+    /// The next thing the far end is sent.
+    async fn far_hears<F: FarEnd>(&mut self, far: &mut F, what: &str) -> Result<FarHeard, Broken> {
+        match self.during(what, far.hear()).await? {
+            Some(heard) => Ok(heard),
+            None => broken(format!(
+                "the far end was sent nothing more when {what} was due"
+            )),
+        }
+    }
+
+    /// Sends one piece of a run, every byte of it `fill`. Returns what
+    /// was sent.
+    fn send(
+        &mut self,
+        audio: AudioCaps,
+        tag: OpTag,
+        at: u32,
+        fill: u8,
+        last: bool,
+    ) -> Result<Vec<u8>, Broken> {
+        let payload = match audio.outbound {
+            Codec::Pcm(rate) => vec![fill; rate.samples_in(PIECE) * 2],
+            Codec::G711(_) => vec![fill; Rate::Hz8000.samples_in(PIECE)],
+            // A packet of 20 ms, as its first byte says. What follows is
+            // the packet's own business.
+            Codec::Opus => vec![0xF8, fill, fill],
+        };
+        let frame = FrameOut {
+            tag,
+            at: MediaDur::from_millis(at * 20),
+            length: PIECE,
+            payload: &payload,
+            last,
+        };
+        if self.transport.try_send(frame).is_err() {
+            return broken("a transport has room for a few frames of a response");
+        }
+        Ok(payload)
+    }
+
+    /// What the far end hears of one run, from where it begins to
+    /// `ends`. Returns the number the far end knows the run by, and its
+    /// audio.
+    async fn far_hears_run<F: FarEnd>(
+        &mut self,
+        far: &mut F,
+        ends: impl Fn(u32) -> FarHeard,
+    ) -> Result<(u32, Vec<u8>), Broken> {
+        let run = match self.far_hears(far, "where a run begins").await? {
+            FarHeard::Begins(run) => run,
+            other => {
+                return broken(format!(
+                    "the far end is told whose audio follows before it is sent any: it was \
+                     sent {other:?}"
+                ));
+            }
+        };
+        let mut audio = Vec::new();
+        loop {
+            match self.far_hears(far, "the audio of a run").await? {
+                FarHeard::Audio(piece) => audio.extend_from_slice(&piece),
+                heard if heard == ends(run) => return Ok((run, audio)),
+                other => {
+                    return broken(format!(
+                        "the audio of run {run} is followed by {:?}: the far end was sent \
+                         {other:?}",
+                        ends(run)
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The transport is over: it says so every time it is asked, and
+    /// takes what it is given without a word.
+    async fn is_over(&mut self, audio: Option<AudioCaps>) -> Result<(), Broken> {
+        for _ in 0..2 {
+            let again = poll_fn(|cx| self.transport.poll_event(cx));
+            match patiently("a transport that is over, asked again", again).await? {
+                None => {}
+                Some(event) => {
+                    return broken(format!(
+                        "a transport that is over says nothing more: it said {event:?}"
+                    ));
+                }
+            }
+        }
+        if let Some(audio) = audio {
+            let _ = self.send(audio, tag(90), 0, 1, true);
+        }
+        let _ = self
+            .transport
+            .try_control(TransportControl::Clear { tag: tag(90) });
+        let closed = poll_fn(|cx| self.transport.poll_close(cx));
+        patiently("the goodbye of a transport that is over", closed).await
+    }
+}
+
+/// What a check calls a response.
+const fn tag(generation: u32) -> OpTag {
+    OpTag {
+        generation: GenId(generation),
+        epoch: Epoch(1),
+    }
+}
+
+/// Has the far end of a transport speak, type and press keys, and looks
+/// at what the transport makes of it. `transport` has to be one that
+/// nobody has looked at yet, and `far` its far end, known to it as
+/// `who`.
+///
+/// The rules: the first thing a transport says is that its far end
+/// joined; what the far end says arrives as packets numbered one after
+/// the other, each placed on the clock of its codec where the one
+/// before it ended, and holding together what was sent; what is typed
+/// arrives as it was typed, on a transport that says it carries text;
+/// and keys arrive one by one, in the order they were pressed.
+///
+/// # Errors
+///
+/// The rule the adapter broke.
+pub async fn transport_hears<F: FarEnd>(
+    transport: &mut dyn Transport,
+    far: &mut F,
+    who: ParticipantId,
+) -> Result<(), Broken> {
+    let caps = transport.caps();
+    let mut line = Watched::new(transport);
+    line.joined(who).await?;
+
+    if let Some(audio) = caps.audio {
+        let mut sent = Vec::new();
+        for n in 0..5 {
+            let piece = line.during("saying something", far.speak(n)).await?;
+            sent.extend_from_slice(&piece);
+        }
+        let mut heard = Vec::new();
+        // The number and the place the next packet has to have.
+        let mut due: Option<(u16, u32)> = None;
+        while heard.len() < sent.len() {
+            let event = line.next("what the far end said").await?;
+            let Some(TransportEvent::Audio {
+                who: whose,
+                sequence,
+                timestamp,
+                payload,
+            }) = event
+            else {
+                return broken(format!(
+                    "what the far end says arrives as audio: the transport said {event:?}"
+                ));
+            };
+            if whose != who {
+                return broken(format!(
+                    "the audio of {who:?} was said to be that of {whose:?}"
+                ));
+            }
+            if payload.is_empty() {
+                return broken("a packet of audio holds some");
+            }
+            if let Some((number, place)) = due
+                && (sequence, timestamp) != (number, place)
+            {
+                return broken(format!(
+                    "packets are numbered one after the other and placed where the one before \
+                     ended: after one that made {number} at {place} due came {sequence} at \
+                     {timestamp}"
+                ));
+            }
+            let held = match audio.inbound {
+                Codec::Pcm(_) => payload.len() / 2,
+                Codec::G711(_) => payload.len(),
+                // A packet a piece: the far end says 20 ms at a time.
+                Codec::Opus => Rate::Hz48000.samples_in(PIECE),
+            };
+            let held = u32::try_from(held).unwrap_or(u32::MAX);
+            due = Some((sequence.wrapping_add(1), timestamp.wrapping_add(held)));
+            heard.extend_from_slice(&payload);
+        }
+        if heard != sent {
+            return broken("the packets hold together what the far end sent, and nothing else");
+        }
+    }
+
+    if caps.text {
+        let typed = "What time is it?";
+        line.during("typing", far.write(typed)).await?;
+        let event = line.next("what the far end typed").await?;
+        let arrived = matches!(
+            &event,
+            Some(TransportEvent::Text { who: whose, text }) if *whose == who && text == typed
+        );
+        if !arrived {
+            return broken(format!(
+                "what is typed arrives as it was typed: {typed:?} arrived as {event:?}"
+            ));
+        }
+    }
+
+    if line.during("pressing keys", far.press("7#")).await? {
+        for key in [Key::Seven, Key::Hash] {
+            let event = line.next("a key the far end pressed").await?;
+            if event != Some(TransportEvent::Dtmf { who, key }) {
+                return broken(format!(
+                    "keys arrive one by one, in the order they were pressed: {key:?} arrived \
+                     as {event:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sends the far end of a transport what a session sends, and has it
+/// say what it played. `transport` has to be one that nobody has looked
+/// at yet, and `far` its far end, known to it as `who`.
+///
+/// The rules: the far end is told whose audio follows before it is sent
+/// any, and when all of a response has been sent; the audio arrives in
+/// order and as it was sent; what the far end says it played is told of
+/// the response it was the audio of, and is never more than was sent; a
+/// report about audio the far end was never sent is told to nobody; a
+/// response that is discarded is said to be, unless nothing of it was
+/// sent, and the next one is told apart from it. What a transport does
+/// not say it can do is not asked of it.
+///
+/// # Errors
+///
+/// The rule the adapter broke.
+pub async fn transport_speaks<F: FarEnd>(
+    transport: &mut dyn Transport,
+    far: &mut F,
+    who: ParticipantId,
+) -> Result<(), Broken> {
+    let caps = transport.caps();
+    let mut line = Watched::new(transport);
+    line.joined(who).await?;
+    let Some(audio) = caps.audio else {
+        return Ok(());
+    };
+
+    // A response of three pieces.
+    let mut sent = Vec::new();
+    for (at, fill) in [1, 2, 3].into_iter().enumerate() {
+        let at = u32::try_from(at).unwrap_or(0);
+        sent.extend(line.send(audio, tag(1), at, fill, fill == 3)?);
+    }
+    let (first, heard) = line.far_hears_run(far, FarHeard::Ends).await?;
+    if heard != sent {
+        return broken("the audio of a response arrives in order, and as it was sent");
+    }
+
+    if audio.remote_buffer.reports_played {
+        let told = |played| TransportEvent::Played {
+            tag: tag(1),
+            played,
+        };
+        let reports = [
+            // A piece of it, more than there was of it, and a run the
+            // far end was never sent, which is told to nobody.
+            (first, PIECE, Some(PIECE)),
+            (
+                first,
+                MediaDur::from_millis(5_000),
+                Some(MediaDur::from_millis(60)),
+            ),
+            (first.wrapping_add(1_000), PIECE, None),
+            (
+                first,
+                MediaDur::from_millis(40),
+                Some(MediaDur::from_millis(40)),
+            ),
+        ];
+        for (run, played, due) in reports {
+            line.during("saying what was played", far.played(run, played))
+                .await?;
+            let Some(due) = due else {
+                continue;
+            };
+            let event = line.next("what the far end played").await?;
+            if event != Some(told(due)) {
+                return broken(format!(
+                    "what the far end played is told of the response it was the audio of, and \
+                     is no more than was sent of it: {:?} was due, and the transport said \
+                     {event:?}",
+                    told(due)
+                ));
+            }
+        }
+    }
+
+    // A response nothing was sent of has nothing to discard. One that
+    // was begun is discarded, and the one after it begins anew.
+    if audio.remote_buffer.clearable {
+        for of in [7, 2] {
+            if of == 2 {
+                line.send(audio, tag(2), 0, 4, false)?;
+            }
+            let discard = TransportControl::Clear { tag: tag(of) };
+            if line.transport.try_control(discard).is_err() {
+                return broken("a transport has room for a request to discard");
+            }
+        }
+        let (second, _) = line.far_hears_run(far, FarHeard::Clear).await?;
+        if second == first {
+            return broken("two responses are not known to the far end by one number");
+        }
+    }
+    let last = line.send(audio, tag(3), 0, 5, true)?;
+    let (third, heard) = line.far_hears_run(far, FarHeard::Ends).await?;
+    if third == first {
+        return broken("two responses are not known to the far end by one number");
+    }
+    if heard != last {
+        return broken("the audio of a response arrives in order, and as it was sent");
+    }
+    Ok(())
+}
+
+/// Ends a session on a transport: sends a last response, and has the
+/// transport say goodbye. `transport` has to be one that nobody has
+/// looked at yet, and `far` its far end, known to it as `who`.
+///
+/// The rules: what was sent before the goodbye arrives before it; the
+/// far end is told that the session is over, or its connection is
+/// closed; saying goodbye comes to an end; and a transport that is over
+/// says so every time it is asked, and takes what it is given without a
+/// word.
+///
+/// # Errors
+///
+/// The rule the adapter broke.
+pub async fn transport_says_goodbye<F: FarEnd>(
+    transport: &mut dyn Transport,
+    far: &mut F,
+    who: ParticipantId,
+) -> Result<(), Broken> {
+    let caps = transport.caps();
+    let mut line = Watched::new(transport);
+    line.joined(who).await?;
+    let sent = match caps.audio {
+        Some(audio) => Some(line.send(audio, tag(1), 0, 6, true)?),
+        None => None,
+    };
+
+    // The session is over: it looks at its transport no more, and asks
+    // it to say goodbye.
+    let mut heard = Vec::new();
+    let mut ended = false;
+    {
+        let transport = &mut *line.transport;
+        let mut hearing = pin!(async {
+            loop {
+                match far.hear().await? {
+                    Some(FarHeard::Audio(piece)) => heard.extend_from_slice(&piece),
+                    Some(FarHeard::Ends(_)) => ended = true,
+                    Some(FarHeard::Bye) | None => return Ok::<_, PortError>(()),
+                    Some(_) => {}
+                }
+            }
+        });
+        // Whether the transport is done saying it, and how the far end
+        // came to know.
+        let mut said = false;
+        let mut known = None;
+        let both = poll_fn(|cx| {
+            if !said {
+                said = transport.poll_close(cx).is_ready();
+            }
+            if known.is_none()
+                && let Poll::Ready(done) = hearing.as_mut().poll(cx)
+            {
+                known = Some(done);
+            }
+            match known.take_if(|_| said) {
+                Some(done) => Poll::Ready(done),
+                None => Poll::Pending,
+            }
+        });
+        if let Err(error) = patiently("a goodbye, said and heard", both).await? {
+            return broken(format!("the far end failed at hearing a goodbye: {error}"));
+        }
+    }
+    if let Some(sent) = sent
+        && (heard != sent || !ended)
+    {
+        return broken("what a session sent before it ended arrives before the goodbye");
+    }
+    line.over = true;
+    line.is_over(caps.audio).await
+}
+
+/// Has the far end of a transport leave. `transport` has to be one that
+/// nobody has looked at yet, and `far` its far end, known to it as
+/// `who`.
+///
+/// The rules: a far end that says goodbye has left, which the transport
+/// says once; nothing follows that but the end of the transport; and a
+/// transport that is over says so every time it is asked, takes what it
+/// is given without a word, and has nobody to say goodbye to.
+///
+/// # Errors
+///
+/// The rule the adapter broke.
+pub async fn transport_is_left<F: FarEnd>(
+    transport: &mut dyn Transport,
+    far: &mut F,
+    who: ParticipantId,
+) -> Result<(), Broken> {
+    let caps = transport.caps();
+    let mut line = Watched::new(transport);
+    line.joined(who).await?;
+    line.during("leaving", far.leave()).await?;
+    match line.next("that the far end left").await? {
+        Some(TransportEvent::Left { who: left }) if left == who => {}
+        other => {
+            return broken(format!(
+                "a far end that says goodbye has left: the transport said {other:?}"
+            ));
+        }
+    }
+    if let Some(event) = line.next("the end of a transport").await? {
+        return broken(format!(
+            "nothing follows a far end that left: the transport said {event:?}"
+        ));
+    }
+    line.is_over(caps.audio).await
 }
 
 // ---------------------------------------------------------------------

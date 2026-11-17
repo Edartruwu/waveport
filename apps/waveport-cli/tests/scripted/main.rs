@@ -46,9 +46,15 @@ use std::time::Instant;
 
 use waveport_adapter_kit::pcm::write_base64;
 use waveport_adapter_kit::wav;
+use waveport_adapter_kit::ws::{WsConn, WsMessage};
 use waveport_ports::audio::Rate;
+use waveport_protocol::client::v1::{
+    self as protocol, AudioFormat, ByeReason, Codec, Cut, ErrorCode, Fact, FromClient, FromServer,
+    Lifecycle, Resume,
+};
 use waveport_testkit::servers::{HttpAnswer, HttpServer, WsHeard, WsSeen, WsServer, WsStep};
 use waveport_testkit::speech;
+use waveport_transport_websocket::{Client, Heard, Hello, PATH, PROTOCOL, Unconnected};
 
 /// What the recogniser said when it was sent this question.
 const HEARD: &str =
@@ -236,11 +242,6 @@ fn desk() -> PathBuf {
     folder(&format!("desks/{}-{number}", std::process::id()))
 }
 
-/// Starts the command in a folder of its own.
-fn started(arguments: &[&str]) -> Child {
-    started_at(&desk(), arguments, None)
-}
-
 /// Starts the command in the folder `desk`. `halt` is where it is told
 /// to stop, if anywhere.
 fn started_at(desk: &Path, arguments: &[&str], halt: Option<&str>) -> Child {
@@ -310,7 +311,13 @@ impl Serving {
     /// Starts the command, which is to take calls, and waits until it
     /// says where. Returns it and the address.
     async fn start(arguments: &[&str]) -> (Self, String) {
-        let mut child = started(arguments);
+        Self::start_at(&desk(), arguments, None).await
+    }
+
+    /// As [`start`](Self::start), in the folder `desk`. `halt` is where
+    /// the command is told to stop, if anywhere.
+    async fn start_at(desk: &Path, arguments: &[&str], halt: Option<&str>) -> (Self, String) {
+        let mut child = started_at(desk, arguments, halt);
         let told = lines_of(child.stdout.take().unwrap());
         let errors = lines_of(child.stderr.take().unwrap());
         let mut serving = Self {
@@ -320,14 +327,20 @@ impl Serving {
         };
         let began = Instant::now();
         loop {
-            let said = serving.told.lock().unwrap().first().cloned();
-            if let Some(line) = said {
-                let address = line
-                    .strip_prefix("taking calls at ")
-                    .unwrap_or_else(|| panic!("the first line was {line:?}"))
-                    .to_owned();
-                return (serving, address);
+            // What it has to say of the calls it keeps comes first.
+            let said = serving.told.lock().unwrap().clone();
+            let address = said
+                .iter()
+                .find_map(|line| line.strip_prefix("taking calls at "));
+            if let Some(address) = address {
+                return (serving, address.to_owned());
             }
+            let first = said.first().map_or("", String::as_str);
+            assert!(
+                first.is_empty() || first.starts_with("note: ") || said.len() < 8,
+                "the command says other things than where it takes calls\n{}",
+                serving.all()
+            );
             let gone = serving.child.try_wait().unwrap().is_some();
             assert!(
                 !gone && began.elapsed() < Duration::from_secs(60),
@@ -345,6 +358,26 @@ impl Serving {
             self.told.lock().unwrap().join("\n"),
             self.errors.lock().unwrap().join("\n")
         )
+    }
+
+    /// Waits until the command has said a line that is `line`.
+    async fn says(&self, line: &str) {
+        let began = Instant::now();
+        while !self.told.lock().unwrap().iter().any(|said| said == line) {
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "the command did not say {line:?}\n{}",
+                self.all()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Kills the command as `kill -9` does: it is given no chance to
+    /// finish anything.
+    fn killed(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
     }
 
     /// Waits for the command to end by itself, and returns how it did.
@@ -746,6 +779,356 @@ async fn a_call_over_a_websocket_goes_as_one_at_the_desk_does() {
 
     providers.were_asked_as_one_question_asks(&all);
     holds_the_answer(&recording, &all);
+}
+
+/// What a caller that is a program, and not the command, does on a
+/// call: it types its question, and says of each run of audio that it
+/// has played it once all of it has arrived. Returns the facts it was
+/// told, with their numbers, and how the agent's side said goodbye.
+async fn stays_on(caller: &mut Client) -> (Vec<(u64, Fact)>, ByeReason) {
+    let mut facts = Vec::new();
+    // How many samples of the run that is arriving have arrived.
+    let mut held = 0;
+    let staying = async {
+        loop {
+            match caller.next().await.unwrap().expect("a goodbye") {
+                Heard::Begins { .. } => held = 0,
+                Heard::Audio(samples) => held += u32::try_from(samples.len() / 2).unwrap(),
+                Heard::Ends(run) => caller.played(run, held).await.unwrap(),
+                Heard::Fact { seq, fact } => facts.push((seq, fact)),
+                Heard::Bye(reason) => return reason,
+                _ => {}
+            }
+        }
+    };
+    let reason = tokio::time::timeout(Duration::from_secs(60), staying)
+        .await
+        .unwrap_or_else(|_| panic!("the call did not end: so far {facts:?}"));
+    (facts, reason)
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one call, told from the line that drops to the goodbye"
+)]
+async fn a_caller_whose_line_drops_is_given_it_back() {
+    let providers = Providers::start().await;
+    let mut arguments = ["serve", "--listen", "127.0.0.1:0", "--calls", "1"]
+        .map(str::to_owned)
+        .to_vec();
+    arguments.extend(providers.arguments());
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let (mut serving, address) = Serving::start(&arguments).await;
+    let soon = Duration::from_secs(10);
+
+    // A caller that is told what the tools do, with audio as a browser
+    // would send it.
+    let hello = Hello {
+        features: vec!["tools".to_owned()],
+        ..Hello::new(Some(AudioFormat {
+            codec: Codec::Pcm16,
+            rate: 24_000,
+        }))
+    };
+    let first = Client::connect(&address, &hello, soon).await.unwrap();
+    let welcome = first.welcome().clone();
+    assert!(!welcome.resumed, "{welcome:?}");
+    assert_eq!((welcome.life, welcome.grace_ms), (1, Some(30_000)));
+    assert_eq!(welcome.features, ["tools"]);
+    let token = welcome
+        .resume_token
+        .clone()
+        .expect("a token to come back with");
+    assert!(token.starts_with("wpr1_"));
+    // Its line drops before it has said anything.
+    first.drop_line();
+
+    // Nobody takes its place who does not hold what it was given: not
+    // with a token that was made up, and not with one of another call.
+    let with = |token: &str, life, seen| Hello {
+        resume: Some(Resume {
+            token: token.to_owned(),
+            life,
+            seen,
+        }),
+        ..hello.clone()
+    };
+    // One that is no token, and one that reads as the call's own and
+    // is not: only whoever keeps the call can tell the second.
+    let mut other = token.clone();
+    let last = other.pop().unwrap();
+    other.push(if last == '0' { '1' } else { '0' });
+    assert!(other.parse::<waveport_assembly::ResumeToken>().is_ok());
+    for wrong in ["wpr1_madeup", &other] {
+        let refused = Client::connect(&address, &with(wrong, 1, 0), soon).await;
+        let Err(Unconnected::Refused { code, .. }) = refused else {
+            panic!("a stranger was taken");
+        };
+        assert_eq!(code, ErrorCode::Token);
+    }
+
+    // It comes back with it, and is given its line: the same call, in
+    // the same life, and the same token to come back with again.
+    let mut caller = Client::connect(&address, &with(&token, 1, 0), soon)
+        .await
+        .unwrap();
+    let back = caller.welcome().clone();
+    assert!(back.resumed, "{back:?}");
+    assert_eq!(
+        (back.session, back.life, back.resume_token),
+        (welcome.session, 1, Some(token))
+    );
+    // And the call goes as any other.
+    caller.text("What time is it right now?").await.unwrap();
+    let (facts, reason) = stays_on(&mut caller).await;
+    let code = serving.ended().await;
+    let all = format!("{}--- the facts ---\n{facts:#?}\n", serving.all());
+    assert_eq!(reason, ByeReason::Ended, "{all}");
+    assert_eq!(code, Some(0), "{all}");
+
+    // It was told the call in facts, each numbered after the one before.
+    assert!(facts.windows(2).all(|two| two[0].0 < two[1].0), "{all}");
+    let at = |is: &dyn Fn(&Fact) -> bool| {
+        facts
+            .iter()
+            .position(|(_, fact)| is(fact))
+            .unwrap_or_else(|| panic!("a fact is missing\n{all}"))
+    };
+    let asked = at(
+        &|fact| matches!(fact, Fact::TurnCommitted { text, .. } if text == "What time is it right now?"),
+    );
+    // A caller of an agent that takes calls on this machine alone is
+    // shown what the tools were given and what they answered.
+    let looked_up = at(&|fact| {
+        matches!(fact, Fact::ToolCalled { tool, args, .. }
+            if tool == "get_time" && args.as_deref() == Some("{}"))
+    });
+    let answered = at(&|fact| {
+        matches!(fact, Fact::UtteranceCommitted { text, truncated: false, .. }
+            if text == "It is ten past three. Goodbye!")
+    });
+    let hung_up = at(&|fact| {
+        matches!(fact, Fact::ToolFinished { result, .. }
+            if result.as_deref() == Some("The call is ending."))
+    });
+    let ended = at(&|fact| {
+        matches!(
+            fact,
+            Fact::LifecycleChanged {
+                to: Lifecycle::Closed,
+                ..
+            }
+        )
+    });
+    assert!(
+        asked < looked_up && looked_up < answered && answered < hung_up && hung_up < ended,
+        "{all}"
+    );
+    // How it ended is the last thing it was told before the goodbye.
+    assert_eq!(ended, facts.len() - 1, "{all}");
+
+    // The agent's side told the same call, and that its caller was away.
+    let served = serving.told.lock().unwrap().join("\n");
+    tells_the_call(&served, "[1] ", &all);
+    assert!(
+        served.contains("[1] the caller is back, from 127.0.0.1:"),
+        "{all}"
+    );
+    assert!(!served.contains("the caller left"), "{all}");
+}
+
+#[tokio::test]
+async fn a_caller_who_could_be_anybody_is_not_shown_what_the_tools_said() {
+    let providers = Providers::start().await;
+    // An agent that may be reached from other machines, though it is
+    // not: nothing asks its callers who they are.
+    let mut arguments = [
+        "serve",
+        "--listen",
+        "127.0.0.1:0",
+        "--exposed",
+        "--calls",
+        "1",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    arguments.extend(providers.arguments());
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let (mut serving, address) = Serving::start(&arguments).await;
+
+    let hello = Hello {
+        features: vec!["tools".to_owned()],
+        ..Hello::new(Some(AudioFormat {
+            codec: Codec::Pcm16,
+            rate: 24_000,
+        }))
+    };
+    let mut caller = Client::connect(&address, &hello, Duration::from_secs(10))
+        .await
+        .unwrap();
+    caller.text("What time is it right now?").await.unwrap();
+    let (facts, reason) = stays_on(&mut caller).await;
+    let code = serving.ended().await;
+    let all = format!("{}--- the facts ---\n{facts:#?}\n", serving.all());
+    assert_eq!((reason, code), (ByeReason::Ended, Some(0)), "{all}");
+
+    // It is told that the tools were called, and how that went, and
+    // nothing of what they were given or what they answered.
+    let mut tools = Vec::new();
+    let mut finished = 0;
+    for (_, fact) in &facts {
+        match fact {
+            Fact::ToolCalled { tool, args, .. } => {
+                assert_eq!(*args, None, "{all}");
+                tools.push(tool.as_str());
+            }
+            Fact::ToolFinished { result, .. } => {
+                assert_eq!(*result, None, "{all}");
+                finished += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(tools, ["get_time", "end_call"], "{all}");
+    assert_eq!(finished, 2, "{all}");
+    // What was said is no secret from whoever it was said to.
+    assert!(
+        facts.iter().any(|(_, fact)| matches!(fact,
+            Fact::UtteranceCommitted { text, .. } if text == "It is ten past three. Goodbye!")),
+        "{all}"
+    );
+    // The agent's own terminal has all of it.
+    let served = serving.told.lock().unwrap().join("\n");
+    tells_the_call(&served, "[1] ", &all);
+}
+
+/// How a stand-in for an agent's side ends a connection: with the facts
+/// numbered up to this, if any, and then with a goodbye, or with none.
+type LineEnd = (Option<u64>, Option<ByeReason>);
+
+/// A stand-in for an agent's side, for a caller to be held to what the
+/// protocol asks of it. It takes as many connections as `ends` has
+/// entries, one after the other. Each is welcomed to a life of the call
+/// that has the connection's number, with a token of its own, and ended
+/// as its entry says. Returns the hello of each.
+async fn stand_in_for_an_agent(
+    listener: tokio::net::TcpListener,
+    ends: Vec<LineEnd>,
+) -> Vec<FromClient> {
+    let soon = Duration::from_secs(10);
+    let mut hellos = Vec::new();
+    for (life, (facts, goodbye)) in (1_u64..).zip(ends) {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let (mut conn, _) = WsConn::accept(tcp, PATH, Some(PROTOCOL), soon)
+            .await
+            .unwrap();
+        let Some(WsMessage::Text(said)) = conn.next().await.unwrap() else {
+            panic!("a connection that does not begin with a hello");
+        };
+        let hello: FromClient = serde_json::from_str(said.as_str()).unwrap();
+        let FromClient::Hello { audio, .. } = &hello else {
+            panic!("a connection that begins with {hello:?}");
+        };
+        let mut says = vec![FromServer::Welcome {
+            v: protocol::VERSION,
+            session: "a-call".to_owned(),
+            life,
+            resumed: life > 1,
+            resume_token: Some(format!("wpr1_madeup{life}")),
+            audio: *audio,
+            features: Vec::new(),
+            next_seq: 1,
+            grace_ms: Some(30_000),
+        }];
+        says.extend((1..=facts.unwrap_or(0)).map(|seq| FromServer::Fact {
+            seq,
+            fact: Fact::CutOff {
+                cause: Cut::BargeIn,
+            },
+        }));
+        says.extend(goodbye.map(|reason| FromServer::Bye { reason }));
+        for message in says {
+            let written = serde_json::to_string(&message).unwrap();
+            conn.send_text(written).await.unwrap();
+        }
+        hellos.push(hello);
+        // Closed as a connection is that has nothing more to say.
+        conn.close_and_wait(None, Duration::from_millis(500)).await;
+    }
+    hellos
+}
+
+#[tokio::test]
+async fn a_caller_comes_back_to_a_line_that_closed_without_a_goodbye() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("ws://{}", listener.local_addr().unwrap());
+    // The first line is closed with no goodbye, as something between
+    // the caller and the agent closes one. The second is closed by an
+    // agent's side that says it is going away, after three facts. The
+    // third ends the call.
+    let agent = tokio::spawn(stand_in_for_an_agent(
+        listener,
+        vec![
+            (None, None),
+            (Some(3), Some(ByeReason::GoingAway)),
+            (None, Some(ByeReason::Ended)),
+        ],
+    ));
+
+    let folder = folder("comes-back-unasked");
+    let script = folder.join("waits.call");
+    // A caller who waits for an agent that never speaks.
+    std::fs::write(&script, "listen 500 20000\n").unwrap();
+    let output = waveport(&[
+        "client",
+        "--url",
+        &address,
+        "--script",
+        script.to_str().unwrap(),
+    ])
+    .await;
+    let told = String::from_utf8_lossy(&output.stdout);
+    let errors = String::from_utf8_lossy(&output.stderr);
+    let all = format!("--- told ---\n{told}--- errors ---\n{errors}");
+
+    // It came back each time, and said why it had to.
+    for why in [
+        "its connection closed with no goodbye",
+        "the agent's side is going away",
+    ] {
+        let line =
+            format!("waveport: the line to the agent dropped ({why}): coming back to the call");
+        assert_eq!(errors.matches(&line).count(), 1, "{line}\n{all}");
+    }
+    assert_eq!(told.matches("the call goes on\n").count(), 2, "{all}");
+    assert!(told.contains("the call ended: nobody said why"), "{all}");
+    assert_eq!(output.status.code(), Some(0), "{all}");
+
+    // Each time it said where it was: with the token and the life the
+    // line before gave it, and the last fact it was sent.
+    let hellos = tokio::time::timeout(Duration::from_secs(10), agent)
+        .await
+        .unwrap_or_else(|_| panic!("the caller did not come back\n{all}"))
+        .unwrap();
+    let came_with: Vec<Option<(String, u64, u64)>> = hellos
+        .into_iter()
+        .map(|hello| match hello {
+            FromClient::Hello { resume, .. } => {
+                resume.map(|Resume { token, life, seen }| (token, life, seen))
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        came_with,
+        [
+            None,
+            Some(("wpr1_madeup1".to_owned(), 1, 0)),
+            Some(("wpr1_madeup2".to_owned(), 2, 3)),
+        ],
+        "{all}"
+    );
 }
 
 #[tokio::test]

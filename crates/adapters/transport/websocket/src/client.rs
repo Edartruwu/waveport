@@ -1,49 +1,117 @@
-//! The client's side of the protocol.
+//! The far end's side: what a command at a desk or a test connects with.
 
+use core::fmt;
 use core::time::Duration;
 
 use bytes::Bytes;
 use waveport_adapter_kit::ws::{WsConn, WsMessage, WsRequest};
-use waveport_ports::audio::Rate;
 use waveport_ports::error::PortError;
+use waveport_protocol::client::v1::{
+    self as client, ByeReason, ErrorCode, FromClient, FromServer, News,
+};
 
-use crate::wire::{self, FromClient, FromServer, PATH, PROTOCOL};
+use crate::wire::{self, Hello, PATH, PROTOCOL, Welcome};
 
 /// Something a server says or sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Heard {
-    /// The audio that follows is that of this response.
-    Begins(u32),
-    /// A piece of the response that began last.
+    /// The audio that follows is that of this run.
+    Begins {
+        /// The number of the run.
+        run: u32,
+        /// The response it is the audio of.
+        generation: u32,
+    },
+    /// A piece of the run that began last.
     Audio(Bytes),
-    /// All of this response has been sent.
+    /// All of this run has been sent.
     Ends(u32),
-    /// What is held of this response, and of any before it, and has not
-    /// been played is to be discarded.
+    /// What is held of this run, and of any before it, and has not been
+    /// played is to be discarded.
     Clear(u32),
-    /// A line about the call, for a person to read.
-    Line(String),
-    /// The call is over, and why. Nothing follows.
-    Bye(String),
+    /// Something became true of the session.
+    Fact {
+        /// Its number.
+        seq: u64,
+        /// What it is.
+        fact: client::Fact,
+    },
+    /// Something is going on.
+    Told(News),
+    /// What was held cannot be gone on from. A state follows, and then
+    /// the facts from this number on.
+    Gap {
+        /// The number of the first fact that follows the state.
+        resumes: u64,
+    },
+    /// What the facts up to one of them add up to.
+    State(Box<client::State>),
+    /// A message of this client was not taken, or the session failed.
+    Error {
+        /// Why, for a program.
+        code: ErrorCode,
+        /// Why, for a person.
+        message: String,
+    },
+    /// The server is done with this connection, and why. Nothing
+    /// follows.
+    Bye(ByeReason),
+}
+
+/// Why a client is not connected.
+#[derive(Debug)]
+pub enum Unconnected {
+    /// The server heard the hello and turned the client away.
+    Refused {
+        /// Why, for a program.
+        code: ErrorCode,
+        /// Why, for a person.
+        message: String,
+    },
+    /// The server could not be reached, took too long, or did not keep
+    /// to the protocol.
+    Failed(PortError),
+}
+
+impl fmt::Display for Unconnected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused { message, .. } => {
+                write!(f, "the server turned the client away: {message}")
+            }
+            Self::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
+impl core::error::Error for Unconnected {}
+
+impl From<PortError> for Unconnected {
+    fn from(error: PortError) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// A connection to a session, from the far end's side.
 #[derive(Debug)]
 pub struct Client {
     conn: WsConn,
-    session: String,
+    welcome: Welcome,
 }
 
 impl Client {
     /// Connects to the server at `address`, such as
-    /// `ws://127.0.0.1:7880`, says hello with audio at `rate`, and waits
-    /// for the session to be there.
+    /// `ws://127.0.0.1:7880`, says `hello`, and waits to be welcomed.
     ///
     /// # Errors
     ///
     /// The server cannot be reached, does not speak the protocol, turns
     /// the client away, or takes longer than `timeout` over any of it.
-    pub async fn connect(address: &str, rate: Rate, timeout: Duration) -> Result<Self, PortError> {
+    pub async fn connect(
+        address: &str,
+        hello: &Hello,
+        timeout: Duration,
+    ) -> Result<Self, Unconnected> {
         let address = address.trim_end_matches('/');
         let url = if address.ends_with(PATH) {
             address.to_owned()
@@ -56,58 +124,88 @@ impl Client {
             timeout,
         };
         let mut conn = WsConn::connect(request).await?;
-        let hello = FromClient::Hello { rate: rate.hz() };
-        conn.send_text(wire::write(&hello)).await?;
-        let answer = match tokio::time::timeout(timeout, conn.next()).await {
-            Ok(answer) => answer?,
-            Err(_) => {
-                return Err(PortError::timeout(format!(
-                    "the server did not answer a hello within {} ms",
-                    timeout.as_millis()
-                )));
-            }
-        };
-        let Some(WsMessage::Text(text)) = answer else {
-            return Err(PortError::permanent(
-                "the server did not answer a hello with words",
+        conn.send_text(wire::write(&hello.said())).await?;
+        let Ok(answer) = tokio::time::timeout(timeout, conn.next()).await else {
+            let error = PortError::timeout(format!(
+                "the server did not answer a hello within {} ms",
+                timeout.as_millis()
             ));
+            return Err(error.into());
         };
+        let answer = answer?;
+        let Some(WsMessage::Text(text)) = answer else {
+            let error = PortError::permanent("the server did not answer a hello with words");
+            return Err(error.into());
+        };
+        let failed = |what: String| Err(Unconnected::Failed(PortError::permanent(what)));
         match wire::read(text.as_str())? {
-            FromServer::Ready { session, rate: at } if at == rate.hz() => {
-                Ok(Self { conn, session })
+            FromServer::Welcome {
+                v,
+                session,
+                life,
+                resumed,
+                resume_token,
+                audio,
+                features,
+                next_seq,
+                grace_ms,
+            } => {
+                if v != client::VERSION {
+                    return failed(format!(
+                        "the server answered in version {v} of the protocol"
+                    ));
+                }
+                if audio != hello.audio {
+                    return failed(format!(
+                        "the server answered with {audio:?} for audio, which was not asked for"
+                    ));
+                }
+                let welcome = Welcome {
+                    session,
+                    life,
+                    resumed,
+                    resume_token,
+                    features,
+                    next_seq,
+                    grace_ms,
+                };
+                Ok(Self { conn, welcome })
             }
-            FromServer::Ready { rate: at, .. } => Err(PortError::permanent(format!(
-                "the server answered with audio at {at} Hz, which was not asked for"
-            ))),
-            FromServer::Bye { reason } => Err(PortError::permanent(format!(
-                "the server turned the client away: {reason}"
-            ))),
-            other => Err(PortError::permanent(format!(
-                "the server answered a hello with {other:?}"
-            ))),
+            FromServer::Error { code, message } => Err(Unconnected::Refused { code, message }),
+            FromServer::Bye { reason } => failed(format!(
+                "the server answered a hello with goodbye: {reason:?}"
+            )),
+            _ => failed("the server answered a hello with something else".to_owned()),
         }
+    }
+
+    /// What the server said as it took the client.
+    #[must_use]
+    pub const fn welcome(&self) -> &Welcome {
+        &self.welcome
     }
 
     /// What the server calls the session.
     #[must_use]
     pub fn session(&self) -> &str {
-        &self.session
+        &self.welcome.session
     }
 
-    /// Sends what the microphone heard: samples at the rate that was
-    /// named, the low byte first.
+    /// Sends what the microphone heard, as the hello said it would be
+    /// written: any whole number of samples, the low byte first, or one
+    /// Opus packet.
     ///
     /// # Errors
     ///
     /// The connection is gone.
-    pub async fn audio(&mut self, samples: Bytes) -> Result<(), PortError> {
-        if samples.is_empty() {
+    pub async fn audio(&mut self, audio: Bytes) -> Result<(), PortError> {
+        if audio.is_empty() {
             return Ok(());
         }
-        self.conn.send_binary(samples).await
+        self.conn.send_binary(audio).await
     }
 
-    /// Says how many samples of response `run` have been played so far.
+    /// Says how many samples of `run` have been played so far.
     ///
     /// # Errors
     ///
@@ -126,7 +224,31 @@ impl Client {
         self.say(&FromClient::Text { text }).await
     }
 
-    async fn say(&mut self, message: &FromClient) -> Result<(), PortError> {
+    /// Presses keys of a telephone, one after another.
+    ///
+    /// # Errors
+    ///
+    /// The connection is gone.
+    pub async fn dtmf(&mut self, keys: &str) -> Result<(), PortError> {
+        let keys = keys.to_owned();
+        self.say(&FromClient::Dtmf { keys }).await
+    }
+
+    /// Asks that the agent stop speaking.
+    ///
+    /// # Errors
+    ///
+    /// The connection is gone.
+    pub async fn interrupt(&mut self) -> Result<(), PortError> {
+        self.say(&FromClient::Interrupt).await
+    }
+
+    /// Says `message` as it is, whether or not a server takes it.
+    ///
+    /// # Errors
+    ///
+    /// The connection is gone.
+    pub async fn say(&mut self, message: &FromClient) -> Result<(), PortError> {
         self.conn.send_text(wire::write(message)).await
     }
 
@@ -138,29 +260,47 @@ impl Client {
     /// The connection dropped, or the server said something that is not
     /// of the protocol.
     pub async fn next(&mut self) -> Result<Option<Heard>, PortError> {
-        let text = match self.conn.next().await? {
-            Some(WsMessage::Text(text)) => text,
-            Some(WsMessage::Binary(samples)) => return Ok(Some(Heard::Audio(samples))),
-            None => return Ok(None),
-        };
-        let heard = match wire::read(text.as_str())? {
-            FromServer::Mark { run, end: false } => Heard::Begins(run),
-            FromServer::Mark { run, end: true } => Heard::Ends(run),
-            FromServer::Clear { run } => Heard::Clear(run),
-            FromServer::Event { text } => Heard::Line(text),
-            FromServer::Bye { reason } => Heard::Bye(reason),
-            FromServer::Ready { .. } => {
-                return Err(PortError::permanent(
-                    "the server said that the session is there a second time",
-                ));
-            }
-        };
-        Ok(Some(heard))
+        loop {
+            let text = match self.conn.next().await? {
+                Some(WsMessage::Text(text)) => text,
+                Some(WsMessage::Binary(audio)) => return Ok(Some(Heard::Audio(audio))),
+                None => return Ok(None),
+            };
+            let heard = match wire::read(text.as_str())? {
+                FromServer::Mark {
+                    run,
+                    generation,
+                    end: false,
+                } => Heard::Begins { run, generation },
+                FromServer::Mark { run, end: true, .. } => Heard::Ends(run),
+                FromServer::Clear { run } => Heard::Clear(run),
+                FromServer::Fact { seq, fact } => Heard::Fact { seq, fact },
+                FromServer::Told(news) => Heard::Told(news),
+                FromServer::Gap { resumes } => Heard::Gap { resumes },
+                FromServer::State(state) => Heard::State(Box::new(state)),
+                FromServer::Error { code, message } => Heard::Error { code, message },
+                FromServer::Bye { reason } => Heard::Bye(reason),
+                FromServer::Welcome { .. } => {
+                    return Err(PortError::permanent(
+                        "the server welcomed the client a second time",
+                    ));
+                }
+                // A message of a later version: it is passed over.
+                FromServer::Unknown => continue,
+            };
+            return Ok(Some(heard));
+        }
     }
 
-    /// Says goodbye and closes the connection.
+    /// Says goodbye, which ends the session, and closes the connection.
     pub async fn bye(mut self) {
         let _ = self.say(&FromClient::Bye).await;
         self.conn.close().await;
+    }
+
+    /// Lets go of the connection without a word, as a client does whose
+    /// network is gone. The session waits for it to come back.
+    pub fn drop_line(self) {
+        drop(self.conn);
     }
 }
