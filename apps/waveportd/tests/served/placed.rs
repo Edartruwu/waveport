@@ -159,7 +159,7 @@ mod on_linux {
         for (name, allowed) in &others {
             assert_eq!(allowed, &rest, "{name}: {threads:?}");
         }
-        let said = daemon.errors();
+        let said = daemon.noted("waveportd: the shards are kept on").await;
         let processor = if shards.len() == 1 {
             format!("processors {first},")
         } else {

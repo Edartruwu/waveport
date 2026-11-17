@@ -7,6 +7,11 @@
 //! language model is a server on this machine whose answers are made
 //! up, in the shape of the ones that were recorded for the adapter's own
 //! tests.
+//!
+//! `lined` has the far end on a WebSocket, and `aloud` has it speak
+//! there: that one needs the models that listen
+//! (`cargo xtask fetch-assets`), and stand-ins for the providers that
+//! recognise and synthesise speech.
 
 #![expect(
     clippy::unwrap_used,
@@ -17,8 +22,10 @@
 
 mod far_end;
 
+mod aloud;
 mod asked;
 mod kept;
+mod lined;
 mod placed;
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -27,12 +34,11 @@ use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use waveport_protocol::client::v1::{Applied, FromServer, View};
-#[cfg(unix)]
-use waveport_testkit::servers::End;
-use waveport_testkit::servers::{HttpAnswer, HttpServer};
+use waveport_testkit::servers::{End, HttpAnswer, HttpServer};
 
 use crate::far_end::{Answer, Event, Events, ask};
 
@@ -77,7 +83,6 @@ fn answer(words: &[&str], tool: Option<&str>) -> HttpAnswer {
 }
 
 /// The same answer, with `pause` before each of its lines.
-#[cfg(unix)]
 fn slow_answer(words: &[&str], pause: Duration) -> HttpAnswer {
     HttpAnswer::Stream {
         pieces: answer_as_text(words, None)
@@ -86,6 +91,23 @@ fn slow_answer(words: &[&str], pause: Duration) -> HttpAnswer {
             .collect(),
         pause,
         end: End::Complete,
+    }
+}
+
+/// An answer that stops after its first words and is never finished:
+/// the server says nothing more, and keeps the connection.
+fn stops_short() -> HttpAnswer {
+    let begun = [
+        piece("{\"role\":\"assistant\",\"content\":\"\"}", "null"),
+        piece(&format!("{{\"content\":\"{}\"}}", ANSWER[0]), "null"),
+    ];
+    HttpAnswer::Stream {
+        pieces: begun
+            .iter()
+            .map(|piece| piece.as_bytes().to_vec())
+            .collect(),
+        pause: Duration::ZERO,
+        end: End::Hang,
     }
 }
 
@@ -114,16 +136,19 @@ fn config(llm: &HttpServer, more: &str) -> String {
     )
 }
 
-/// Keeps the lines that come through `pipe`.
-fn lines_of(pipe: impl std::io::Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
+/// Keeps the lines that come through `pipe`. Returns them, and the
+/// thread that reads them, which ends when the pipe is closed.
+fn lines_of(
+    pipe: impl std::io::Read + Send + 'static,
+) -> (Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
     let kept = Arc::new(Mutex::new(Vec::new()));
     let keeping = Arc::clone(&kept);
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         for line in BufReader::new(pipe).lines().map_while(Result::ok) {
             keeping.lock().unwrap().push(line);
         }
     });
-    kept
+    (kept, reader)
 }
 
 /// The daemon, started in a folder, with what it has to be told.
@@ -136,6 +161,7 @@ fn command(desk: &Path, config: &str, variables: &[(&str, &str)]) -> Command {
         // No key of anyone's is needed for a server on this machine,
         // and none is to reach it.
         .env_remove("OPENAI_API_KEY")
+        .env_remove("CARTESIA_API_KEY")
         .env_remove("WAVEPORT_TEST_HALT")
         .envs(variables.iter().copied())
         .stdin(Stdio::null())
@@ -151,6 +177,8 @@ struct Served {
     address: String,
     told: Arc<Mutex<Vec<String>>>,
     errors: Arc<Mutex<Vec<String>>>,
+    /// The threads that read what it says.
+    readers: Vec<JoinHandle<()>>,
 }
 
 impl Served {
@@ -158,8 +186,8 @@ impl Served {
     /// where it listens.
     async fn start(desk: &Path, config: &str, variables: &[(&str, &str)]) -> Self {
         let mut child = command(desk, config, variables).spawn().unwrap();
-        let told = lines_of(child.stdout.take().unwrap());
-        let errors = lines_of(child.stderr.take().unwrap());
+        let (told, told_by) = lines_of(child.stdout.take().unwrap());
+        let (errors, errors_by) = lines_of(child.stderr.take().unwrap());
         let began = Instant::now();
         let address = loop {
             let listening = told.lock().unwrap().iter().find_map(|line| {
@@ -182,6 +210,7 @@ impl Served {
             address,
             told,
             errors,
+            readers: vec![told_by, errors_by],
         }
     }
 
@@ -199,9 +228,37 @@ impl Served {
         }
     }
 
-    /// What the daemon said to whoever runs it.
+    /// What the daemon said to whoever runs it, as far as it has been
+    /// read. What a daemon says is read by a thread of its own, which
+    /// may not have got to all of it: a test that looks for something
+    /// the daemon said waits for it (`noted`), or for the daemon to be
+    /// over.
     fn errors(&self) -> String {
         self.errors.lock().unwrap().join("\n")
+    }
+
+    /// What the daemon said to whoever runs it, once it has said `what`.
+    async fn noted(&self, what: &str) -> String {
+        let began = Instant::now();
+        loop {
+            let errors = self.errors();
+            if errors.contains(what) {
+                return errors;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "the daemon did not say {what:?}: {errors}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Reads what a daemon that is over said, to its end: its pipes are
+    /// closed, and the threads that read them end.
+    fn read_to_the_end(&mut self) {
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
     }
 
     /// Asks the daemon as whoever is on its machine and says nothing of
@@ -262,6 +319,7 @@ impl Served {
     fn kill(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
+        self.read_to_the_end();
     }
 
     /// Tells the daemon to stop, as whoever runs it does.
@@ -280,6 +338,7 @@ impl Served {
         let began = Instant::now();
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
+                self.read_to_the_end();
                 return status;
             }
             assert!(

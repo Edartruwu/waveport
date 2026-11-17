@@ -1389,6 +1389,74 @@ async fn what_is_asked_as_a_caller_joins_finds_the_caller_there() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_far_end_is_greeted_when_it_joins_and_before_what_it_says_is_taken() {
+    let greets = || SessionSpec {
+        greeting: Some("Good morning.".to_owned()),
+        ..spec()
+    };
+    // Nobody is greeted before they are there.
+    let world = World::new(&[], ScriptedLlm::replies(Vec::new()));
+    let later = FakeTransport::sound_card().join(2_000, CALLER);
+    let mut running = Running::start_as(greets(), &world, later).await;
+    assert_eq!(running.until(1_900).await, None);
+    assert_eq!(running.watch.first("Tts("), None);
+    assert_eq!(running.until(8_000).await, None);
+    assert_eq!(running.utterances(), [("Good morning.".to_owned(), false)]);
+    let greeted = running.watch.first("Tts(").unwrap();
+    assert!((2_000..2_100).contains(&greeted), "greeted at {greeted} ms");
+
+    // A far end that joins and types in the same moment: both are
+    // waiting when the session first runs.
+    let llm = ScriptedLlm::replies(vec![vec![LlmStep::say("It is three.")]]);
+    let world = World::new(&[], llm);
+    let at_once = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .text(0, CALLER, "what time is it");
+    let mut running = Running::start_as(greets(), &world, at_once).await;
+    assert_eq!(running.until(8_000).await, None);
+    // It was greeted first. What it typed stopped the greeting, as it
+    // stops whatever is being said, and was answered. A greeting that
+    // came after would have stopped the answer, and the question would
+    // have had none.
+    let asked = world.llm.asked();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].last_user(), Some("what time is it"));
+    let utterances = running.utterances();
+    assert_eq!(
+        utterances.last(),
+        Some(&("It is three.".to_owned(), false)),
+        "{utterances:?}"
+    );
+
+    // A session that goes on after its process died has greeted.
+    let journal = world.journal.clone();
+    let world = World {
+        journal,
+        ..World::new(&[], ScriptedLlm::replies(Vec::new()))
+    };
+    let back = FakeTransport::sound_card().join(0, CALLER);
+    let mut running = Running::start_as(greets(), &world, back).await;
+    assert_eq!(running.until(8_000).await, None);
+    let said: Vec<String> = running
+        .utterances()
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect();
+    assert!(!said.is_empty(), "{said:?}");
+    assert_eq!(
+        said.iter().filter(|text| *text == "Good morning.").count(),
+        0
+    );
+    assert_eq!(
+        said,
+        utterances
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn what_is_typed_into_a_call_stops_what_is_being_said() {
     let speech = [(1_000, 2_200, "tell me a story")];
     let llm = ScriptedLlm::replies(vec![

@@ -135,6 +135,14 @@ impl Tickets {
         }
     }
 
+    /// Uses `token` for the session it was made for, whichever that is:
+    /// the session, if the token is still good and was not used before.
+    /// It is used up either way.
+    pub(crate) fn redeem_for_its_session(&self, token: &str) -> Option<SessionId> {
+        let ticket = self.held().remove(&digest(token))?;
+        (ticket.until > Instant::now()).then_some(ticket.session)
+    }
+
     /// Lets go of every token that was made for `session`.
     pub(crate) fn revoke(&self, session: SessionId) {
         self.held().retain(|_, ticket| ticket.session != session);
@@ -265,6 +273,26 @@ mod tests {
         tickets.revoke(b);
         assert!(!tickets.redeem(&revoked, b));
         assert!(tickets.redeem(&kept, a));
+    }
+
+    #[test]
+    fn a_client_token_says_which_session_it_is_for_once() {
+        let tickets = Tickets::default();
+        let (a, b) = (SessionId(1), SessionId(2));
+        let for_a = tickets.mint(a, Duration::from_secs(60)).unwrap();
+        let for_b = tickets.mint(b, Duration::from_secs(60)).unwrap();
+        assert_eq!(tickets.redeem_for_its_session(&for_b), Some(b));
+        assert_eq!(tickets.redeem_for_its_session(&for_a), Some(a));
+        assert_eq!(tickets.redeem_for_its_session(&for_a), None, "it was used");
+        assert_eq!(tickets.redeem_for_its_session("wpc1_madeup"), None);
+
+        // One that nobody came for in time is none, and one that was
+        // taken back is none.
+        let late = tickets.mint(a, Duration::ZERO).unwrap();
+        assert_eq!(tickets.redeem_for_its_session(&late), None);
+        let revoked = tickets.mint(b, Duration::from_secs(60)).unwrap();
+        tickets.revoke(b);
+        assert_eq!(tickets.redeem_for_its_session(&revoked), None);
     }
 
     #[test]

@@ -7,20 +7,25 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use waveport_assembly::shown::Asked;
 use waveport_assembly::stack::name;
 use waveport_assembly::{
     Agent, Context as _, Failure, ResumeToken, Settled, Stack, StackSpec, Told,
 };
+use waveport_domain::ids::ParticipantId;
 use waveport_ports::control::SessionInput;
 use waveport_ports::journal::SessionId;
 use waveport_ports::plan::SessionPlan;
-use waveport_protocol::client::v1::ErrorCode;
+use waveport_ports::transport::Transport;
+use waveport_protocol::client::v1::{ErrorCode, Resume};
 use waveport_protocol::control::v1::{
     Mode, Problem, SessionCreated, SessionInfo, SessionState, Sessions,
 };
+use waveport_transport_websocket::{Caller, Handle, Link, Welcome};
 
 use crate::auth::{Gate, Keys, Tickets};
 use crate::config::{Config, Limits};
@@ -44,13 +49,59 @@ enum Phase {
     Kept,
 }
 
+/// Who is at the far end of a session's line: its first participant,
+/// who is also the one that writes to a session on no line.
+const FAR_END: ParticipantId = ParticipantId(0);
+
+/// The line of a session that runs on one.
+#[derive(Clone)]
+struct Line {
+    /// What puts a client on it.
+    handle: Handle,
+    /// How long the session waits for a client whose connection
+    /// dropped, in milliseconds.
+    grace_ms: u32,
+}
+
 /// A session of the daemon.
 struct Entry {
     /// Its agent, by the name the configuration gives it.
     agent: String,
     phase: Phase,
+    /// Whether it is on a line, or was when it last ran. A session is
+    /// on a line or on none for all of its lives: the far end of one
+    /// that is has a connection of its own, and the session is gone on
+    /// with when the far end comes back on one.
+    lined: bool,
+    /// Its line, while it runs on one.
+    line: Option<Line>,
     /// Held by whoever starts it, so that one does.
     starting: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// What is kept with a session, for the daemon that goes on with it.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Label {
+    /// Its agent, by the name the configuration gives it.
+    agent: String,
+    /// Whether it is on a line.
+    #[serde(default)]
+    line: bool,
+}
+
+impl Label {
+    /// The label as it was kept. A daemon that knew no lines kept the
+    /// name of the agent and nothing else.
+    fn read(written: &str) -> Self {
+        serde_json::from_str(written).unwrap_or_else(|_| Self {
+            agent: written.to_owned(),
+            line: false,
+        })
+    }
+
+    fn written(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
 }
 
 /// A session that runs, for whoever asked for it to.
@@ -60,6 +111,47 @@ pub(crate) struct Live {
     /// What it tells from its beginning here on, if it was started for
     /// whoever asked and they asked to follow it.
     pub(crate) told: Option<Told>,
+}
+
+/// How a session stands for whoever wants it to run.
+enum Stands {
+    /// It runs, in this life, on this line if it is on one.
+    Runs(u64, Option<Line>),
+    /// It does not: whoever holds `starting` starts it, or goes on with
+    /// it if it ran before.
+    Rests {
+        starting: Arc<tokio::sync::Mutex<()>>,
+        agent: String,
+        ran: bool,
+        lined: bool,
+    },
+}
+
+fn stands(entry: &mut Entry) -> Stands {
+    match entry.phase {
+        Phase::Running { life, .. } => Stands::Runs(life, entry.line.clone()),
+        Phase::Waiting { .. } | Phase::Kept => Stands::Rests {
+            starting: Arc::clone(&entry.starting),
+            agent: entry.agent.clone(),
+            ran: entry.phase == Phase::Kept,
+            lined: entry.lined,
+        },
+    }
+}
+
+/// What a client is told that comes to a session on no line.
+fn no_line() -> Problem {
+    Problem::of(
+        ErrorCode::Unsupported,
+        "the session is on no line: it is written to at its `input` and followed at its `events`",
+    )
+}
+
+/// Tells `caller` why it is not put on a line.
+async fn turned_away<T>(caller: Caller, problem: &Problem) -> Option<T> {
+    let why = problem.detail.as_deref().unwrap_or_default();
+    caller.refuse(problem.code, why).await;
+    None
 }
 
 /// What the requests of a daemon share.
@@ -119,7 +211,7 @@ impl Shared {
         self.going.subscribe()
     }
 
-    fn busy() -> Problem {
+    pub(crate) fn busy() -> Problem {
         Problem::of(
             ErrorCode::Busy,
             "the daemon is stopping, and takes nothing new",
@@ -188,6 +280,8 @@ impl Shared {
             let entry = Entry {
                 agent: agent.to_owned(),
                 phase: Phase::Waiting { until },
+                lined: false,
+                line: None,
                 starting: Arc::default(),
             };
             sessions.insert(id, entry);
@@ -260,44 +354,184 @@ impl Shared {
     /// not run, and gone on with if it is kept and does not run. With
     /// `followed`, whoever has it started is given what it tells from
     /// its beginning here on.
+    ///
+    /// A session that is started here is on no line. One that was on a
+    /// line is not gone on with here: its far end comes back on one.
     pub(crate) async fn live(
         self: &Arc<Self>,
         id: SessionId,
         followed: bool,
     ) -> Result<Live, Problem> {
-        let running = |entry: &mut Entry| match entry.phase {
-            Phase::Running { life, .. } => Ok(life),
-            Phase::Waiting { .. } => Err((Arc::clone(&entry.starting), entry.agent.clone(), false)),
-            Phase::Kept => Err((Arc::clone(&entry.starting), entry.agent.clone(), true)),
-        };
-        let starting = match self.found(id, running)? {
-            Ok(life) => return Ok(Live { life, told: None }),
-            Err((starting, ..)) => starting,
+        let starting = match self.found(id, stands)? {
+            Stands::Runs(life, _) => return Ok(Live { life, told: None }),
+            Stands::Rests { starting, .. } => starting,
         };
         let _one = starting.lock().await;
         // Whoever held it before may have started the session.
-        let (name, resumed) = match self.found(id, running)? {
-            Ok(life) => return Ok(Live { life, told: None }),
-            Err((_, name, resumed)) => (name, resumed),
+        let (agent, ran) = match self.found(id, stands)? {
+            Stands::Runs(life, _) => return Ok(Live { life, told: None }),
+            Stands::Rests {
+                ran: true,
+                lined: true,
+                ..
+            } => {
+                return Err(Problem::of(
+                    ErrorCode::OutOfPlace,
+                    "the session was on a line, and is gone on with when its far end comes back \
+                     on one",
+                ));
+            }
+            Stands::Rests { agent, ran, .. } => (agent, ran),
         };
+        let (life, told, _) = self.start(id, &agent, ran, None, followed).await?;
+        Ok(Live { life, told })
+    }
+
+    /// Puts `caller` on the line of the session `id`. The session is
+    /// started on that line if it was made and has not run, and gone on
+    /// with on it if it is kept and was on one. `back` is what a caller
+    /// that comes back said of where it was; one that is new to the
+    /// session is given a token to come back with. `asked` is what the
+    /// caller is told beyond the facts.
+    ///
+    /// Returns what the caller is told through, and the life the
+    /// session is in. A caller that cannot be put on the line has been
+    /// told why.
+    pub(crate) async fn on_line(
+        self: &Arc<Self>,
+        id: SessionId,
+        caller: Caller,
+        back: Option<&Resume>,
+        asked: Asked,
+    ) -> Option<(Link, u64)> {
+        let starting = match self.found(id, stands) {
+            Ok(Stands::Runs(life, wire)) => {
+                return self.attach(id, caller, wire, life, back, asked).await;
+            }
+            Ok(Stands::Rests { starting, .. }) => starting,
+            Err(problem) => return turned_away(caller, &problem).await,
+        };
+        let _one = starting.lock().await;
+        // Whoever held it before may have started the session.
+        let (agent, ran) = match self.found(id, stands) {
+            Ok(Stands::Runs(life, wire)) => {
+                return self.attach(id, caller, wire, life, back, asked).await;
+            }
+            Ok(Stands::Rests {
+                ran: true,
+                lined: false,
+                ..
+            }) => return turned_away(caller, &no_line()).await,
+            Ok(Stands::Rests { agent, ran, .. }) => (agent, ran),
+            Err(problem) => return turned_away(caller, &problem).await,
+        };
+        // Audio that nobody hears is not taken, and none is promised
+        // that nobody sends.
+        let speaks = self.agents.get(&agent).is_some_and(Agent::speaks);
+        if caller.hello().audio.is_some() && !speaks {
+            let problem = Problem::of(
+                ErrorCode::Unsupported,
+                "the agent of this session neither hears nor speaks: a hello for it names no \
+                 audio",
+            );
+            return turned_away(caller, &problem).await;
+        }
+        let (transport, handle) = caller.transport(FAR_END);
+        let wire: (Box<dyn Transport>, Handle) = (Box::new(transport), handle);
+        match self.start(id, &agent, ran, Some(wire), false).await {
+            Ok((life, _, wire)) => self.attach(id, caller, wire, life, back, asked).await,
+            Err(problem) => turned_away(caller, &problem).await,
+        }
+    }
+
+    /// Puts `caller` on `wire`, which is the line of the session `id`
+    /// in its life `life`, if it is on one.
+    async fn attach(
+        &self,
+        id: SessionId,
+        caller: Caller,
+        wire: Option<Line>,
+        life: u64,
+        back: Option<&Resume>,
+        asked: Asked,
+    ) -> Option<(Link, u64)> {
+        let Some(wire) = wire else {
+            return turned_away(caller, &no_line()).await;
+        };
+        let resume_token = match back {
+            // It keeps the one it came with: a welcome that is lost on
+            // the way then costs it nothing.
+            Some(resume) => resume.token.clone(),
+            None => match self.credential(id).await {
+                Ok(token) => token.to_string(),
+                Err(problem) => return turned_away(caller, &problem).await,
+            },
+        };
+        let welcome = Welcome {
+            session: id.to_string(),
+            life,
+            resumed: back.is_some(),
+            resume_token: Some(resume_token),
+            features: asked.features(),
+            next_seq: self
+                .stack
+                .status(id)
+                .map_or(1, |status| status.next_seq.get()),
+            grace_ms: Some(wire.grace_ms),
+        };
+        match wire.handle.attach(caller, welcome).await {
+            Ok(link) => Some((link, life)),
+            // The session is over, or under way with other audio.
+            Err(unattached) => {
+                unattached.refuse().await;
+                None
+            }
+        }
+    }
+
+    /// Starts the session `id` of the agent `name`, or goes on with it
+    /// if it `ran` before: on `wire`, if it is given one, and on none
+    /// otherwise. Whoever calls this holds what the session is started
+    /// with. Returns the life it is in, what it tells from its
+    /// beginning here on if that was asked for, and its line.
+    async fn start(
+        self: &Arc<Self>,
+        id: SessionId,
+        name: &str,
+        ran: bool,
+        wire: Option<(Box<dyn Transport>, Handle)>,
+        followed: bool,
+    ) -> Result<(u64, Option<Told>, Option<Line>), Problem> {
         if self.is_draining() {
             return Err(Self::busy());
         }
-        let Some(agent) = self.agents.get(&name) else {
+        let Some(agent) = self.agents.get(name) else {
             return Err(Problem::of(
                 ErrorCode::NoAgent,
                 "the session is one of an agent the daemon no longer has",
             ));
         };
         let failed = |failure: Failure| failed("the session could not be started", &failure);
-        if !resumed {
+        let (transport, handle) = wire.map_or((None, None), |(transport, handle)| {
+            (Some(transport), Some(handle))
+        });
+        if !ran {
             // Kept with the session from before its first record, so
-            // that whoever goes on with it knows whose it is.
-            self.stack.kept.label(id, &name).await.map_err(failed)?;
+            // that whoever goes on with it knows whose it is, and that
+            // its far end comes back on a line.
+            let label = Label {
+                agent: name.to_owned(),
+                line: handle.is_some(),
+            };
+            self.stack
+                .kept
+                .label(id, &label.written())
+                .await
+                .map_err(failed)?;
         }
         let (call, told) = self
             .stack
-            .start(agent, id, None, Vec::new(), resumed, followed)
+            .start(agent, id, transport, Vec::new(), ran, followed)
             .await
             .map_err(failed)?;
         let life = call.life();
@@ -306,7 +540,15 @@ impl Shared {
         // which is not its beginning: whoever asked for all of it is
         // told what it has come to instead.
         let told = told.filter(|_| call.rebuilt.is_none());
-        let known = self.found(id, |entry| entry.phase = Phase::Running { life, mode });
+        let wire = handle.map(|handle| Line {
+            handle,
+            grace_ms: u32::try_from(call.grace.as_millis()).unwrap_or(u32::MAX),
+        });
+        let known = self.found(id, |entry| {
+            entry.phase = Phase::Running { life, mode };
+            entry.lined = wire.is_some();
+            entry.line.clone_from(&wire);
+        });
         if known.is_err() {
             // It was ended while it was being started.
             let _ = self.stack.ask(id, SessionInput::Close);
@@ -327,6 +569,7 @@ impl Shared {
             if settled == Settled::Kept {
                 if let Some(entry) = sessions.get_mut(&id) {
                     entry.phase = Phase::Kept;
+                    entry.line = None;
                 }
             } else {
                 sessions.remove(&id);
@@ -334,7 +577,7 @@ impl Shared {
                 daemon.tickets.revoke(id);
             }
         });
-        Ok(Live { life, told })
+        Ok((life, told, wire))
     }
 
     /// Ends the session `id`. Returns whether it is gone already: one
@@ -435,12 +678,15 @@ impl Daemon {
         // agent its label names.
         let mut sessions = BTreeMap::new();
         for (id, label) in stack.kept.labelled().await? {
-            let Some(agent) = label else {
+            let Some(label) = label else {
                 continue;
             };
+            let Label { agent, line } = Label::read(&label);
             let entry = Entry {
                 agent,
                 phase: Phase::Kept,
+                lined: line,
+                line: None,
                 starting: Arc::default(),
             };
             sessions.insert(id, entry);

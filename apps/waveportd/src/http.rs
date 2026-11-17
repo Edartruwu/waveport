@@ -9,6 +9,7 @@
 //! | `POST /v1/sessions/{id}/tokens` | a control key | 201, another client token |
 //! | `POST /v1/sessions/{id}/input` | a control key, or the session's resume token | 202 |
 //! | `GET /v1/sessions/{id}/events` | a control key, a client token, or the session's resume token | a stream of server-sent events |
+//! | `GET /v1/client` | a client token or a resume token, in the hello | a WebSocket that speaks client protocol v1 |
 //! | `GET /healthz` | anyone | 200, or 503 while the daemon stops |
 //!
 //! A body is JSON, and says so (`Content-Type: application/json`). What
@@ -48,6 +49,7 @@ use waveport_protocol::control::v1::{Context, CreateSession, Input, Problem, Ses
 use crate::auth::From;
 use crate::daemon::{Shared, failed};
 use crate::events::Following;
+use crate::line;
 use waveport_assembly::shown::{Asked, Position};
 
 /// The daemon, for a request.
@@ -98,7 +100,7 @@ fn json(status: StatusCode, body: &impl Serialize) -> Response {
 }
 
 /// A problem that has a status of its own.
-fn problem(status: StatusCode, code: ErrorCode, detail: &str) -> Problem {
+pub(crate) fn problem(status: StatusCode, code: ErrorCode, detail: &str) -> Problem {
     Problem {
         status: status.as_u16(),
         title: status.canonical_reason().unwrap_or_default().to_owned(),
@@ -111,7 +113,7 @@ fn forbidden(detail: &str) -> Response {
     Refused(Problem::of(ErrorCode::Forbidden, detail)).into_response()
 }
 
-fn not_admitted(detail: &str) -> Problem {
+pub(crate) fn not_admitted(detail: &str) -> Problem {
     Problem::of(ErrorCode::Token, detail)
 }
 
@@ -120,7 +122,10 @@ fn refusal(refusal: Refusal) -> Problem {
 }
 
 /// What a header says, if it is there and is text.
-fn said(headers: &HeaderMap, name: impl axum::http::header::AsHeaderName) -> Option<&str> {
+pub(crate) fn said(
+    headers: &HeaderMap,
+    name: impl axum::http::header::AsHeaderName,
+) -> Option<&str> {
     headers.get(name)?.to_str().ok()
 }
 
@@ -132,6 +137,7 @@ pub(crate) fn router(daemon: &Arc<Shared>) -> Router {
         .route("/v1/sessions/{id}/tokens", post(mint))
         .route("/v1/sessions/{id}/input", post(input))
         .route("/v1/sessions/{id}/events", get(events))
+        .route("/v1/client", get(line::client))
         .fallback(nowhere)
         .layer(middleware::from_fn_with_state(Arc::clone(daemon), gate));
     Router::new()

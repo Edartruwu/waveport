@@ -2994,6 +2994,7 @@ name = "waveportd"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "futures-util",
  "getrandom 0.4.3",
@@ -3003,11 +3004,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "waveport-adapter-kit",
  "waveport-assembly",
  "waveport-domain",
+ "waveport-media",
  "waveport-ports",
  "waveport-protocol",
  "waveport-testkit",
+ "waveport-transport-websocket",
 ]
 
 [[package]]

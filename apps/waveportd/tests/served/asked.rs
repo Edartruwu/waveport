@@ -222,10 +222,9 @@ async fn a_chat_is_had_over_http_from_its_first_word_to_its_last() {
     assert_eq!((none.status, none.code().as_str()), (401, "token"));
     let all = daemon.ask("GET", "/v1/sessions", None).await.json();
     assert_eq!(all, json!({"sessions": []}));
-    assert_eq!(
-        daemon.errors(),
-        "waveportd: there is no control key: whoever is on this machine may ask everything"
-    );
+    let warned =
+        "waveportd: there is no control key: whoever is on this machine may ask everything";
+    assert_eq!(daemon.noted(warned).await, warned);
 }
 
 #[tokio::test]

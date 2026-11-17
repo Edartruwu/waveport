@@ -12,15 +12,19 @@
 use core::future::poll_fn;
 use core::pin::Pin;
 use core::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use waveport_domain::command::ClientEvent;
 use waveport_domain::config::{AgentSpec, Effect, KernelConfig, ToolSpec};
 use waveport_domain::fact::Lifecycle;
+use waveport_domain::fact::Stamped;
 use waveport_domain::ids::{ParticipantId, Seq, ToolId};
 use waveport_domain::policy::DefaultPolicies;
+use waveport_domain::text::TextArena;
+use waveport_domain::time::MonoTime;
 use waveport_ports::control::{ControlError, EventRx, SessionControl, SessionEvent, SessionInput};
 use waveport_ports::journal::SessionId;
+use waveport_ports::telemetry::{EventSink, StageMark};
 use waveport_ports::tool::ToolReply;
 use waveport_runtime::compute::Compute;
 use waveport_runtime::context::ToolDef;
@@ -189,6 +193,61 @@ async fn sessions_are_started_driven_followed_and_closed() {
             .iter()
             .all(|shard| shard.sessions == 0 && shard.polls > 0)
     );
+}
+
+/// Looks, each time it is shown facts, at how far the runtime says
+/// their session has come. It is shown them once every follower has
+/// been told of them, which is when a follower may ask the same.
+struct Counted {
+    runtime: Weak<Runtime>,
+    /// The number of the last fact it was shown, and the number the
+    /// runtime gave the next one at that moment.
+    seen: Mutex<Vec<(u64, u64)>>,
+}
+
+impl EventSink for Counted {
+    fn facts(&self, session: SessionId, _at: MonoTime, facts: &[Stamped], _text: &TextArena) {
+        let runtime = self.runtime.upgrade();
+        let status = runtime.and_then(|runtime| runtime.status(session));
+        if let (Some(last), Some(status)) = (facts.last(), status) {
+            let seen = (last.seq.get(), status.next_seq.get());
+            self.seen.lock().unwrap().push(seen);
+        }
+    }
+
+    fn stage(&self, _session: SessionId, _mark: StageMark) {}
+}
+
+#[tokio::test]
+async fn a_fact_is_counted_by_the_time_anyone_is_told_of_it() {
+    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()).unwrap());
+    let (compute, journal) = (compute(), MemoryJournal::new());
+    let counted = Arc::new(Counted {
+        runtime: Arc::downgrade(&runtime),
+        seen: Mutex::default(),
+    });
+    let id = SessionId(0xF);
+    let parts = Parts {
+        sink: Some(Arc::clone(&counted) as Arc<dyn EventSink>),
+        ..parts(&compute, &journal, ScriptedTools::none())
+    };
+    let started = runtime
+        .start(spec(id.0), parts, DefaultPolicies::default())
+        .await
+        .unwrap();
+    let text = "Hi.".to_owned();
+    runtime.send(id, SessionInput::Say { text }).unwrap();
+    runtime.send(id, SessionInput::Close).unwrap();
+    assert_eq!(exit(started).await, Exit::Ended(Ended::Closed));
+
+    // Whoever is told of a fact and asks at once where the session
+    // stands is not told that the fact is still to come: a client that
+    // came back with its number would be taken for one from elsewhere.
+    let seen = counted.seen.lock().unwrap().clone();
+    assert!(seen.len() > 1, "{seen:?}");
+    for (last, next) in seen {
+        assert_eq!(next, last + 1);
+    }
 }
 
 #[tokio::test]

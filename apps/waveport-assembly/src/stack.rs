@@ -345,6 +345,13 @@ impl Stack {
         let instructions = agent.instructions.as_deref().unwrap_or(usual);
         let mut spec = SessionSpec::new(id, instructions);
         spec.language = speech.map(|speech| speech.language.clone());
+        // A session on a line greets its far end by itself, when it
+        // joins: asked for from here, the greeting could come after the
+        // first thing the far end says, and stop the answer to it.
+        let lined = transport.is_some();
+        if lined {
+            spec.greeting.clone_from(&agent.greeting);
+        }
         spec.states = self.states;
         self.tools.offer(&mut spec);
         let grace = spec.kernel.timing.detach_wait;
@@ -395,9 +402,12 @@ impl Stack {
         } else {
             None
         };
-        // A session that goes on has been greeted.
+        // A session that goes on has been greeted. One on no line is
+        // asked to greet here, after whoever follows it is there to be
+        // told: what is written to it is asked the same way, and comes
+        // after this.
         let greeting = agent.greeting.as_ref().filter(|_| rebuilt.is_none());
-        if let Some(greeting) = greeting {
+        if let Some(greeting) = greeting.filter(|_| !lined) {
             let text = greeting.clone();
             self.runtime
                 .send(id, SessionInput::Say { text })

@@ -735,6 +735,41 @@ async fn a_client_that_says_goodbye_has_left() {
 }
 
 #[tokio::test]
+async fn a_goodbye_that_is_told_ends_the_connection_and_not_the_session() {
+    let (mut session, mut client) = call(pcm(24_000)).await;
+    // Whoever serves the client is going away, and its session is kept.
+    let going = FromServer::Bye {
+        reason: ByeReason::GoingAway,
+    };
+    session.link().tell(fact(1, "last")).await.unwrap();
+    session.link().tell(going).await.unwrap();
+    assert!(matches!(
+        hears(&mut session, &mut client).await,
+        Heard::Fact { seq: 1, .. }
+    ));
+    let bye = Heard::Bye(ByeReason::GoingAway);
+    assert_eq!(hears(&mut session, &mut client).await, bye);
+    // Nothing follows it: the connection is closed, in good order.
+    let after = session.during(client.next()).await;
+    assert!(matches!(after, Ok(None)), "{after:?}");
+    // The session has no line, and is not over.
+    session.until(2).await;
+    assert_eq!(session.seen[1..], [TransportEvent::Detached]);
+    assert!(!session.closed && !session.handle().is_over());
+    assert_eq!(session.link().tell(fact(2, "anyone?")).await, Err(Gone));
+
+    // Its client comes back, here or to whoever has the session next.
+    let mut client = session.comes_back(Hello::new(pcm(24_000))).await;
+    session.until(3).await;
+    assert_eq!(session.seen[2..], [TransportEvent::Attached]);
+    session.link().tell(fact(2, "back")).await.unwrap();
+    assert!(matches!(
+        hears(&mut session, &mut client).await,
+        Heard::Fact { seq: 2, .. }
+    ));
+}
+
+#[tokio::test]
 async fn a_client_whose_connection_drops_is_waited_for_and_taken_back() {
     let (mut session, mut client) = call(pcm(24_000)).await;
     session.send(tag(7), 0, 1, false);

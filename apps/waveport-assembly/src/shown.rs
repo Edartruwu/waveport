@@ -197,6 +197,23 @@ impl Telling {
     }
 }
 
+/// Whether `message` is the last a client is told of a session: the
+/// fact that it closed. Whoever tells a client through a connection of
+/// its own lets go of it after this, and the goodbye follows.
+#[must_use]
+pub const fn closes(message: &FromServer) -> bool {
+    matches!(
+        message,
+        FromServer::Fact {
+            fact: client::Fact::LifecycleChanged {
+                to: client::Lifecycle::Closed,
+                ..
+            },
+            ..
+        }
+    )
+}
+
 /// Where a client that comes back says it was: the life of the session
 /// it was told of, and the number of the last fact it was sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
