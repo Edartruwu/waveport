@@ -1,0 +1,7 @@
+{"event":"connected","protocol":"Call","version":"1.0.0"}
+{"event":"start","sequenceNumber":"1","start":{"accountSid":"ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX","streamSid":"MZXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX","callSid":"CAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX","tracks":["inbound"],"mediaFormat":{"encoding":"audio/x-mulaw","sampleRate":8000,"channels":1},"customParameters":{"FirstName":"Jane","LastName":"Doe","RemoteParty":"Bob"}},"streamSid":"MZXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"}
+{"event":"media","sequenceNumber":"4","media":{"track":"inbound","chunk":"2","timestamp":"5","payload":"no+JhoaJjpzS"},"streamSid":"MZXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"}
+{"event":"dtmf","streamSid":"MZXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX","sequenceNumber":"5","dtmf":{"track":"inbound","digit":"1"}}
+{"event":"dtmf","streamSid":"MZXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX","sequenceNumber":"5","dtmf":{"track":"inbound_track","digit":"#"}}
+{"event":"mark","sequenceNumber":"4","streamSid":"MZXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX","mark":{"name":"my label"}}
+{"event":"stop","sequenceNumber":"5","stop":{"accountSid":"ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX","callSid":"CAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"},"streamSid":"MZXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"}
