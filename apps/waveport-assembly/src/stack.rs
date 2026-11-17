@@ -109,6 +109,9 @@ pub struct Call {
     pub greeted: bool,
     /// Whether it was begun as one to go on with.
     pub resumed: bool,
+    /// How long it waits for a far end whose line dropped, before it
+    /// ends as one whose far end left.
+    pub grace: Duration,
     started: Started,
 }
 
@@ -344,6 +347,7 @@ impl Stack {
         spec.language = speech.map(|speech| speech.language.clone());
         spec.states = self.states;
         self.tools.offer(&mut spec);
+        let grace = spec.kernel.timing.detach_wait;
         let brain = match speech {
             Some(speech) => Brain::Cascaded {
                 stt: speech.stt.clone(),
@@ -405,6 +409,7 @@ impl Stack {
             rebuilt,
             greeted: greeting.is_some(),
             resumed,
+            grace,
             started,
         };
         Ok((call, told))

@@ -20,6 +20,7 @@ bench = false
 waveport-adapter-kit = { workspace = true }
 waveport-domain = { workspace = true }
 waveport-ports = { workspace = true }
+waveport-protocol = { workspace = true }
 
 bytes = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
@@ -27,6 +28,8 @@ serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 
 [dev-dependencies]
+waveport-testkit = { workspace = true }
+
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [lints]

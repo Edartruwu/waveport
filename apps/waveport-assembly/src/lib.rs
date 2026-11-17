@@ -27,6 +27,7 @@
 pub mod halt;
 pub mod kept;
 mod providers;
+pub mod shown;
 pub mod spec;
 pub mod stack;
 pub mod tools;

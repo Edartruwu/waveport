@@ -1,183 +1,234 @@
-//! The messages of the protocol, as they are on the wire.
+//! The connection as it is on the wire, and what its two ends say as it
+//! begins.
 //!
 //! Everything that is not audio is a text message that holds one JSON
-//! object, and its `type` says what it is. Audio is a binary message that
-//! holds samples and nothing else.
+//! object: a message of client protocol v1. Audio is a binary message
+//! that holds audio and nothing else.
+
+use core::fmt;
 
 use serde::{Deserialize, Serialize};
 use waveport_ports::error::PortError;
+use waveport_protocol::client::v1::{self as client, AudioFormat, FromClient, FromServer, Resume};
 
 /// The name of the protocol, which a client gives as it connects.
-pub const PROTOCOL: &str = "waveport.ws.v0";
+pub const PROTOCOL: &str = client::NAME;
 
 /// The path a client asks for.
-pub const PATH: &str = "/v0/session";
+pub const PATH: &str = "/v1/client";
 
-/// What a client says.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FromClient {
-    /// The first thing a client says: the rate of its audio, both ways.
-    Hello {
-        /// Samples a second: 8,000, 16,000, 24,000 or 48,000.
-        rate: u32,
-    },
-    /// How much of a response the client has played so far.
-    Played {
-        /// The response, by the number its `mark` gave it.
-        run: u32,
-        /// How many of its samples have been played.
-        samples: u32,
-    },
-    /// Something typed in place of speech.
-    Text {
-        /// What was typed.
-        text: String,
-    },
-    /// The client is leaving.
-    Bye,
+/// What a client says as it comes: its hello, without the version.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Hello {
+    /// Its client token, where the server asks for one.
+    pub token: Option<String>,
+    /// The audio it sends and wants. None for a client that writes.
+    pub audio: Option<AudioFormat>,
+    /// What it wants to be told beyond the facts, by the names of the
+    /// protocol's features.
+    pub features: Vec<String>,
+    /// Where it was, if it comes back to a session.
+    pub resume: Option<Resume>,
 }
 
-/// What a server says.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FromServer {
-    /// The answer to `hello`: the session is there.
-    Ready {
-        /// What the session is called.
-        session: String,
-        /// The rate of the audio, both ways: the one the client named.
-        rate: u32,
-    },
-    /// Where one response's audio begins, and where it ends.
-    Mark {
-        /// The number of the response. The audio that follows, up to the
-        /// next mark, is its audio.
-        run: u32,
-        /// Whether this is the end of the response and not its
-        /// beginning: all of its audio has been sent.
-        #[serde(default, skip_serializing_if = "is_false")]
-        end: bool,
-    },
-    /// What the client holds of this response, and of every one before
-    /// it, and has not played is to be discarded.
-    Clear {
-        /// The number of the response.
-        run: u32,
-    },
-    /// A line about the call, for a person to read. What it says is not
-    /// part of the protocol.
-    Event {
-        /// The line.
-        text: String,
-    },
-    /// The session is over. The connection closes after this.
-    Bye {
-        /// Why, in a few words.
-        reason: String,
-    },
+impl Hello {
+    /// The hello of a client that speaks and hears `audio`, or writes
+    /// if that is none, and holds no token.
+    #[must_use]
+    pub const fn new(audio: Option<AudioFormat>) -> Self {
+        Self {
+            token: None,
+            audio,
+            features: Vec::new(),
+            resume: None,
+        }
+    }
+
+    /// As the message that is sent.
+    pub(crate) fn said(&self) -> FromClient {
+        FromClient::Hello {
+            v: client::VERSION,
+            token: self.token.clone(),
+            audio: self.audio,
+            features: self.features.clone(),
+            resume: self.resume.clone(),
+        }
+    }
 }
 
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde gives a reference to the field"
-)]
-const fn is_false(flag: &bool) -> bool {
-    !*flag
+impl fmt::Debug for Hello {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Its tokens let their holder into a session, and are not shown.
+        f.debug_struct("Hello")
+            .field("audio", &self.audio)
+            .field("features", &self.features)
+            .field("comes_back", &self.resume.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a client is told as it is taken. A server is given it by whoever
+/// runs the session; the version and the audio are the connection's, and
+/// are not in it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Welcome {
+    /// What the session is called.
+    pub session: String,
+    /// Which life of the session this is.
+    pub life: u64,
+    /// Whether the client came back to a session that was under way.
+    pub resumed: bool,
+    /// What lets the client come back, if the session is kept where that
+    /// can be done.
+    pub resume_token: Option<String>,
+    /// Which of the features the client asked for it will be told.
+    pub features: Vec<String>,
+    /// The number the next fact gets that comes about in the session.
+    pub next_seq: u64,
+    /// How long the session waits for a client whose connection
+    /// dropped, in milliseconds.
+    pub grace_ms: Option<u32>,
+}
+
+impl Welcome {
+    /// As the message that is sent on a connection whose audio is
+    /// `audio`.
+    pub(crate) fn said(self, audio: Option<AudioFormat>) -> FromServer {
+        FromServer::Welcome {
+            v: client::VERSION,
+            session: self.session,
+            life: self.life,
+            resumed: self.resumed,
+            resume_token: self.resume_token,
+            audio,
+            features: self.features,
+            next_seq: self.next_seq,
+            grace_ms: self.grace_ms,
+        }
+    }
+}
+
+impl fmt::Debug for Welcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The resume token is not shown.
+        f.debug_struct("Welcome")
+            .field("session", &self.session)
+            .field("life", &self.life)
+            .field("resumed", &self.resumed)
+            .field("features", &self.features)
+            .field("next_seq", &self.next_seq)
+            .field("grace_ms", &self.grace_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A message as the text that is sent.
 pub(crate) fn write<M: Serialize>(message: &M) -> String {
-    // Neither kind of message holds anything that cannot be written.
+    // No message holds anything that cannot be written.
     serde_json::to_string(message).unwrap_or_default()
 }
 
 /// A message from the text that arrived.
 pub(crate) fn read<'a, M: Deserialize<'a>>(text: &'a str) -> Result<M, PortError> {
     serde_json::from_str(text).map_err(|error| {
-        let shown: String = text.chars().take(80).collect();
-        PortError::permanent(format!("{shown:?} is not a message of {PROTOCOL}: {error}"))
+        // What arrived is not repeated, and neither is what the reader
+        // says of it, which can quote it: a message may hold a token.
+        let what = match error.classify() {
+            serde_json::error::Category::Data => "it does not say what a message of its kind says",
+            serde_json::error::Category::Eof => "it breaks off",
+            serde_json::error::Category::Syntax | serde_json::error::Category::Io => {
+                "it is not JSON"
+            }
+        };
+        PortError::permanent(format!(
+            "what arrived is not a message of {PROTOCOL}: {what}"
+        ))
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FromClient, FromServer, read, write};
+    use waveport_protocol::client::v1::{
+        AudioFormat, Codec, FromClient, FromServer, Resume, VERSION,
+    };
+
+    use super::{Hello, Welcome, read, write};
+
+    const AUDIO: AudioFormat = AudioFormat {
+        codec: Codec::Pcm16,
+        rate: 24_000,
+    };
 
     #[test]
-    fn messages_are_written_as_the_protocol_has_them() {
-        for (message, text) in [
-            (
-                FromServer::Ready {
-                    session: "s-1".to_owned(),
-                    rate: 24_000,
-                },
-                r#"{"type":"ready","session":"s-1","rate":24000}"#,
-            ),
-            (
-                FromServer::Mark { run: 3, end: false },
-                r#"{"type":"mark","run":3}"#,
-            ),
-            (
-                FromServer::Mark { run: 3, end: true },
-                r#"{"type":"mark","run":3,"end":true}"#,
-            ),
-            (FromServer::Clear { run: 3 }, r#"{"type":"clear","run":3}"#),
-            (
-                FromServer::Event {
-                    text: "caller: hello".to_owned(),
-                },
-                r#"{"type":"event","text":"caller: hello"}"#,
-            ),
-            (
-                FromServer::Bye {
-                    reason: "the call ended".to_owned(),
-                },
-                r#"{"type":"bye","reason":"the call ended"}"#,
-            ),
-        ] {
-            assert_eq!(write(&message), text);
-            assert_eq!(read::<FromServer>(text).unwrap(), message);
-        }
-        for (message, text) in [
-            (
-                FromClient::Hello { rate: 48_000 },
-                r#"{"type":"hello","rate":48000}"#,
-            ),
-            (
-                FromClient::Played {
-                    run: 3,
-                    samples: 960,
-                },
-                r#"{"type":"played","run":3,"samples":960}"#,
-            ),
-            (
-                FromClient::Text {
-                    text: "hello".to_owned(),
-                },
-                r#"{"type":"text","text":"hello"}"#,
-            ),
-            (FromClient::Bye, r#"{"type":"bye"}"#),
-        ] {
-            assert_eq!(write(&message), text);
-            assert_eq!(read::<FromClient>(text).unwrap(), message);
-        }
+    fn a_hello_and_a_welcome_are_said_as_the_protocol_has_them() {
+        let hello = Hello {
+            token: Some("wpc1_madeup".to_owned()),
+            audio: Some(AUDIO),
+            features: vec!["said".to_owned()],
+            resume: Some(Resume {
+                token: "wpr1_madeup".to_owned(),
+                life: 2,
+                seen: 17,
+            }),
+        };
+        let said = write(&hello.said());
+        assert_eq!(
+            said,
+            r#"{"type":"hello","v":1,"token":"wpc1_madeup","audio":{"codec":"pcm16","rate":24000},"features":["said"],"resume":{"token":"wpr1_madeup","life":2,"seen":17}}"#
+        );
+        assert_eq!(read::<FromClient>(&said).unwrap(), hello.said());
+        assert_eq!(write(&Hello::new(None).said()), r#"{"type":"hello","v":1}"#);
+
+        let welcome = Welcome {
+            session: "s-1".to_owned(),
+            life: 2,
+            resumed: true,
+            resume_token: Some("wpr1_madeup".to_owned()),
+            features: vec!["said".to_owned()],
+            next_seq: 18,
+            grace_ms: Some(30_000),
+        };
+        let FromServer::Welcome { v, audio, .. } = welcome.clone().said(Some(AUDIO)) else {
+            panic!("a welcome is said as one");
+        };
+        assert_eq!((v, audio), (VERSION, Some(AUDIO)));
+        assert_eq!(
+            write(&welcome.said(None)),
+            r#"{"type":"welcome","v":1,"session":"s-1","life":2,"resumed":true,"resume_token":"wpr1_madeup","features":["said"],"next_seq":18,"grace_ms":30000}"#
+        );
     }
 
     #[test]
-    fn what_is_not_a_message_is_said_to_be_none_and_shown_in_part() {
+    fn what_is_shown_of_a_hello_and_a_welcome_holds_no_token() {
+        let hello = Hello {
+            token: Some("wpc1_madeup".to_owned()),
+            resume: Some(Resume {
+                token: "wpr1_madeup".to_owned(),
+                life: 1,
+                seen: 0,
+            }),
+            ..Hello::new(Some(AUDIO))
+        };
+        let welcome = Welcome {
+            resume_token: Some("wpr1_madeup".to_owned()),
+            ..Welcome::default()
+        };
+        let shown = format!("{hello:?} {welcome:?}");
+        assert!(!shown.contains("madeup"), "{shown}");
+        assert!(shown.contains("comes_back: true"), "{shown}");
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_not_repeated() {
+        // A hello whose version is a token, half a hello, and no JSON.
         for text in [
-            "",
-            "hello",
-            "{}",
-            r#"{"type":"dance"}"#,
-            r#"{"type":"hello"}"#,
+            r#"{"type":"hello","v":"wpc1_madeup"}"#,
+            r#"{"type":"hello","v":1,"token":"wpc1_madeup""#,
+            "wpc1_madeup",
         ] {
-            let error = read::<FromClient>(text).unwrap_err();
-            assert!(error.message.contains("waveport.ws.v0"), "{error}");
+            let error = read::<FromClient>(text).unwrap_err().to_string();
+            assert!(!error.contains("madeup"), "{error}");
+            assert!(error.contains("waveport.client.v1"), "{error}");
         }
-        let long = "x".repeat(10_000);
-        let error = read::<FromClient>(&long).unwrap_err();
-        assert!(error.message.len() < 300, "{}", error.message.len());
     }
 }

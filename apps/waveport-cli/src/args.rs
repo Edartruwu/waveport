@@ -209,6 +209,11 @@ pub(crate) struct Serve {
     /// Stop once this many calls have been taken and have ended.
     #[arg(long, value_name = "NUMBER")]
     pub calls: Option<u32>,
+    /// Go on with the calls that broke off when their callers come
+    /// back. A caller says which call it was on with the token it was
+    /// given as the call began, which `waveport client` does by itself.
+    #[arg(long, conflicts_with = "no_journal")]
+    pub resume: bool,
 }
 
 #[derive(Debug, Args)]
@@ -624,8 +629,19 @@ mod tests {
         let run = ["waveport", "run", "--script", "a.call", "--resume", "last"];
         assert!(Cli::try_parse_from(run).is_ok());
         // Whoever calls an agent over a WebSocket says which call to go
-        // on with, not the agent.
+        // on with, not the agent: the agent is told only that it is to
+        // go on with the calls that broke off.
         assert!(Cli::try_parse_from(["waveport", "serve", "--resume", "last"]).is_err());
+        let serve = |more: &[&str]| {
+            let line = ["waveport", "serve"].iter().chain(more).copied();
+            Cli::try_parse_from(line).map(|cli| match cli.command {
+                Command::Serve(serve) => serve.resume,
+                _ => panic!("serve is serve"),
+            })
+        };
+        assert!(!serve(&[]).unwrap());
+        assert!(serve(&["--resume"]).unwrap());
+        assert!(serve(&["--resume", "--no-journal"]).is_err());
     }
 
     #[test]

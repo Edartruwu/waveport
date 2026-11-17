@@ -2692,6 +2692,7 @@ dependencies = [
  "waveport-llm-openai-compat",
  "waveport-models-onnx",
  "waveport-ports",
+ "waveport-protocol",
  "waveport-runtime",
  "waveport-store-journal",
  "waveport-store-memory",
@@ -2736,6 +2737,7 @@ dependencies = [
  "waveport-assembly",
  "waveport-domain",
  "waveport-ports",
+ "waveport-protocol",
  "waveport-runtime",
  "waveport-testkit",
  "waveport-transport-local-audio",
@@ -2957,6 +2959,8 @@ dependencies = [
  "waveport-adapter-kit",
  "waveport-domain",
  "waveport-ports",
+ "waveport-protocol",
+ "waveport-testkit",
 ]
 
 [[package]]
