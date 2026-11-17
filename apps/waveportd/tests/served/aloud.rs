@@ -12,68 +12,18 @@ use core::time::Duration;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use waveport_adapter_kit::pcm::write_base64;
 use waveport_media::codec::opus::{MAX_PACKET, OpusDecoder, OpusEncoder, OpusSettings};
 use waveport_ports::audio::Rate;
 use waveport_protocol::client::v1::{AudioFormat, ByeReason, Codec, Fact};
 use waveport_testkit::servers::{HttpServer, WsServer, WsStep};
 use waveport_testkit::speech;
+use waveport_testkit::stand_in::{HEARD, SAID, spoken};
 use waveport_transport_websocket::{Client, Heard, Hello};
 
 use crate::{Served, answer, desk};
 
-/// What the recogniser said when it was sent this question.
-const HEARD: &str =
-    include_str!("../../../../crates/adapters/stt/openai/tests/fixtures/question.ws");
-
-/// What the agent says once it knows the time.
-const SAID: [&str; 3] = ["It is", " ten past three.", " Goodbye!"];
-
 /// How many samples a packet holds: 20 ms at 48 kHz.
 const PACKET: usize = 960;
-
-/// What the synthesiser says for one response: 1.2 s of a tone at
-/// 24 kHz, in three pieces, with where the words are. As the provider
-/// does, it speaks each piece of text when it is given it.
-fn spoken() -> Vec<WsStep> {
-    let tone: Vec<i16> = (0..Rate::Hz24000.samples_in_millis(400))
-        .map(|n| if n % 48 < 24 { 3_000 } else { -3_000 })
-        .collect();
-    let mut data = String::new();
-    write_base64(&tone, &mut data);
-    let chunk = format!(
-        "< {{\"type\":\"chunk\",\"data\":\"{data}\",\"done\":false,\"status_code\":206,\
-         \"step_time\":12,\"context_id\":\"{{{{context_id}}}}\"}}"
-    );
-    let words = |words: &str, starts: &str, ends: &str| {
-        format!(
-            "< {{\"type\":\"timestamps\",\"done\":false,\"status_code\":206,\
-             \"context_id\":\"{{{{context_id}}}}\",\"word_timestamps\":{{\"words\":[{words}],\
-             \"start\":[{starts}],\"end\":[{ends}]}}}}"
-        )
-    };
-    let first = words(
-        "\"It\",\"is\",\"ten\",\"past\",\"three.\"",
-        "0.0,0.1,0.2,0.4,0.6",
-        "0.1,0.2,0.4,0.6,0.8",
-    );
-    let second = words("\"Goodbye!\"", "0.8", "1.2");
-    let done = "< {\"type\":\"done\",\"done\":true,\"status_code\":206,\
-                \"context_id\":\"{{context_id}}\"}";
-    let script = [
-        "> \"transcript\":\"It is",
-        &chunk,
-        &first,
-        &chunk,
-        "> Goodbye!",
-        &chunk,
-        &second,
-        "> \"continue\":false",
-        done,
-    ]
-    .join("\n");
-    WsStep::script(&script)
-}
 
 /// Where the models that listen are.
 fn assets() -> PathBuf {

@@ -14,6 +14,9 @@
 //! - [`servers`]: servers on this machine that answer as a provider was
 //!   recorded to, for the tests of adapters.
 //! - [`speech`]: something for a recogniser to hear, made by a machine.
+//! - [`stand_in`]: what those servers say in place of the providers of
+//!   a whole agent, for the tests that run a program from its command
+//!   line.
 //! - The allocation counter, re-exported.
 
 pub mod conformance;
@@ -21,6 +24,7 @@ pub mod drive;
 pub mod fakes;
 pub mod servers;
 pub mod speech;
+pub mod stand_in;
 
 pub use waveport_alloc_counter::{
     AllocStats, CountingAllocator, assert_no_alloc, is_installed, measure, snapshot,

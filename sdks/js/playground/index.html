@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Waveport playground</title>
+    <link rel="stylesheet" href="playground.css" />
+    <script type="module" src="playground.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Waveport playground</h1>
+      <p id="status" role="status" data-state="idle">Not in a session</p>
+    </header>
+
+    <main>
+      <form id="start" autocomplete="off">
+        <label>
+          Agent
+          <select id="agent" name="agent" required></select>
+        </label>
+        <label id="keyed" hidden>
+          Control key
+          <input id="key" name="key" type="password" autocomplete="off" spellcheck="false" />
+        </label>
+        <div class="row">
+          <button id="talk" type="submit" value="talk">Talk</button>
+          <button id="write" type="submit" value="write" class="quiet">Write</button>
+        </div>
+        <p class="hint">
+          Talking asks for the microphone. Nothing leaves this page but to the daemon that
+          served it.
+        </p>
+      </form>
+
+      <section id="session" hidden aria-label="Session">
+        <ol id="conversation" aria-live="polite"></ol>
+        <p id="live" class="live" aria-live="off"></p>
+        <div id="controls">
+          <form id="say" autocomplete="off">
+            <input id="text" name="text" type="text" placeholder="Write to the agent" enterkeyhint="send" />
+            <button type="submit">Send</button>
+          </form>
+          <div class="row">
+            <button id="mute" type="button" class="quiet" aria-pressed="false" hidden>Mute</button>
+            <button id="interrupt" type="button" class="quiet">Stop the agent</button>
+            <button id="bye" type="button" class="danger">End the session</button>
+          </div>
+        </div>
+        <dl id="about"></dl>
+      </section>
+
+      <p id="problem" role="alert" hidden></p>
+
+      <details>
+        <summary>What the session said</summary>
+        <ol id="log"></ol>
+      </details>
+    </main>
+  </body>
+</html>

@@ -75,6 +75,11 @@ pub struct Config {
     /// How much of what, and for how long.
     #[serde(default)]
     pub limits: Limits,
+    /// Whether the daemon serves a page to try its agents on, at
+    /// `/playground/`. Left out, a daemon that listens on this machine
+    /// alone serves it, and one that listens anywhere else does not.
+    #[serde(default)]
+    pub playground: Option<bool>,
     /// The agents, by the names sessions are asked for with.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentSpec>,
@@ -222,6 +227,13 @@ impl Config {
         read_toml::<Self>(text, "the configuration")?.checked()
     }
 
+    /// Whether the daemon serves the page to try its agents on.
+    #[must_use]
+    pub fn serves_playground(&self) -> bool {
+        self.playground
+            .unwrap_or_else(|| self.listen.ip().is_loopback())
+    }
+
     /// The configuration, if what it says holds together.
     ///
     /// # Errors
@@ -315,6 +327,24 @@ mod tests {
     use waveport_assembly::spec::Keeps;
 
     use super::{Config, Limits};
+
+    #[test]
+    fn the_page_is_served_on_this_machine_and_elsewhere_only_if_told_to() {
+        let serves = |more: &str| {
+            let text = format!("{more}\n[agents.front-desk]\n");
+            Config::from_toml(&text).unwrap().serves_playground()
+        };
+        assert!(serves(""));
+        assert!(serves("listen = \"127.0.0.1:0\""));
+        assert!(serves("listen = \"[::1]:7070\""));
+        assert!(!serves("playground = false"));
+        // A daemon that anyone can reach serves it to nobody, unless
+        // whoever runs it says so.
+        assert!(!serves("listen = \"0.0.0.0:7070\""));
+        assert!(!serves("listen = \"192.0.2.7:7070\""));
+        assert!(!serves("listen = \"[::]:7070\""));
+        assert!(serves("listen = \"0.0.0.0:7070\"\nplayground = true"));
+    }
 
     #[test]
     fn a_configuration_that_names_one_agent_is_enough() {

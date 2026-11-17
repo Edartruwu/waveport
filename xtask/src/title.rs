@@ -16,7 +16,7 @@ pub(crate) const TYPES: &[&str] = &[
 ];
 
 /// Scopes that are not crate names.
-const EXTRA_SCOPES: &[&str] = &["ci", "deps", "release", "docs"];
+const EXTRA_SCOPES: &[&str] = &["ci", "deps", "release", "docs", "sdk-js"];
 
 /// Prefix dropped from crate names to form their scope.
 const CRATE_PREFIX: &str = "waveport-";

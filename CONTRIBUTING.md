@@ -23,6 +23,8 @@ rustup toolchain install nightly-2026-11-14 --profile minimal --component miri -
 
 The instruction-count benchmarks also need Valgrind and `cargo install --locked gungraun-runner --version 0.20.0`. They run on Linux only.
 
+The gate of the JavaScript client needs [Node.js](https://nodejs.org/) 24 or later, whose npm keeps a version out until it is a week old, and a Chrome or Chromium for the test that runs a browser. The browser is looked for where it is usually installed, or where `CHROME_BIN` says it is. It is run without a window, makes no sound and opens no microphone.
+
 ### Model files
 
 Model weights are not committed, and neither is ONNX Runtime, the library that runs them. `assets/assets.lock.toml` pins each file to an address that never changes what it serves, a SHA-256 and a licence. The library is pinned once for each platform, as the file inside the archive its project releases:
@@ -65,6 +67,7 @@ CI runs the same commands; a test in `xtask/src/ci.rs` fails if the workflows an
 | `loom` | `cargo test --release --locked -p waveport-runtime --lib --target-dir target/loom` with `RUSTFLAGS="--cfg waveport_loom"` | What a session and the compute plane hand each other arrives whole and wakes whoever waits for it, however the threads take turns |
 | `miri` | `cargo miri test -p waveport-alloc-counter` on the pinned nightly | The one crate with `unsafe` code has no undefined behaviour in its tests |
 | `bench-ir` | `cargo xtask bench-ir --base <rev>` | No benchmark executes more than 2% more instructions than at the base revision |
+| `js` | In `sdks/js`: `npm ci`, `npm run check`, `npm test`, then `cargo build --locked -p waveportd --example stand_in` and `node test/browser/run.js --daemon ../../target/debug/examples/stand_in` | The JavaScript client has the types its comments give, passes its tests, and has whole sessions with the real daemon from a headless Chrome |
 
 ## Layers and the dependency rule
 
@@ -145,6 +148,7 @@ Today the only such crate is `waveport-alloc-counter`, which implements a global
 - Licences must be on the allow-list in `deny.toml`. Adding a licence is a reviewed change to that file.
 - One version of each crate. A duplicate that cannot be avoided is listed in `deny.toml` with the reason.
 - `Cargo.lock` is committed, and every gate runs with `--locked`.
+- What is written in JavaScript (`sdks/`) runs on nothing but the browser: a `package.json` there has no dependencies. What it is checked with is the TypeScript compiler and the types of Node, each at one exact version, in a lock file that is committed and that `npm ci` installs from. Its `.npmrc` keeps a version out until it is seven days old and runs no script of a package as it is installed. A test in `xtask/src/js.rs` holds every package under `sdks/` to all of that, and adding a tool is a reviewed change to the list there.
 
 ## Tests
 
@@ -267,6 +271,16 @@ A test that kills a daemon to see what the next one holds names the place (`WAVE
 
 Tests that wait on sockets and a clock are run many times before they are trusted, and on a machine that is kept busy (a loop per processor and a few more). What was mended with the daemon's lines, three faults and four tests, each showed about once in fifteen to sixty such runs, and never in five quiet ones.
 
+**The page a daemon serves.** `page.rs` in the same folder holds what the daemon answers when it is asked for its playground: the page and the client beside it, byte for byte as the repository has them, what a browser is told it may do with them (nothing that is not from the daemon, and not inside another page), that a page from elsewhere and a name that was pointed at the machine get nothing, and that a daemon which listens beyond the machine serves it only when told to. What a browser does with the page is tested from the client's side.
+
+**The JavaScript client.** `sdks/js` is tested in Node, with `node --test` and nothing installed for it, and in a browser. `test/protocol.test.js` reads the fixtures of the Rust protocol (`crates/core/waveport-protocol/tests/fixtures/client-v1/`): every message has to be read and written as it stands, what is unknown has to be tolerated as the protocol says, and a view has to come to what the Rust one comes to, so the two cannot drift apart without a test failing on one side. `test/client.test.js` is the connection, with a server that is the test. `test/worklet.test.js` is what runs on the audio thread, as plain classes: what is played and what is said to have been played, by the sample, with the time the output takes. `test/voice.test.js` stands in for a browser's sound and holds the voice to the order a call needs: ready before the client connects, and on the line in the same turn in which the client is welcomed. A test that waits for something that never comes is ended after 20 s and fails (`--test-timeout`).
+
+`test/browser/run.js` is a headless Chrome on the playground of `apps/waveportd/examples/stand_in.rs`, which is the real daemon with the models that listen and with stand-ins for its three providers (`waveport_testkit::stand_in`, which the tests of the command and of the daemon use too). The script drives Chrome over the pipe it offers for that (`--remote-debugging-pipe`), with nothing installed. Chrome is given the question the stand-in recogniser hears as a recording in place of a microphone (`--use-file-for-fake-audio-capture`) and plays to nothing (`--disable-audio-output`): no sound is made and no microphone is opened, so it runs on a machine without either. It has a spoken call as Opus and one as plain samples, a session in writing, and one whose line drops and comes back. In each the agent greets the moment the page is on the line. What the page shows of the conversation has to be the greeting, the question and the answer, each heard to its end. That alone would not show that the page played anything: a session takes a far end that says nothing of what it played to play as it is sent. So the test keeps what the page says on its line, and each run has to have been said played to its last sample, 19,200 for the greeting and 57,600 for the answer, in counts that never go back. `--notes` prints what the page wrote to its console, and `--can-run` says whether there is a Node and a Chrome to run it with, which is what the gate asks before it starts.
+
+The rules of the client, of the page and of how the daemon serves it were tried by breaking them, sixty-seven changes: a token of the wrong kind that is said, a client that comes back as if it had seen nothing, a sample that counts as heard before the output could sound it, a voice that is on its line a moment after the welcome, a page that is served to a page from elsewhere, a package that takes on a dependency. The first round found four that no test noticed. Nothing held the number of things that wait for a line that is away. And three faults of playing, a voice that came late to its line, an audio thread that played nothing and one that was never told a run was whole, left a conversation that read as it should, for the reason above; that is what put the counts into the browser test. Each change now fails a test that says what is wrong, and none by hanging: a test in Node that waits for what never comes fails after 20 s.
+
+The page and the client are read into the daemon when it is built (`include_str!`), so the daemon is built before a browser is run on it, which `cargo xtask ci --only js` does. A change to a file of `sdks/js/src` or `sdks/js/playground` whose name changes is a change to the list in `apps/waveportd/src/playground.rs`, and a test there fails if a file names another that is not served.
+
 **The WebSocket transport.** `crates/adapters/transport/websocket/tests/loopback.rs` runs the server side and the client against each other over real sockets on the loopback interface: with plain samples and with Opus, on a line of text, with a client that drops and comes back, one that takes another's place, and a client that says what no client should, which is told what was wrong and is heard as before. Its rules, those of coming back in the command, and the checks of the next paragraph were tried by breaking them, 52 changes. The first round found three that no test noticed: a token that read as the call's own and was not, a line closed with no goodbye, and a check that another check stood in front of. Each now fails a test.
 
 **A transport, any transport.** What every transport owes a session is checked by four functions of `waveport-testkit` (`conformance::transport_hears`, `transport_speaks`, `transport_says_goodbye` and `transport_is_left`). They know nothing of how a transport reaches its far end: a transport's tests give them its own client as the far end, by implementing `FarEnd` for it, and a transport that nobody has looked at yet. `crates/testing/waveport-testkit/tests/conformance.rs` has a line that keeps the rules and breaks one at a time, twenty-one ways, and each has to be told which. A new transport implements `FarEnd` for its test client and runs the four.
@@ -350,7 +364,7 @@ type(scope)!: subject
 ```
 
 - **type**: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `chore` or `revert`.
-- **scope** (optional): a crate name without `waveport-` (`domain`, `runtime`, `sim`, `xtask`, …), or one of `ci`, `deps`, `docs`, `release`.
+- **scope** (optional): a crate name without `waveport-` (`domain`, `runtime`, `sim`, `xtask`, …), or one of `ci`, `deps`, `docs`, `release`, `sdk-js`.
 - **`!`** (optional): the change breaks a public API. It is what allows a breaking change to a preview crate.
 - **subject**: lower-case imperative, no full stop at the end.
 

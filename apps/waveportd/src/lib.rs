@@ -45,6 +45,16 @@
 //! was pointed at it is not its name. A daemon that listens anywhere
 //! else does not start without a key.
 //!
+//! # The page
+//!
+//! A daemon serves a page to try its agents on, at `/playground/`,
+//! with the client for JavaScript beside it (`sdks/js`). Both are part
+//! of the program: nothing is read from a disk or fetched when it runs.
+//! The page asks as anyone asks, so it can do what whoever opens it
+//! could do without it. A daemon that listens on this machine alone
+//! serves it, and one that listens anywhere else only if its file says
+//! so (`playground`).
+//!
 //! # Where its threads run
 //!
 //! Sessions run on threads of their own, the shards, and each session
@@ -69,6 +79,7 @@ mod daemon;
 mod events;
 mod http;
 mod line;
+mod playground;
 mod serve;
 mod threads;
 
