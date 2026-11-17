@@ -24,6 +24,7 @@ mod far_end;
 
 mod aloud;
 mod asked;
+mod called;
 mod kept;
 mod lined;
 mod page;
@@ -302,7 +303,19 @@ impl Drop for Served {
 /// Runs a daemon that is not to start, and returns how it ended and
 /// what it said.
 fn refused_to_start(config: &str, variables: &[(&str, &str)]) -> (ExitStatus, String) {
-    let done = command(&desk(), config, variables).output().unwrap();
+    let mut child = command(&desk(), config, variables).spawn().unwrap();
+    // One that starts after all is not waited for: it says little, so
+    // what it says can be left unread until it is over.
+    let patience = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > patience {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("a daemon that was to refuse to start did not: {config}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let done = child.wait_with_output().unwrap();
     let said = String::from_utf8(done.stderr).unwrap();
     assert_eq!(String::from_utf8(done.stdout).unwrap(), "", "{said}");
     (done.status, said)

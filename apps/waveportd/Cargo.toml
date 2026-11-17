@@ -27,6 +27,7 @@ waveport-assembly = { workspace = true }
 waveport-domain = { workspace = true }
 waveport-ports = { workspace = true }
 waveport-protocol = { workspace = true }
+waveport-transport-telephony-ws = { workspace = true }
 waveport-transport-websocket = { workspace = true }
 
 axum = { workspace = true }

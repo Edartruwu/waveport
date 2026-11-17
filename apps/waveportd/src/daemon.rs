@@ -25,9 +25,11 @@ use waveport_protocol::client::v1::{ErrorCode, Resume};
 use waveport_protocol::control::v1::{
     Mode, Problem, SessionCreated, SessionInfo, SessionState, Sessions,
 };
+use waveport_transport_telephony_ws::Call;
 use waveport_transport_websocket::{Caller, Handle, Link, Welcome};
 
 use crate::auth::{Gate, Keys, Tickets};
+use crate::calls::Telephony;
 use crate::config::{Config, Limits};
 use crate::threads::Threads;
 use crate::{http, serve};
@@ -63,6 +65,15 @@ struct Line {
     grace_ms: u32,
 }
 
+/// What a session that is on a line is started on.
+enum Wire {
+    /// The line of a client, which comes back to it when its connection
+    /// drops.
+    Line(Box<dyn Transport>, Handle),
+    /// A call that a carrier brings, which nobody comes back to.
+    Call(Box<dyn Transport>),
+}
+
 /// A session of the daemon.
 struct Entry {
     /// Its agent, by the name the configuration gives it.
@@ -71,9 +82,12 @@ struct Entry {
     /// Whether it is on a line, or was when it last ran. A session is
     /// on a line or on none for all of its lives: the far end of one
     /// that is has a connection of its own, and the session is gone on
-    /// with when the far end comes back on one.
+    /// with when the far end comes back on one. A call is on a line,
+    /// too, and the session that was made for one is from when it was
+    /// made: it begins when the call is brought, and not before.
     lined: bool,
-    /// Its line, while it runs on one.
+    /// Its line, while it runs on one that a client can come to. A
+    /// call has none: nobody comes to it but its carrier, once.
     line: Option<Line>,
     /// Held by whoever starts it, so that one does.
     starting: Arc<tokio::sync::Mutex<()>>,
@@ -139,6 +153,15 @@ fn stands(entry: &mut Entry) -> Stands {
     }
 }
 
+/// What whoever would start a session that was made for a call is
+/// told, while the call has not been brought.
+fn waits_for_its_call() -> Problem {
+    Problem::of(
+        ErrorCode::OutOfPlace,
+        "the session was made for a call, and begins when its carrier brings the call",
+    )
+}
+
 /// What a client is told that comes to a session on no line.
 fn no_line() -> Problem {
     Problem::of(
@@ -167,6 +190,8 @@ pub(crate) struct Shared {
     pub(crate) gate: Gate,
     /// Whether the page to try the agents on is served.
     pub(crate) playground: bool,
+    /// What answers the calls of carriers, if anything does.
+    pub(crate) telephony: Option<Telephony>,
     sessions: Mutex<BTreeMap<SessionId, Entry>>,
     /// Whether the daemon takes nothing new.
     draining: AtomicBool,
@@ -272,6 +297,18 @@ impl Shared {
     /// Makes a session of the agent `agent`, and a token for its far end
     /// to connect with.
     pub(crate) fn create(&self, agent: &str) -> Result<SessionCreated, Problem> {
+        self.make(agent, false)
+    }
+
+    /// Makes a session of the agent `agent` for a call that a carrier
+    /// asked about, and a token for the stream of the call to say. The
+    /// session begins when the call is brought: until then nobody
+    /// starts it, whoever follows it or writes to it.
+    pub(crate) fn create_for_a_call(&self, agent: &str) -> Result<SessionCreated, Problem> {
+        self.make(agent, true)
+    }
+
+    fn make(&self, agent: &str, for_a_call: bool) -> Result<SessionCreated, Problem> {
         if self.is_draining() {
             return Err(Self::busy());
         }
@@ -294,7 +331,7 @@ impl Shared {
             let entry = Entry {
                 agent: agent.to_owned(),
                 phase: Phase::Waiting { until },
-                lined: false,
+                lined: for_a_call,
                 line: None,
                 starting: Arc::default(),
             };
@@ -371,6 +408,8 @@ impl Shared {
     ///
     /// A session that is started here is on no line. One that was on a
     /// line is not gone on with here: its far end comes back on one.
+    /// One that was made for a call is not started here: it begins when
+    /// the call is brought.
     pub(crate) async fn live(
         self: &Arc<Self>,
         id: SessionId,
@@ -395,6 +434,11 @@ impl Shared {
                      on one",
                 ));
             }
+            Stands::Rests {
+                ran: false,
+                lined: true,
+                ..
+            } => return Err(waits_for_its_call()),
             Stands::Rests { agent, ran, .. } => (agent, ran),
         };
         let (life, told, _) = self.start(id, &agent, ran, None, followed).await?;
@@ -436,6 +480,12 @@ impl Shared {
                 lined: false,
                 ..
             }) => return turned_away(caller, &no_line()).await,
+            // The far end of a call is a telephone.
+            Ok(Stands::Rests {
+                ran: false,
+                lined: true,
+                ..
+            }) => return turned_away(caller, &waits_for_its_call()).await,
             Ok(Stands::Rests { agent, ran, .. }) => (agent, ran),
             Err(problem) => return turned_away(caller, &problem).await,
         };
@@ -451,11 +501,36 @@ impl Shared {
             return turned_away(caller, &problem).await;
         }
         let (transport, handle) = caller.transport(FAR_END);
-        let wire: (Box<dyn Transport>, Handle) = (Box::new(transport), handle);
+        let wire = Wire::Line(Box::new(transport), handle);
         match self.start(id, &agent, ran, Some(wire), false).await {
             Ok((life, _, wire)) => self.attach(id, caller, wire, life, back, asked).await,
             Err(problem) => turned_away(caller, &problem).await,
         }
+    }
+
+    /// Starts the session `id` on `call`, whose stream came with the
+    /// ticket of that session. The session was made for the call and
+    /// has not run: a call that comes for any other is closed, and so is
+    /// one whose session cannot be started.
+    pub(crate) async fn on_call(self: &Arc<Self>, id: SessionId, call: Call) {
+        let Ok(Stands::Rests { starting, .. }) = self.found(id, stands) else {
+            return call.refuse().await;
+        };
+        let _one = starting.lock().await;
+        // Whoever held it before may have started the session.
+        let Ok(Stands::Rests {
+            agent,
+            ran: false,
+            lined: true,
+            ..
+        }) = self.found(id, stands)
+        else {
+            return call.refuse().await;
+        };
+        let wire = Wire::Call(Box::new(call.transport(FAR_END)));
+        // A session that does not start has said why where the daemon
+        // runs, and lets go of the stream, which ends the call.
+        let _ = self.start(id, &agent, false, Some(wire), false).await;
     }
 
     /// Puts `caller` on `wire`, which is the line of the session `id`
@@ -513,7 +588,7 @@ impl Shared {
         id: SessionId,
         name: &str,
         ran: bool,
-        wire: Option<(Box<dyn Transport>, Handle)>,
+        wire: Option<Wire>,
         followed: bool,
     ) -> Result<(u64, Option<Told>, Option<Line>), Problem> {
         if self.is_draining() {
@@ -526,16 +601,19 @@ impl Shared {
             ));
         };
         let failed = |failure: Failure| failed("the session could not be started", &failure);
-        let (transport, handle) = wire.map_or((None, None), |(transport, handle)| {
-            (Some(transport), Some(handle))
-        });
+        let lined = wire.is_some();
+        let (transport, handle) = match wire {
+            None => (None, None),
+            Some(Wire::Line(transport, handle)) => (Some(transport), Some(handle)),
+            Some(Wire::Call(transport)) => (Some(transport), None),
+        };
         if !ran {
             // Kept with the session from before its first record, so
             // that whoever goes on with it knows whose it is, and that
             // its far end comes back on a line.
             let label = Label {
                 agent: name.to_owned(),
-                line: handle.is_some(),
+                line: lined,
             };
             self.stack
                 .kept
@@ -560,7 +638,7 @@ impl Shared {
         });
         let known = self.found(id, |entry| {
             entry.phase = Phase::Running { life, mode };
-            entry.lined = wire.is_some();
+            entry.lined = lined;
             entry.line.clone_from(&wire);
         });
         if known.is_err() {
@@ -719,6 +797,14 @@ impl Daemon {
                 "there is no control key: whoever is on this machine may ask everything".to_owned(),
             );
         }
+        let telephony = Telephony::of(&config.telephony)?;
+        // A daemon that is told where carriers reach it is reached by
+        // that name.
+        let mut hosts = config.hosts.clone();
+        if let Some(telephony) = &telephony {
+            hosts.push(telephony.host().to_owned());
+            notes.extend(telephony.notes());
+        }
         let listener = TcpListener::bind(config.listen)
             .await
             .with(|| format!("{} cannot be listened on", config.listen))?;
@@ -732,8 +818,9 @@ impl Daemon {
             agents,
             keys,
             tickets: Tickets::default(),
-            gate: Gate::new(address, &config.hosts, &config.allowed_origins),
+            gate: Gate::new(address, &hosts, &config.allowed_origins),
             playground: config.serves_playground(),
+            telephony,
             sessions: Mutex::new(sessions),
             draining: AtomicBool::new(false),
             going: watch::Sender::new(false),

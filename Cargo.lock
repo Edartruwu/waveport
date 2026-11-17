@@ -3027,6 +3027,7 @@ dependencies = [
  "waveport-ports",
  "waveport-protocol",
  "waveport-testkit",
+ "waveport-transport-telephony-ws",
  "waveport-transport-websocket",
 ]
 

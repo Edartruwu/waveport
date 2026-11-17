@@ -10,6 +10,8 @@
 //! | `POST /v1/sessions/{id}/input` | a control key, or the session's resume token | 202 |
 //! | `GET /v1/sessions/{id}/events` | a control key, a client token, or the session's resume token | a stream of server-sent events |
 //! | `GET /v1/client` | a client token or a resume token, in the hello | a WebSocket that speaks client protocol v1 |
+//! | `POST /v1/telephony/{carrier}/voice` | the carrier, which signs what it asks | the document that connects its call to a stream |
+//! | `GET /v1/telephony/{carrier}/stream` | the carrier, with what the answer gave its stream to say | a WebSocket that carries the call |
 //! | `GET /healthz` | anyone | 200, or 503 while the daemon stops |
 //!
 //! A body is JSON, and says so (`Content-Type: application/json`). What
@@ -49,7 +51,7 @@ use waveport_protocol::control::v1::{Context, CreateSession, Input, Problem, Ses
 use crate::auth::From;
 use crate::daemon::{Shared, failed};
 use crate::events::Following;
-use crate::{line, playground};
+use crate::{calls, line, playground};
 use waveport_assembly::shown::{Asked, Position};
 
 /// The daemon, for a request.
@@ -144,6 +146,8 @@ pub(crate) fn router(daemon: &Arc<Shared>) -> Router {
         .route("/v1/sessions/{id}/input", post(input))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/client", get(line::client))
+        .route("/v1/telephony/{carrier}/voice", post(calls::voice))
+        .route("/v1/telephony/{carrier}/stream", get(calls::stream))
         .fallback(nowhere)
         .layer(middleware::from_fn_with_state(Arc::clone(daemon), gate));
     Router::new()

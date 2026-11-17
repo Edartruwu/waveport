@@ -2,7 +2,7 @@
 //! are kept, and its agents.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -80,6 +80,9 @@ pub struct Config {
     /// alone serves it, and one that listens anywhere else does not.
     #[serde(default)]
     pub playground: Option<bool>,
+    /// The calls that carriers bring.
+    #[serde(default)]
+    pub telephony: Telephony,
     /// The agents, by the names sessions are asked for with.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentSpec>,
@@ -98,6 +101,93 @@ pub struct Control {
     /// given and what they answered.
     #[serde(default)]
     pub show_tool_text: bool,
+}
+
+/// The calls that carriers bring.
+///
+/// ```toml
+/// [telephony]
+/// public = "https://voice.example"
+///
+/// [telephony.twilio]
+/// agent = "front-desk"
+/// token_env = "TWILIO_AUTH_TOKEN"
+/// ```
+///
+/// Twilio is then told to ask `https://voice.example/v1/telephony/twilio/voice`
+/// when a call comes in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Telephony {
+    /// The address carriers reach the daemon at, as they are told it:
+    /// `https://voice.example`, with nothing after the name but a port.
+    /// A carrier signs what it asks with the address it asked at, and
+    /// is answered with the address of a stream at this one, which it
+    /// reaches over TLS. Whatever stands in front of the daemon and
+    /// speaks TLS for it passes a WebSocket on.
+    #[serde(default)]
+    pub public: Option<String>,
+    /// The calls that Twilio brings.
+    #[serde(default)]
+    pub twilio: Option<Twilio>,
+}
+
+/// The calls that Twilio brings.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Twilio {
+    /// The agent that answers, by its name. It hears and speaks.
+    pub agent: String,
+    /// The name of the environment variable that holds the auth token
+    /// of the account, which is what Twilio signs its requests with.
+    /// The token itself is never written here.
+    pub token_env: String,
+    /// The account whose calls are answered, as Twilio names it
+    /// (`AC…`). Left out, every call that is signed with the token is.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Whether a stream is turned away whose request is not signed as
+    /// Twilio signs. Left out, a stream is let in by what the answer to
+    /// its call gave it to say, which is good once, and one that is not
+    /// signed is said once where the daemon runs: how Twilio signs the
+    /// request for a stream is not written down in full.
+    #[serde(default)]
+    pub signed_streams: bool,
+}
+
+impl Telephony {
+    /// What follows `https://` in the address carriers reach the
+    /// daemon at: its name, and its port if it says one.
+    #[must_use]
+    pub fn authority(&self) -> Option<&str> {
+        self.public
+            .as_deref()
+            .and_then(|public| public.strip_prefix("https://"))
+    }
+
+    /// Whether any carrier's calls are answered.
+    #[must_use]
+    pub const fn answers(&self) -> bool {
+        self.twilio.is_some()
+    }
+}
+
+/// Whether `authority` is a name, or a name and a port, and nothing
+/// else. A name is one of letters, digits, dots and strokes, or an
+/// address in brackets.
+fn is_an_authority(authority: &str) -> bool {
+    let (name, port) = match authority.rsplit_once(':') {
+        Some((name, port)) if !port.contains(']') => (name, Some(port)),
+        _ => (authority, None),
+    };
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-');
+    let named = name.starts_with(|c: char| c.is_ascii_alphanumeric()) && name.chars().all(plain);
+    let numbered = name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|address| address.parse::<Ipv6Addr>().is_ok());
+    let ported = port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port > 0));
+    (named || numbered) && ported
 }
 
 /// Where sessions are kept.
@@ -298,7 +388,55 @@ impl Config {
                 "`processors` names processor {twice} for two shards"
             )));
         }
+        self.telephony_checked()?;
         Ok(self)
+    }
+
+    /// What the configuration says of calls, if it holds together.
+    fn telephony_checked(&mut self) -> Result<(), Failure> {
+        let telephony = &mut self.telephony;
+        if let Some(public) = telephony.public.as_mut() {
+            // Written with or without a stroke at its end, it is the
+            // same address.
+            if public.ends_with('/') {
+                public.pop();
+            }
+        }
+        if telephony.public.is_some() && !telephony.authority().is_some_and(is_an_authority) {
+            return Err(Failure(
+                "`telephony.public` is the address carriers reach the daemon at: `https://`, \
+                 its name, a port if it has one, and nothing after that"
+                    .to_owned(),
+            ));
+        }
+        let Some(twilio) = &telephony.twilio else {
+            return Ok(());
+        };
+        if telephony.public.is_none() {
+            return Err(Failure(
+                "`telephony.twilio` answers calls, and `telephony.public` does not say where \
+                 Twilio reaches the daemon: it signs what it asks with that address"
+                    .to_owned(),
+            ));
+        }
+        if twilio.token_env.trim().is_empty() {
+            return Err(Failure(
+                "`telephony.twilio.token_env` names the environment variable that holds the \
+                 account's auth token"
+                    .to_owned(),
+            ));
+        }
+        match self.agents.get(&twilio.agent) {
+            None => Err(Failure(format!(
+                "`telephony.twilio.agent` names {:?}, and there is no agent of that name",
+                twilio.agent
+            ))),
+            Some(agent) if agent.speech.is_none() => Err(Failure(format!(
+                "the agent {} answers calls and neither hears nor speaks: it has no `speech`",
+                twilio.agent
+            ))),
+            Some(_) => Ok(()),
+        }
     }
 
     /// What the agents of the daemon share. Where its threads run is
@@ -326,7 +464,7 @@ mod tests {
 
     use waveport_assembly::spec::Keeps;
 
-    use super::{Config, Limits};
+    use super::{Config, Limits, Telephony, is_an_authority};
 
     #[test]
     fn the_page_is_served_on_this_machine_and_elsewhere_only_if_told_to() {
@@ -397,8 +535,33 @@ model = "a-model"
 
 [agents.night_desk.speech]
 language = "es"
+
+[telephony]
+public = "https://voice.example:8443/"
+
+[telephony.twilio]
+agent = "night_desk"
+token_env = "A_CARRIER_TOKEN"
+account = "AC00000000000000000000000000000001"
+signed_streams = true
 "#;
         let config = Config::from_toml(text).unwrap();
+        // Written with a stroke at its end or without, it is one
+        // address.
+        let calls = &config.telephony;
+        assert_eq!(calls.public.as_deref(), Some("https://voice.example:8443"));
+        assert_eq!(calls.authority(), Some("voice.example:8443"));
+        assert!(calls.answers());
+        let twilio = calls.twilio.as_ref().unwrap();
+        assert_eq!(
+            (twilio.agent.as_str(), twilio.token_env.as_str()),
+            ("night_desk", "A_CARRIER_TOKEN")
+        );
+        assert_eq!(
+            twilio.account.as_deref(),
+            Some("AC00000000000000000000000000000001")
+        );
+        assert!(twilio.signed_streams);
         assert_eq!(config.listen.port(), 8443);
         assert_eq!(config.hosts, ["voice.example"]);
         assert_eq!(config.control.key_env.len(), 2);
@@ -418,6 +581,128 @@ language = "es"
         let names: Vec<&str> = config.agents.keys().map(String::as_str).collect();
         assert_eq!(names, ["front-desk", "night_desk"]);
         assert!(config.agents["night_desk"].speech.is_some());
+    }
+
+    #[test]
+    fn a_daemon_that_is_told_of_no_calls_answers_none() {
+        let config = Config::from_toml("[agents.a]\n").unwrap();
+        assert_eq!(config.telephony, Telephony::default());
+        assert_eq!(config.telephony.authority(), None);
+        assert!(!config.telephony.answers());
+        // Where carriers reach a daemon may be said before any carrier
+        // is: it answers no calls yet.
+        let reached = "[telephony]\npublic = \"https://voice.example\"\n[agents.a]\n";
+        let config = Config::from_toml(reached).unwrap();
+        assert_eq!(config.telephony.authority(), Some("voice.example"));
+        assert!(!config.telephony.answers());
+        // What is left out of what is said of a carrier.
+        let speaks = "[agents.a.speech]\nlanguage = \"en\"\n";
+        let least = format!(
+            "{reached}[telephony.twilio]\nagent = \"a\"\ntoken_env = \"A_CARRIER_TOKEN\"\n{speaks}"
+        );
+        let config = Config::from_toml(&least).unwrap();
+        assert!(config.telephony.answers());
+        let twilio = config.telephony.twilio.unwrap();
+        assert_eq!((twilio.account, twilio.signed_streams), (None, false));
+    }
+
+    #[test]
+    fn the_address_carriers_reach_a_daemon_at_is_a_name_and_perhaps_a_port() {
+        for good in [
+            "voice.example",
+            "voice.example:8443",
+            "a-b.example",
+            "localhost",
+            "127.0.0.1:8080",
+            "voice.example:65535",
+            "[::1]",
+            "[::1]:8443",
+            "[2001:db8::1]:443",
+        ] {
+            assert!(is_an_authority(good), "{good}");
+        }
+        for bad in [
+            "",
+            ":443",
+            "voice.example:",
+            "voice.example:0",
+            "voice.example:65536",
+            "voice.example:port",
+            "voice.example:1:2",
+            "voice.example/calls",
+            "voice.example?x",
+            "voice.example#x",
+            "user@voice.example",
+            "voice example",
+            ".example",
+            "-example",
+            "::1",
+            "[::1",
+            "[]",
+            "[]:443",
+            "[::1]x",
+            "[[::1]]",
+            "[voice.example]",
+        ] {
+            assert!(!is_an_authority(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn calls_are_answered_by_an_agent_that_speaks_at_an_address_that_is_said() {
+        let speaks = "[agents.a.speech]\nlanguage = \"en\"\n";
+        let twilio = "[telephony.twilio]\nagent = \"a\"\ntoken_env = \"A_CARRIER_TOKEN\"\n";
+        let at = |public: &str| format!("[telephony]\npublic = \"{public}\"\n");
+        let good = format!("{}{twilio}{speaks}", at("https://voice.example"));
+        assert!(Config::from_toml(&good).is_ok());
+        let nameless = "[telephony.twilio]\nagent = \"a\"\ntoken_env = \" \"\n";
+        for (text, why) in [
+            // Nowhere, and somewhere a carrier's stream does not reach.
+            (
+                format!("{twilio}{speaks}"),
+                "`telephony.public` does not say",
+            ),
+            (
+                format!("{}{twilio}{speaks}", at("http://voice.example")),
+                "`telephony.public` is the address",
+            ),
+            (
+                format!("{}{twilio}{speaks}", at("voice.example")),
+                "`telephony.public` is the address",
+            ),
+            (
+                format!("{}{twilio}{speaks}", at("https://voice.example/calls")),
+                "`telephony.public` is the address",
+            ),
+            (
+                format!("{}{twilio}{speaks}", at("https://voice.example//")),
+                "`telephony.public` is the address",
+            ),
+            (
+                format!("{}[agents.a]\n", at("https://")),
+                "`telephony.public` is the address",
+            ),
+            // An agent that only reads and writes, and one there is
+            // none of.
+            (
+                format!("{}{twilio}[agents.a]\n", at("https://voice.example")),
+                "the agent a answers calls and neither hears nor speaks",
+            ),
+            (
+                format!("{}{twilio}[agents.b]\n", at("https://voice.example")),
+                "there is no agent of that name",
+            ),
+            // No variable for what the carrier signs with.
+            (
+                format!("{}{nameless}{speaks}", at("https://voice.example")),
+                "`telephony.twilio.token_env` names",
+            ),
+        ] {
+            let Err(failure) = Config::from_toml(&text) else {
+                panic!("{text:?} was taken");
+            };
+            assert!(failure.0.contains(why), "{text:?}: {failure}");
+        }
     }
 
     #[test]
@@ -458,6 +743,10 @@ language = "es"
             ),
             ("[agents.a.llm]\nkey = \"sk-not-a-key\"\n", "at line 2"),
             ("listen = \"sk-not-a-key\"\n[agents.a]\n", "at line 1"),
+            (
+                "[telephony.twilio]\nagent = \"a\"\ntoken = \"sk-not-a-key\"\n[agents.a]\n",
+                "at line 3",
+            ),
         ] {
             let Err(failure) = Config::from_toml(text) else {
                 panic!("{text:?} was taken");

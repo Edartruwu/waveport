@@ -68,6 +68,61 @@ fn upgrade_to(code: ErrorCode, detail: &str, name: HeaderName, value: &'static s
     response
 }
 
+/// Answers a request that asks for its connection to become a
+/// WebSocket, on which `protocol` is spoken if what is spoken there has
+/// a name. With the answer that makes it one comes the connection,
+/// which is there once the answer has been sent. A request that asks
+/// for no WebSocket, for another version of it, or for one on which
+/// `protocol` is not spoken, is answered with why, and no connection
+/// comes of it.
+pub(crate) fn becomes_a_websocket(
+    request: &mut Request,
+    protocol: Option<&'static str>,
+) -> (Option<OnUpgrade>, Response) {
+    let headers = request.headers();
+    let refused = |problem: Problem| (None, Refused::from(problem).into_response());
+    if !(names(headers, UPGRADE, "websocket") && names(headers, CONNECTION, "upgrade")) {
+        let detail = "what is asked here is asked over a WebSocket";
+        let answer = upgrade_to(ErrorCode::Unsupported, detail, UPGRADE, "websocket");
+        return (None, answer);
+    }
+    if said(headers, SEC_WEBSOCKET_VERSION) != Some(WEBSOCKET) {
+        let detail = "the WebSocket protocol spoken here is version 13";
+        let name = SEC_WEBSOCKET_VERSION;
+        return (
+            None,
+            upgrade_to(ErrorCode::Version, detail, name, WEBSOCKET),
+        );
+    }
+    if let Some(protocol) = protocol {
+        let offered = headers.get_all(SEC_WEBSOCKET_PROTOCOL).iter();
+        if !ws::offers(offered.filter_map(|named| named.to_str().ok()), protocol) {
+            let detail = format!(
+                "the protocol spoken here is {protocol}: a client names it among the ones it \
+                 speaks"
+            );
+            return refused(Problem::of(ErrorCode::Version, detail));
+        }
+    }
+    let accept = said(headers, SEC_WEBSOCKET_KEY)
+        .map(ws::accept_key)
+        .and_then(|accept| HeaderValue::from_str(&accept).ok());
+    let Some(accept) = accept else {
+        let detail = "a request for a WebSocket has a key";
+        return refused(Problem::of(ErrorCode::Malformed, detail));
+    };
+    let upgraded = hyper::upgrade::on(request);
+    let mut response = StatusCode::SWITCHING_PROTOCOLS.into_response();
+    let headers = response.headers_mut();
+    headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+    headers.insert(SEC_WEBSOCKET_ACCEPT, accept);
+    if let Some(protocol) = protocol {
+        headers.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(protocol));
+    }
+    (Some(upgraded), response)
+}
+
 /// Answers a request for a client's line: the connection becomes a
 /// WebSocket, and whoever is on it is heard from there on.
 pub(crate) async fn client(
@@ -82,44 +137,11 @@ pub(crate) async fn client(
                       hello";
         return Err(Problem::of(ErrorCode::Malformed, detail).into());
     }
-    let headers = request.headers();
-    if !(names(headers, UPGRADE, "websocket") && names(headers, CONNECTION, "upgrade")) {
-        let detail = "a client connects here over a WebSocket";
-        return Ok(upgrade_to(
-            ErrorCode::Unsupported,
-            detail,
-            UPGRADE,
-            "websocket",
-        ));
+    let (upgraded, answer) = becomes_a_websocket(&mut request, Some(PROTOCOL));
+    if let Some(upgraded) = upgraded {
+        tokio::spawn(serve(Arc::clone(&daemon), upgraded));
     }
-    if said(headers, SEC_WEBSOCKET_VERSION) != Some(WEBSOCKET) {
-        let detail = "the WebSocket protocol spoken here is version 13";
-        let name = SEC_WEBSOCKET_VERSION;
-        return Ok(upgrade_to(ErrorCode::Version, detail, name, WEBSOCKET));
-    }
-    let offered = headers.get_all(SEC_WEBSOCKET_PROTOCOL).iter();
-    if !ws::offers(offered.filter_map(|named| named.to_str().ok()), PROTOCOL) {
-        let detail = format!(
-            "the protocol spoken here is {PROTOCOL}: a client names it among the ones it speaks"
-        );
-        return Err(Problem::of(ErrorCode::Version, detail).into());
-    }
-    let accept = said(headers, SEC_WEBSOCKET_KEY)
-        .map(ws::accept_key)
-        .and_then(|accept| HeaderValue::from_str(&accept).ok());
-    let Some(accept) = accept else {
-        let detail = "a request for a WebSocket has a key";
-        return Err(Problem::of(ErrorCode::Malformed, detail).into());
-    };
-    let upgraded = hyper::upgrade::on(&mut request);
-    tokio::spawn(serve(Arc::clone(&daemon), upgraded));
-    let mut response = StatusCode::SWITCHING_PROTOCOLS.into_response();
-    let headers = response.headers_mut();
-    headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
-    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
-    headers.insert(SEC_WEBSOCKET_ACCEPT, accept);
-    headers.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(PROTOCOL));
-    Ok(response)
+    Ok(answer)
 }
 
 /// The session a hello is for, and where its client was if it comes
