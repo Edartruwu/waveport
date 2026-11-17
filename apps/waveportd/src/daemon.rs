@@ -165,11 +165,25 @@ pub(crate) struct Shared {
     pub(crate) keys: Keys,
     pub(crate) tickets: Tickets,
     pub(crate) gate: Gate,
+    /// Whether the page to try the agents on is served.
+    pub(crate) playground: bool,
     sessions: Mutex<BTreeMap<SessionId, Entry>>,
     /// Whether the daemon takes nothing new.
     draining: AtomicBool,
     /// Whether the daemon is going away, for whoever follows a session.
     going: watch::Sender<bool>,
+}
+
+impl Shared {
+    /// The names of the agents, in order.
+    pub(crate) fn agent_names(&self) -> Vec<&str> {
+        self.agents.keys().map(String::as_str).collect()
+    }
+
+    /// Whether whoever asks for everything has to hold a control key.
+    pub(crate) fn wants_a_key(&self) -> bool {
+        !self.keys.is_empty()
+    }
 }
 
 /// Returns once `flag` is raised, or nobody is left to raise it.
@@ -719,6 +733,7 @@ impl Daemon {
             keys,
             tickets: Tickets::default(),
             gate: Gate::new(address, &config.hosts, &config.allowed_origins),
+            playground: config.serves_playground(),
             sessions: Mutex::new(sessions),
             draining: AtomicBool::new(false),
             going: watch::Sender::new(false),

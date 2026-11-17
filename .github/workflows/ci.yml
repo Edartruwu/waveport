@@ -250,6 +250,41 @@ jobs:
             cargo xtask bench-ir
           fi
 
+  # The JavaScript client: its types, its tests, and a browser on the
+  # page a daemon serves, with a recording for a microphone. The daemon
+  # is the real one with stand-ins for its providers, so nothing beyond
+  # the runner is asked for anything.
+  js:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      # The npm that comes with Node 24 keeps a version out until it is a
+      # week old (`sdks/js/.npmrc`). The one the image has does not know
+      # how to.
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci
+        working-directory: sdks/js
+      - run: npm run check
+        working-directory: sdks/js
+      - run: npm test
+        working-directory: sdks/js
+      - run: cargo build --locked -p waveportd --example stand_in
+      # The models that listen: see the `test` job.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/assets
+          key: assets-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('assets/assets.lock.toml') }}
+      - run: cargo xtask fetch-assets
+      - run: node test/browser/run.js --daemon ../../target/debug/examples/stand_in
+        working-directory: sdks/js
+
   # The single required check. It fails unless every job above succeeded.
   ci-ok:
     if: always()
@@ -266,6 +301,7 @@ jobs:
       - loom
       - miri
       - bench
+      - js
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

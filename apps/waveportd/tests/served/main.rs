@@ -26,6 +26,7 @@ mod aloud;
 mod asked;
 mod kept;
 mod lined;
+mod page;
 mod placed;
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -38,77 +39,17 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use waveport_protocol::client::v1::{Applied, FromServer, View};
-use waveport_testkit::servers::{End, HttpAnswer, HttpServer};
+use waveport_testkit::servers::{HttpAnswer, HttpServer};
+use waveport_testkit::stand_in::{answer, slow_answer, unfinished};
 
 use crate::far_end::{Answer, Event, Events, ask};
 
 /// What the language model writes when it is asked the time.
 const ANSWER: [&str; 3] = ["It is", " ten past three.", " Anything else?"];
 
-/// One piece of an answer of the language model, as it comes off the
-/// wire.
-fn piece(delta: &str, finish: &str) -> String {
-    format!(
-        "data: {{\"id\":\"chatcmpl-made-up\",\"object\":\"chat.completion.chunk\",\
-         \"created\":1794769429,\"model\":\"a-model\",\"choices\":[{{\"index\":0,\
-         \"delta\":{delta},\"finish_reason\":{finish}}}]}}\n\n"
-    )
-}
-
-/// What the language model answers with: `words`, and then the tool
-/// `tool` asked for, if any.
-fn answer_as_text(words: &[&str], tool: Option<&str>) -> String {
-    let mut stream = piece("{\"role\":\"assistant\",\"content\":\"\"}", "null");
-    for word in words {
-        stream.push_str(&piece(&format!("{{\"content\":\"{word}\"}}"), "null"));
-    }
-    match tool {
-        Some(name) => {
-            let call = format!(
-                "{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_{name}\",\"type\":\"function\",\
-                 \"function\":{{\"name\":\"{name}\",\"arguments\":\"{{}}\"}}}}]}}"
-            );
-            stream.push_str(&piece(&call, "null"));
-            stream.push_str(&piece("{}", "\"tool_calls\""));
-        }
-        None => stream.push_str(&piece("{}", "\"stop\"")),
-    }
-    stream.push_str("data: [DONE]\n\n");
-    stream
-}
-
-/// An answer of the language model that arrives at once.
-fn answer(words: &[&str], tool: Option<&str>) -> HttpAnswer {
-    HttpAnswer::recorded(&answer_as_text(words, tool))
-}
-
-/// The same answer, with `pause` before each of its lines.
-fn slow_answer(words: &[&str], pause: Duration) -> HttpAnswer {
-    HttpAnswer::Stream {
-        pieces: answer_as_text(words, None)
-            .split_inclusive('\n')
-            .map(|line| line.as_bytes().to_vec())
-            .collect(),
-        pause,
-        end: End::Complete,
-    }
-}
-
-/// An answer that stops after its first words and is never finished:
-/// the server says nothing more, and keeps the connection.
+/// An answer that stops after its first words and is never finished.
 fn stops_short() -> HttpAnswer {
-    let begun = [
-        piece("{\"role\":\"assistant\",\"content\":\"\"}", "null"),
-        piece(&format!("{{\"content\":\"{}\"}}", ANSWER[0]), "null"),
-    ];
-    HttpAnswer::Stream {
-        pieces: begun
-            .iter()
-            .map(|piece| piece.as_bytes().to_vec())
-            .collect(),
-        pause: Duration::ZERO,
-        end: End::Hang,
-    }
+    unfinished(&ANSWER[..1])
 }
 
 /// A folder for a daemon to be run in, which nothing else is run in.

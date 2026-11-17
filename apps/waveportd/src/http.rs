@@ -49,7 +49,7 @@ use waveport_protocol::control::v1::{Context, CreateSession, Input, Problem, Ses
 use crate::auth::From;
 use crate::daemon::{Shared, failed};
 use crate::events::Following;
-use crate::line;
+use crate::{line, playground};
 use waveport_assembly::shown::{Asked, Position};
 
 /// The daemon, for a request.
@@ -131,7 +131,13 @@ pub(crate) fn said(
 
 /// The routes of the daemon.
 pub(crate) fn router(daemon: &Arc<Shared>) -> Router {
+    let page = if daemon.playground {
+        playground::routes()
+    } else {
+        Router::new()
+    };
     let asked = Router::new()
+        .merge(page)
         .route("/v1/sessions", post(create).get(list))
         .route("/v1/sessions/{id}", get(info).delete(end))
         .route("/v1/sessions/{id}/tokens", post(mint))

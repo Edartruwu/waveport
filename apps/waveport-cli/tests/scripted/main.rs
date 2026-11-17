@@ -52,13 +52,10 @@ use waveport_protocol::client::v1::{
     self as protocol, AudioFormat, ByeReason, Codec, Cut, ErrorCode, Fact, FromClient, FromServer,
     Lifecycle, Resume,
 };
-use waveport_testkit::servers::{HttpAnswer, HttpServer, WsHeard, WsSeen, WsServer, WsStep};
+use waveport_testkit::servers::{HttpServer, WsHeard, WsSeen, WsServer, WsStep};
 use waveport_testkit::speech;
+use waveport_testkit::stand_in::{HEARD, SAID, answer, piece, spoken};
 use waveport_transport_websocket::{Client, Heard, Hello, PATH, PROTOCOL, Unconnected};
-
-/// What the recogniser said when it was sent this question.
-const HEARD: &str =
-    include_str!("../../../../crates/adapters/stt/openai/tests/fixtures/question.ws");
 
 /// What a stand-in for Deepgram says in a call with one question:
 /// nothing until it is asked what it has heard, and then the question
@@ -90,91 +87,7 @@ const HEARD_BY_ASSEMBLYAI: &str = "< {\"type\":\"Begin\",\"id\":\"made-up\",\
     ! 1000 ";
 
 /// What the agent says once it knows the time.
-const ANSWER: [&str; 3] = ["It is", " ten past three.", " Goodbye!"];
-
-/// One piece of an answer of the language model, as it comes off the
-/// wire.
-fn piece(delta: &str, finish: &str) -> String {
-    format!(
-        "data: {{\"id\":\"chatcmpl-made-up\",\"object\":\"chat.completion.chunk\",\
-         \"created\":1794769429,\"model\":\"a-model\",\"choices\":[{{\"index\":0,\
-         \"delta\":{delta},\"finish_reason\":{finish}}}]}}\n\n"
-    )
-}
-
-/// The piece that asks for the tool `name`, with no arguments.
-fn asks_for(name: &str) -> String {
-    let call = format!(
-        "{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_{name}\",\"type\":\"function\",\
-         \"function\":{{\"name\":\"{name}\",\"arguments\":\"{{}}\"}}}}]}}"
-    );
-    piece(&call, "null")
-}
-
-/// An answer of the language model: these words, and then a call of this
-/// tool.
-fn answer(words: &[&str], tool: Option<&str>) -> HttpAnswer {
-    let mut stream = piece("{\"role\":\"assistant\",\"content\":\"\"}", "null");
-    for word in words {
-        stream.push_str(&piece(&format!("{{\"content\":\"{word}\"}}"), "null"));
-    }
-    match tool {
-        Some(tool) => {
-            stream.push_str(&asks_for(tool));
-            stream.push_str(&piece("{}", "\"tool_calls\""));
-        }
-        None => stream.push_str(&piece("{}", "\"stop\"")),
-    }
-    stream.push_str("data: [DONE]\n\n");
-    HttpAnswer::recorded(&stream)
-}
-
-/// What the synthesiser says for one response: 1.2 s of a tone at
-/// 24 kHz, in three pieces, with where the words are. As the provider
-/// does, it speaks each piece of text when it is given it, and does not
-/// wait for the rest.
-fn spoken() -> Vec<WsStep> {
-    let tone: Vec<i16> = (0..Rate::Hz24000.samples_in_millis(400))
-        .map(|n| if n % 48 < 24 { 3_000 } else { -3_000 })
-        .collect();
-    let mut data = String::new();
-    write_base64(&tone, &mut data);
-    let chunk = format!(
-        "< {{\"type\":\"chunk\",\"data\":\"{data}\",\"done\":false,\"status_code\":206,\
-         \"step_time\":12,\"context_id\":\"{{{{context_id}}}}\"}}"
-    );
-    let words = |words: &str, starts: &str, ends: &str| {
-        format!(
-            "< {{\"type\":\"timestamps\",\"done\":false,\"status_code\":206,\
-             \"context_id\":\"{{{{context_id}}}}\",\"word_timestamps\":{{\"words\":[{words}],\
-             \"start\":[{starts}],\"end\":[{ends}]}}}}"
-        )
-    };
-    let first = words(
-        "\"It\",\"is\",\"ten\",\"past\",\"three.\"",
-        "0.0,0.1,0.2,0.4,0.6",
-        "0.1,0.2,0.4,0.6,0.8",
-    );
-    let second = words("\"Goodbye!\"", "0.8", "1.2");
-    let done = "< {\"type\":\"done\",\"done\":true,\"status_code\":206,\
-                \"context_id\":\"{{context_id}}\"}";
-    let script = [
-        // The first sentence.
-        "> \"transcript\":\"It is",
-        &chunk,
-        &first,
-        &chunk,
-        // The second, which is given once the first has its audio.
-        "> Goodbye!",
-        &chunk,
-        &second,
-        // And once the adapter has said that no more text follows.
-        "> \"continue\":false",
-        done,
-    ]
-    .join("\n");
-    WsStep::script(&script)
-}
+const ANSWER: [&str; 3] = SAID;
 
 /// The same answer as a stand-in for ElevenLabs gives it: the same
 /// 1.2 s of a tone in three pieces, each with the characters spoken in

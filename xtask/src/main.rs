@@ -13,6 +13,7 @@ mod bench;
 mod ci;
 mod error;
 mod git;
+mod js;
 mod lint_sync;
 mod meta;
 mod perf;

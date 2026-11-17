@@ -3,13 +3,14 @@
 //! The command strings below are the gates. CI runs the same strings; a test
 //! in this module fails if the workflows and this file drift apart.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use crate::args::Args;
 use crate::error::{Context, Error, Result};
 use crate::meta::{self, LoadOptions, Workspace};
-use crate::{arch, assets, bench, git, lint_sync, semver, tier};
+use crate::{arch, assets, bench, git, js, lint_sync, semver, tier};
 
 /// The dated nightly that runs Miri. Change it here and in the workflow together.
 macro_rules! miri_toolchain {
@@ -50,6 +51,7 @@ enum Tool {
     SemverChecks,
     Miri,
     Valgrind,
+    Node,
 }
 
 impl Tool {
@@ -76,6 +78,22 @@ impl Tool {
                 " cargo miri --version"
             )),
             Self::Valgrind => bench::tools_installed(),
+            // The script says whether the Node is new enough and
+            // whether there is a browser to run.
+            Self::Node => {
+                let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join(js::DIR)
+                    .join("test/browser/run.js");
+                probe(&format!("{} --version", npm()))
+                    && Command::new("node")
+                        .arg(script)
+                        .arg("--can-run")
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success())
+            }
         }
     }
 
@@ -91,6 +109,10 @@ impl Tool {
                 " --profile minimal --component miri --component rust-src"
             ),
             Self::Valgrind => "install valgrind, then cargo install --locked gungraun-runner",
+            Self::Node => {
+                "install Node.js 24 or later, which brings npm 11, and Chrome or Chromium \
+                 (`CHROME_BIN` says where a browser is)"
+            }
         }
     }
 }
@@ -232,7 +254,45 @@ const GATES: &[Gate] = &[
         tool: Some(Tool::Valgrind),
         run: |env| bench::compare(&env.workspace, env.base.as_deref()),
     },
+    Gate {
+        name: "js",
+        fast: false,
+        tool: Some(Tool::Node),
+        // The JavaScript client: its types, its tests, and a browser on
+        // the page a daemon serves. The daemon is the real one, so the
+        // models that listen are fetched for it.
+        run: |env| {
+            Ok(within(env, js::DIR, js::INSTALL)?
+                && within(env, js::DIR, js::CHECK)?
+                && within(env, js::DIR, js::TEST)?
+                && shell(env, js::STAND_IN)?
+                && assets::run(&[])?
+                && within(env, js::DIR, js::BROWSER)?)
+        },
+    },
 ];
+
+/// What npm is called where it is run from a program.
+const fn npm() -> &'static str {
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
+}
+
+/// Runs one of the gate strings in a folder of the repository.
+fn within(env: &Env, folder: &str, line: &str) -> Result<bool> {
+    let mut parts = line.split_whitespace();
+    let program = match parts.next() {
+        Some("npm") => npm(),
+        Some(program) => program,
+        None => return Err(Error::new("empty gate command")),
+    };
+    println!("    $ (in {folder}) {line}");
+    Command::new(program)
+        .current_dir(env.workspace.root.join(folder))
+        .args(parts)
+        .status()
+        .map(|status| status.success())
+        .context(format!("could not run `{line}`"))
+}
 
 /// Builds a command from one of the gate strings.
 fn command(env: &Env, line: &str, deny_warnings: bool) -> Result<Command> {
@@ -341,6 +401,7 @@ mod tests {
         BENCH_SMOKE, CLIPPY, DENY, DOCS, DOCTEST, FEATURES, FMT, GATES, LOOM, LOOM_FLAGS, MIRI,
         MSRV, NO_STD, TEST, Tool,
     };
+    use crate::js;
 
     #[test]
     fn gate_names_are_unique() {
@@ -382,6 +443,34 @@ mod tests {
         }
     }
 
+    /// The one check a pull request is held to waits for every job: a job
+    /// that it does not name can fail and be merged all the same.
+    #[test]
+    fn the_required_check_waits_for_every_job() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/ci.yml");
+        let text = std::fs::read_to_string(path).unwrap();
+        let (_, jobs) = text.split_once("\njobs:\n").unwrap();
+        // A job is a name at two spaces, and what the last one waits for
+        // is a list at six.
+        let names: Vec<&str> = jobs
+            .lines()
+            .filter_map(|line| line.strip_prefix("  ")?.strip_suffix(':'))
+            .filter(|name| !name.starts_with([' ', '#']))
+            .collect();
+        let (_, required) = jobs.split_once("\n  ci-ok:\n").unwrap();
+        let (_, needs) = required.split_once("\n    needs:\n").unwrap();
+        let needed: Vec<&str> = needs
+            .lines()
+            .map_while(|line| line.strip_prefix("      - "))
+            .collect();
+        assert!(names.len() >= 13, "{names:?}");
+        assert_eq!(names.last(), Some(&"ci-ok"));
+        for name in &names[..names.len() - 1] {
+            assert!(needed.contains(name), "`ci-ok` does not wait for `{name}`");
+        }
+        assert_eq!(needed.len(), names.len() - 1, "{needed:?}");
+    }
+
     /// CI and `cargo xtask ci` must run the same gates. A gate changed in
     /// one place and not the other fails here.
     #[test]
@@ -411,6 +500,13 @@ mod tests {
                 "cargo xtask semver --self-test",
                 "cargo xtask bench-ir --base",
                 "cargo xtask fetch-assets",
+                // The JavaScript client, in its own folder.
+                js::INSTALL,
+                js::CHECK,
+                js::TEST,
+                js::STAND_IN,
+                js::BROWSER,
+                &format!("working-directory: {}", js::DIR),
                 // Settings the local runner applies to its child processes.
                 "CARGO_BUILD_WARNINGS: deny",
                 "RUSTDOCFLAGS: -D warnings",

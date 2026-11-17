@@ -60,7 +60,7 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Every directory named `fixtures` under `dir`. What a build leaves
-/// behind is not looked into.
+/// behind, and what is installed, is not looked into.
 fn fixtures_under(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -68,7 +68,7 @@ fn fixtures_under(dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         match path.file_name().and_then(|name| name.to_str()) {
-            Some("target" | ".git") => {}
+            Some("target" | ".git" | "node_modules") => {}
             Some("fixtures") => out.push(path),
             _ => fixtures_under(&path, out),
         }
@@ -121,7 +121,7 @@ fn a_key_is_seen_and_what_only_looks_like_one_is_not() {
 fn no_recording_holds_a_key() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut fixtures = Vec::new();
-    for part in ["apps", "crates"] {
+    for part in ["apps", "crates", "sdks"] {
         fixtures_under(&root.join(part), &mut fixtures);
     }
     let mut files = Vec::new();

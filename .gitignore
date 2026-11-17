@@ -6,3 +6,6 @@
 # where keys are sometimes put. Neither is the repository's.
 .waveport/
 .env
+
+# What npm installs for the JavaScript client.
+node_modules/
