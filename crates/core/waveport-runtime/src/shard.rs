@@ -13,6 +13,10 @@
 //! A session that panics ends, and is said to have. The shard and its
 //! other sessions go on.
 //!
+//! The thread of a shard can be kept on a processor of its own
+//! ([`RuntimeConfig::pinning`]). It is not, unless whoever runs the
+//! process says which.
+//!
 //! A runtime that is to stop is drained first: it starts no session
 //! from then on, and whoever stops it waits for the ones it has. What
 //! still runs when the runtime is dropped stops where it is, and what it
@@ -35,12 +39,13 @@ use waveport_ports::control::{ControlError, EventRx, SessionControl, SessionEven
 use waveport_ports::journal::{Lease, SessionId};
 use waveport_ports::plan::SessionPlan;
 
+use crate::pinning::{self, PinError, Pinning};
 use crate::session::{Ended, Parts, Rebuilt, Request, Session, SessionSpec, Standing, StartError};
 pub use crate::watch::ShardStats;
 use crate::watch::{Counters, Watched};
 
 /// How a runtime is set up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     /// How many shards it has.
     pub shards: usize,
@@ -52,17 +57,22 @@ pub struct RuntimeConfig {
     /// How far behind a follower of a session can be before it is let
     /// go, in things it is told.
     pub follower_room: usize,
+    /// The processor each shard's thread is kept on, if they are kept
+    /// anywhere. The threads a shard starts for work that blocks are
+    /// kept on the processors that are no shard's.
+    pub pinning: Option<Pinning>,
 }
 
 impl Default for RuntimeConfig {
     /// One shard, runs of 250 µs, 256 requests waiting and followers 256
-    /// behind.
+    /// behind. Its thread is left to the system.
     fn default() -> Self {
         Self {
             shards: 1,
             poll_budget: Duration::from_micros(250),
             inbox: 256,
             follower_room: 256,
+            pinning: None,
         }
     }
 }
@@ -74,6 +84,8 @@ pub enum RuntimeError {
     Config,
     /// A shard's thread or executor could not be started.
     Thread(String),
+    /// The threads of the shards could not be kept on their processors.
+    Pinning(PinError),
 }
 
 impl fmt::Display for RuntimeError {
@@ -81,6 +93,9 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::Config => f.write_str("a runtime needs a shard, and room for requests"),
             Self::Thread(error) => write!(f, "a shard could not be started: {error}"),
+            Self::Pinning(error) => {
+                write!(f, "the shards cannot have processors of their own: {error}")
+            }
         }
     }
 }
@@ -189,15 +204,30 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// The configuration asks for nothing, or a thread could not be
-    /// started.
+    /// The configuration asks for nothing, a thread could not be
+    /// started, or a shard could not be kept on its processor.
     pub fn new(config: RuntimeConfig) -> Result<Self, RuntimeError> {
         if config.shards == 0 || config.inbox == 0 || config.follower_room == 0 {
             return Err(RuntimeError::Config);
         }
+        let mut places = Vec::new();
+        if let Some(pinning) = &config.pinning {
+            if pinning.shards().len() != config.shards {
+                return Err(RuntimeError::Pinning(PinError::Count {
+                    shards: config.shards,
+                    processors: pinning.shards().len(),
+                }));
+            }
+            let rest: Arc<[usize]> = Arc::from(pinning.rest());
+            places.extend(pinning.shards().iter().map(|&processor| Place {
+                processor,
+                rest: Arc::clone(&rest),
+            }));
+        }
+        let mut places = places.into_iter();
         let mut shards = Vec::with_capacity(config.shards);
         for index in 0..config.shards {
-            shards.push(start_shard(index)?);
+            shards.push(start_shard(index, places.next())?);
         }
         Ok(Self {
             config,
@@ -444,23 +474,49 @@ fn lock(directory: &Directory) -> std::sync::MutexGuard<'_, Sessions> {
     directory.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Where the thread of a shard is kept, and the threads it starts.
+struct Place {
+    /// The shard's own processor.
+    processor: usize,
+    /// The processors that are no shard's.
+    rest: Arc<[usize]>,
+}
+
 /// Starts the thread of a shard, and waits until its executor is there.
-fn start_shard(index: usize) -> Result<Shard, RuntimeError> {
+/// With a `place`, the thread is kept there before the executor is
+/// built.
+fn start_shard(index: usize, place: Option<Place>) -> Result<Shard, RuntimeError> {
     let (jobs, mut waiting) = mpsc::unbounded_channel::<Job>();
     let (built, is_built) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new()
         .name(format!("waveport-shard-{index}"))
         .spawn(move || {
-            let executor = Builder::new_current_thread()
-                .enable_all()
-                .build_local(LocalOptions::default());
-            let executor = match executor {
+            let mut builder = Builder::new_current_thread();
+            builder.enable_all();
+            if let Some(Place { processor, rest }) = place {
+                // The executor starts threads for work that blocks: a
+                // name is looked up on one whenever an adapter connects.
+                // A thread begins where its maker is, which would be
+                // this shard's processor, so each is sent to the
+                // processors that are no shard's as it starts. Nobody
+                // can be told if that fails then. So it is tried here
+                // first, on the way to where this thread stays.
+                let kept = pinning::keep(&rest).and_then(|()| pinning::keep(&[processor]));
+                if let Err(error) = kept {
+                    let _ = built.send(Err(RuntimeError::Pinning(error)));
+                    return;
+                }
+                builder.on_thread_start(move || {
+                    let _ = pinning::keep(&rest);
+                });
+            }
+            let executor = match builder.build_local(LocalOptions::default()) {
                 Ok(executor) => {
                     let _ = built.send(Ok(()));
                     executor
                 }
                 Err(error) => {
-                    let _ = built.send(Err(error.to_string()));
+                    let _ = built.send(Err(RuntimeError::Thread(error.to_string())));
                     return;
                 }
             };
@@ -477,9 +533,102 @@ fn start_shard(index: usize) -> Result<Shard, RuntimeError> {
             counters: Arc::default(),
             thread: Some(thread),
         }),
-        Ok(Err(error)) => Err(RuntimeError::Thread(error)),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(RuntimeError::Thread(
             "the thread ended before it had begun".to_owned(),
         )),
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests {
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use super::{Job, Place, Runtime, RuntimeConfig, RuntimeError, start_shard};
+    use crate::pinning::{PinError, Pinning, allowed};
+
+    /// Where the thread of `shard` may run, and where a thread may that
+    /// it started for work that blocks.
+    fn found(shard: &super::Shard) -> (Vec<usize>, Vec<usize>) {
+        let (found, told) = std::sync::mpsc::channel();
+        let job: Job = Box::new(move || {
+            let here = allowed().unwrap();
+            tokio::task::spawn_local(async move {
+                let there = tokio::task::spawn_blocking(|| allowed().unwrap());
+                let _ = found.send((here, there.await.unwrap()));
+            });
+        });
+        assert!(shard.jobs.send(job).is_ok());
+        told.recv_timeout(Duration::from_secs(10)).unwrap()
+    }
+
+    #[test]
+    fn a_shard_stays_on_its_processor_and_what_it_starts_stays_off_it() {
+        let all = allowed().unwrap();
+        let Some((&processor, others)) = all.split_last().filter(|(_, others)| !others.is_empty())
+        else {
+            // There is one processor, and nothing to tell apart.
+            return;
+        };
+        let place = Place {
+            processor,
+            rest: Arc::from(others),
+        };
+        let shard = start_shard(0, Some(place)).unwrap();
+        let (here, there) = found(&shard);
+        assert_eq!(here, [processor]);
+        assert_eq!(there, others);
+        // A shard that was given no place is left to the system, and so
+        // is what it starts.
+        let shard = start_shard(1, None).unwrap();
+        assert_eq!(found(&shard), (all.clone(), all.clone()));
+        // Whoever started them is where it was.
+        assert_eq!(allowed().unwrap(), all);
+    }
+
+    #[test]
+    fn a_runtime_is_not_started_with_shards_it_cannot_place() {
+        let all = allowed().unwrap();
+        let Some((&processor, _)) = all.split_last().filter(|(_, others)| !others.is_empty())
+        else {
+            return;
+        };
+        let with = |shards, pinning| RuntimeConfig {
+            shards,
+            pinning: Some(pinning),
+            ..RuntimeConfig::default()
+        };
+        let pinning = Pinning::here(&[processor]).unwrap();
+        // One processor for each shard.
+        let refused = Runtime::new(with(2, pinning.clone())).map(|_| ());
+        let count = PinError::Count {
+            shards: 2,
+            processors: 1,
+        };
+        assert_eq!(refused, Err(RuntimeError::Pinning(count.clone())));
+        assert_eq!(
+            RuntimeError::Pinning(count).to_string(),
+            "the shards cannot have processors of their own: 1 processors were named for 2 \
+             shards: each shard has one"
+        );
+        let runtime = Runtime::new(with(1, pinning)).unwrap();
+        assert_eq!(runtime.sessions(), 0);
+        // A place the system does not have is said by the shard that
+        // was to be there.
+        let Some(nowhere) = (0..1024).rev().find(|processor| !all.contains(processor)) else {
+            return;
+        };
+        let place = Place {
+            processor: nowhere,
+            rest: Arc::from(all.as_slice()),
+        };
+        match start_shard(0, Some(place)).map(|_| ()) {
+            Err(RuntimeError::Pinning(PinError::Refused { processors, .. })) => {
+                assert_eq!(processors, [nowhere]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

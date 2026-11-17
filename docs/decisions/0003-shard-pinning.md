@@ -1,6 +1,6 @@
 # Decision 0003: when the threads of the shards are pinned
 
-**Date:** 16 November 2026. **Status:** accepted. **Phase:** 1, after milestone 11.
+**Date:** 16 November 2026. **Status:** accepted, and built in phase 2 (milestone 9). **Phase:** 1, after milestone 11.
 
 The [roadmap](../../ROADMAP.md) had the threads of the shards pinned to cores in phase 1. Milestone 11 measured what pinning is worth and did not build it. This record says what that measurement was, why pinning is not built yet, when it is built, and what to build then.
 
@@ -46,6 +46,20 @@ So the gain that was measured is this laptop's. It is not evidence for a server.
 - **The crate.** `rustix` 1.1 with its `thread` feature: `sched_setaffinity` and `sched_getaffinity` for a thread, with a set of processors. Declared for Linux only, it adds `linux-raw-sys` to the tree; `bitflags` is there already.
 - **Not `core_affinity`**, which the density spike used. It binds a thread to one processor and cannot give the other threads a set of them. It brings `num_cpus`, and `winapi` on Windows. On macOS it sets an affinity tag, which is a hint.
 - **No choosing by the runtime.** To choose well it would have to know which cores are fast, which are two threads of one core, and what else runs on the machine.
+
+## As it was built
+
+It was built in phase 2 with the daemon, as decided, and differs from the list above in three places.
+
+- **The setting is a plan, and not a list of processors.** `RuntimeConfig` has a `Pinning`: the processor of each shard, and the processors that are left for every other thread. Two lines of the list above cannot both be had as they are written. The processors that may be asked for are the ones the thread that asks may run on, and the daemon keeps its first thread off the shards' processors before the runtime is built: by then that thread may no longer run on the processors of the shards, and asking it says so. So the question is asked once (`Pinning::here`), while the thread may still run wherever the process may, and the answer is handed on. A `Pinning` can be made in no other way, and on a system that is not Linux in none.
+- **The other threads need a processor.** Naming every processor the process may run on for a shard is refused, because the threads that are no shard's would have none.
+- **A shard tries the processors of the other threads first.** The hook that sends a shard's blocking threads to the processors that are no shard's cannot tell anybody that it failed. So the thread of a shard is kept on those processors for a moment before it is kept on its own, where a failure stops the runtime from starting and says why.
+
+In the daemon the setting is `processors`, one for each of its `shards`. A daemon that is told it and cannot do it does not start: on a system that is not Linux, with a processor the process may not run on, or with none left over. `waveportd --check` reads the file and does not ask the machine. A set of processors has room for 1,024, as the system's own call has by default; a machine with more is answered with an error.
+
+Linux cuts the name of a thread after fifteen letters, so the threads of the shards are all called `waveport-shard-` in `ps` and `top`. They are told apart by their processors, which are in the order of the shards.
+
+Nothing was measured with it. The measurements the next section asks for are still to be made, and pinning is still off unless the processors are named.
 
 ## What has to be measured before it is on by default anywhere
 

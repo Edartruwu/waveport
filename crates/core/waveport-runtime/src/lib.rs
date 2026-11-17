@@ -20,6 +20,8 @@ pub mod context;
 pub mod edges;
 mod handoff;
 #[cfg(not(waveport_loom))]
+pub mod pinning;
+#[cfg(not(waveport_loom))]
 pub mod session;
 #[cfg(not(waveport_loom))]
 pub mod shard;

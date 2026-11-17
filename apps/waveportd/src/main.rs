@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use waveport_assembly::{Context as _, Failure};
-use waveportd::{Config, Daemon};
+use waveportd::{Config, Daemon, Threads};
 
 /// Runs agents that are reached over HTTP.
 #[derive(Debug, Parser)]
@@ -49,8 +49,8 @@ async fn told_to_stop() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn run(config: &Config) -> Result<ExitCode, Failure> {
-    let running = Daemon::start(config).await?;
+async fn run(config: &Config, threads: &Threads) -> Result<ExitCode, Failure> {
+    let running = Daemon::start(config, threads).await?;
     for note in running.notes() {
         eprintln!("waveportd: {note}");
     }
@@ -87,15 +87,19 @@ fn main() -> ExitCode {
             );
             return Ok(ExitCode::SUCCESS);
         }
-        // The threads here serve connections. Sessions run on threads
-        // of their own.
+        // Sessions run on threads of their own, which may have
+        // processors of their own. Every other thread of the daemon is
+        // started from this one and begins where this one is, so this
+        // one is kept off those processors before it starts any.
+        let threads = Threads::place(&config)?;
+        // The threads here serve connections.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("waveportd-io")
             .enable_all()
             .build()
             .with(|| "nothing can be run".to_owned())?;
-        let done = runtime.block_on(run(&config));
+        let done = runtime.block_on(run(&config, &threads));
         // Whatever still waits for something is not waited for.
         runtime.shutdown_background();
         done
