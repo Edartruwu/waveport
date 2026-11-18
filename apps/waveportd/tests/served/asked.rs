@@ -597,11 +597,11 @@ async fn a_page_from_elsewhere_is_refused_on_this_machine() {
     assert_eq!(may.header("access-control-allow-origin"), Some(app));
     assert_eq!(
         may.header("access-control-allow-methods"),
-        Some("GET, POST, DELETE")
+        Some("GET, POST, PATCH, DELETE")
     );
     assert_eq!(
         may.header("access-control-allow-headers"),
-        Some("authorization, content-type, last-event-id")
+        Some("authorization, content-type, if-match, last-event-id")
     );
     forbidden(first("https://evil.example").await);
     // So is a stream of events.

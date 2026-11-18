@@ -71,6 +71,10 @@ pub(crate) const LISTEN: &str = "127.0.0.1:9283";
 /// take calls.
 pub(crate) const CALLS: &str = "ws://127.0.0.1:9283";
 
+/// Where a client finds a daemon that was told nothing about where to
+/// listen.
+pub(crate) const DAEMON: &str = "http://127.0.0.1:7070";
+
 /// Voice agents on this machine.
 #[derive(Debug, Parser)]
 #[command(name = "waveport", version, about, long_about = None)]
@@ -106,10 +110,12 @@ pub(crate) enum Command {
     /// another terminal, or on another machine if --exposed says that it
     /// may be. Nothing asks a caller who they are.
     Serve(Serve),
-    /// Call an agent that `waveport serve` runs.
+    /// Call an agent that `waveport serve` runs, or one of a daemon.
     ///
     /// The caller is whoever sits at this machine, at its microphone and
-    /// loudspeaker, or follows a script as with `waveport run`.
+    /// loudspeaker, or follows a script as with `waveport run`. The call
+    /// goes over a WebSocket to `waveport serve`, or with --webrtc over
+    /// WebRTC to an agent that `waveportd` runs.
     Client(Client),
     /// Chat with an agent in writing, at this terminal.
     ///
@@ -218,9 +224,25 @@ pub(crate) struct Serve {
 
 #[derive(Debug, Args)]
 pub(crate) struct Client {
-    /// Where the agent takes calls.
-    #[arg(long, value_name = "URL", default_value = CALLS)]
-    pub url: String,
+    /// Where the agent takes calls: `ws://127.0.0.1:9283` if nothing is
+    /// said, and with --webrtc its daemon, at `http://127.0.0.1:7070`.
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+    /// Call an agent that a daemon runs, over WebRTC. The daemon is
+    /// asked for a session of the agent, and the call is offered to it.
+    #[arg(long, requires = "agent")]
+    pub webrtc: bool,
+    /// The agent to call, as the daemon names it.
+    #[arg(long, value_name = "NAME", requires = "webrtc")]
+    pub agent: Option<String>,
+    /// The environment variable that holds the daemon's control key,
+    /// for a daemon that has one.
+    #[arg(long, value_name = "VARIABLE", requires = "webrtc")]
+    pub key_env: Option<String>,
+    /// Make the call over a connection and not with datagrams, as from
+    /// a network that lets none out.
+    #[arg(long, requires = "webrtc")]
+    pub tcp: bool,
     /// The microphone, as `waveport devices` names it.
     #[arg(long, value_name = "ID")]
     pub microphone: Option<String>,
@@ -242,6 +264,15 @@ pub(crate) struct Client {
     /// Where to write what the caller was played, as a WAV file.
     #[arg(long, value_name = "FILE", requires = "script")]
     pub record: Option<PathBuf>,
+}
+
+impl Client {
+    /// Where the agent takes calls, or its daemon listens: what was
+    /// said, or where one that was told nothing does.
+    pub(crate) fn at(&self) -> &str {
+        let unsaid = if self.webrtc { DAEMON } else { CALLS };
+        self.url.as_deref().unwrap_or(unsaid)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -557,6 +588,46 @@ mod tests {
     }
 
     #[test]
+    fn a_call_over_webrtc_is_to_an_agent_of_a_daemon() {
+        let client = |more: &[&str]| {
+            let all = ["waveport", "client"].iter().chain(more).copied();
+            Cli::try_parse_from(all).map(|cli| match cli.command {
+                Command::Client(client) => client,
+                _ => panic!("client is client"),
+            })
+        };
+        // A daemon that was told nothing about where to listen is found
+        // by a client that was told nothing either.
+        let told = client(&["--webrtc", "--agent", "desk"]).unwrap();
+        assert_eq!(told.at(), "http://127.0.0.1:7070");
+        assert_eq!(told.agent.as_deref(), Some("desk"));
+        assert_eq!((told.key_env.as_deref(), told.tcp), (None, false));
+        let all = [
+            "--webrtc",
+            "--agent",
+            "desk",
+            "--url",
+            "https://voice.example",
+            "--key-env",
+            "WAVEPORTD_KEY",
+            "--tcp",
+        ];
+        let told = client(&all).unwrap();
+        assert_eq!(told.at(), "https://voice.example");
+        // It is the name of a variable that is said, and never a key.
+        assert_eq!(
+            (told.key_env.as_deref(), told.tcp),
+            (Some("WAVEPORTD_KEY"), true)
+        );
+        // A daemon has agents, and is asked for one. What is said of a
+        // daemon is said of nothing else.
+        assert!(client(&["--webrtc"]).is_err());
+        assert!(client(&["--agent", "desk"]).is_err());
+        assert!(client(&["--key-env", "WAVEPORTD_KEY"]).is_err());
+        assert!(client(&["--tcp"]).is_err());
+    }
+
+    #[test]
     fn calls_over_a_websocket_stay_on_this_machine_unless_told() {
         let cli = Cli::try_parse_from(["waveport", "serve"]).unwrap();
         let Command::Serve(serve) = cli.command else {
@@ -570,8 +641,9 @@ mod tests {
         };
         // A client finds a server that was told nothing, having been told
         // nothing itself.
-        assert_eq!(client.url, format!("ws://{}", serve.listen));
+        assert_eq!(client.at(), format!("ws://{}", serve.listen));
         assert!(client.script.is_none());
+        assert!(!client.webrtc);
 
         // A caller is at the devices or follows a script, not both, and
         // only a scripted one is recorded.

@@ -2,7 +2,7 @@
 //! are kept, and its agents.
 
 use std::collections::BTreeMap;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -83,6 +83,9 @@ pub struct Config {
     /// The calls that carriers bring.
     #[serde(default)]
     pub telephony: Telephony,
+    /// The calls that come over WebRTC. Left out, none are answered.
+    #[serde(default)]
+    pub webrtc: Option<Webrtc>,
     /// The agents, by the names sessions are asked for with.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentSpec>,
@@ -170,6 +173,121 @@ impl Telephony {
     pub const fn answers(&self) -> bool {
         self.twilio.is_some()
     }
+}
+
+/// The calls that come over WebRTC: where their datagrams are taken,
+/// and what a far end is told of the servers that help it get through.
+///
+/// ```toml
+/// [webrtc]
+/// udp = "0.0.0.0:7071"
+/// tcp = "0.0.0.0:7071"
+/// reached_at = "203.0.113.5"
+///
+/// [[webrtc.ice_servers]]
+/// urls = ["turn:turn.example.net?transport=udp"]
+/// secret_env = "TURN_SECRET"
+/// ```
+///
+/// An offer is posted to `/v1/webrtc`, by whoever holds a client token
+/// of a session whose agent hears and speaks.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Webrtc {
+    /// Where the datagrams of every call are taken. It is another port
+    /// than the one the daemon listens on, and whatever stands before
+    /// the daemon lets datagrams through to it.
+    pub udp: SocketAddr,
+    /// Where connections are taken, for the calls of far ends whose
+    /// network lets no datagram out. Left out, none are.
+    #[serde(default)]
+    pub tcp: Option<SocketAddr>,
+    /// The address far ends are told to reach the daemon at, where it
+    /// is not the one above: for a daemon that takes datagrams at every
+    /// address of its machine, or that is behind an address of somebody
+    /// else's. It is one address, and a number: a far end is told no
+    /// name.
+    #[serde(default)]
+    pub reached_at: Option<IpAddr>,
+    /// Whether a far end that can may make its handshake in DTLS 1.3.
+    /// Left out, it may not: the library the handshake is made with has
+    /// faults in it that are open.
+    #[serde(default)]
+    pub dtls13: bool,
+    /// How many calls may be on their way at once: answered, with their
+    /// far ends not there yet. An offer that comes when as many are is
+    /// told to come again.
+    #[serde(default = "setting_up")]
+    pub setting_up: usize,
+    /// How long a far end has to be there once its offer is answered,
+    /// in milliseconds: its checks, the handshake and its hello.
+    #[serde(default = "there_within_ms")]
+    pub there_within_ms: u32,
+    /// The servers a far end is told of with its answer, which it asks
+    /// where it is reached from outside (STUN) or sends its call
+    /// through (TURN). The daemon runs none of them and asks none of
+    /// them anything.
+    #[serde(default)]
+    pub ice_servers: Vec<IceServer>,
+}
+
+/// A server a far end is told of with the answer to its offer.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IceServer {
+    /// Its addresses, as a browser takes them: `stun:stun.example.net`,
+    /// `turn:turn.example.net:3478?transport=udp`,
+    /// `turns:turn.example.net?transport=tcp`.
+    pub urls: Vec<String>,
+    /// The name of the environment variable that holds the secret the
+    /// server shares with whoever makes credentials for it (coturn's
+    /// `static-auth-secret`). Each far end is then given a name and a
+    /// password of its own, which are good for `ttl_s` and no longer.
+    /// The secret itself is never written here, and no far end is told
+    /// it.
+    #[serde(default)]
+    pub secret_env: Option<String>,
+    /// How long the name and the password a far end is given are good
+    /// for, in seconds.
+    #[serde(default = "ttl_s")]
+    pub ttl_s: u32,
+    /// The name every far end says to the server, for a server that has
+    /// one name and one password for all. Every far end is told both.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// The name of the environment variable that holds the password
+    /// that goes with `username`.
+    #[serde(default)]
+    pub credential_env: Option<String>,
+}
+
+impl IceServer {
+    /// Whether any of its addresses is of a server calls are sent
+    /// through, which asks who sends.
+    #[must_use]
+    pub fn relays(&self) -> bool {
+        self.urls.iter().any(|url| url.starts_with("turn"))
+    }
+}
+
+/// Whether `url` is the address of a STUN or TURN server (RFC 7064, RFC
+/// 7065), and holds nothing that could not stand between the brackets
+/// of a `Link`.
+fn is_an_ice_server(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return false;
+    };
+    let (place, query) = match rest.split_once('?') {
+        Some((place, query)) => (place, Some(query)),
+        None => (rest, None),
+    };
+    let relays = matches!(scheme, "turn" | "turns");
+    let asked = match query {
+        None => true,
+        Some("transport=udp" | "transport=tcp") => relays,
+        Some(_) => false,
+    };
+    (relays || matches!(scheme, "stun" | "stuns")) && is_an_authority(place) && asked
 }
 
 /// Whether `authority` is a name, or a name and a port, and nothing
@@ -296,6 +414,18 @@ const fn keep_alive_ms() -> u32 {
     15_000
 }
 
+const fn setting_up() -> usize {
+    64
+}
+
+const fn there_within_ms() -> u32 {
+    15_000
+}
+
+const fn ttl_s() -> u32 {
+    3_600
+}
+
 /// Whether `name` can be the name of an agent: a few letters, digits,
 /// hyphens and underscores, beginning with a letter or a digit.
 fn is_a_name(name: &str) -> bool {
@@ -389,7 +519,73 @@ impl Config {
             )));
         }
         self.telephony_checked()?;
+        self.webrtc_checked()?;
         Ok(self)
+    }
+
+    /// What the configuration says of calls over WebRTC, if it holds
+    /// together.
+    fn webrtc_checked(&self) -> Result<(), Failure> {
+        let Some(webrtc) = &self.webrtc else {
+            return Ok(());
+        };
+        let at = webrtc.reached_at.unwrap_or_else(|| webrtc.udp.ip());
+        if at.is_unspecified() {
+            return Err(Failure(
+                "`webrtc.udp` takes datagrams at every address of the machine, and \
+                 `webrtc.reached_at` does not say the one that far ends are told"
+                    .to_owned(),
+            ));
+        }
+        if webrtc.setting_up == 0 || webrtc.there_within_ms == 0 {
+            return Err(Failure(
+                "`webrtc.setting_up` and `webrtc.there_within_ms` are each one at least".to_owned(),
+            ));
+        }
+        if !self.agents.values().any(|agent| agent.speech.is_some()) {
+            return Err(Failure(
+                "`webrtc` answers calls, and no agent hears or speaks: none has a `speech`"
+                    .to_owned(),
+            ));
+        }
+        for server in &webrtc.ice_servers {
+            if server.urls.is_empty() {
+                return Err(Failure(
+                    "a server of `webrtc.ice_servers` has no `urls`: it is reached nowhere"
+                        .to_owned(),
+                ));
+            }
+            // What was written is not said back: a password may have
+            // been written where none belongs.
+            if !server.urls.iter().all(|url| is_an_ice_server(url)) {
+                return Err(Failure(
+                    "one of the `urls` of `webrtc.ice_servers` is no address of a STUN or TURN \
+                     server: `stun:` or `turn:`, a name, a port if it has one, and for a TURN \
+                     server `?transport=udp` or `?transport=tcp` if it says which"
+                        .to_owned(),
+                ));
+            }
+            let named =
+                |name: &Option<String>| name.as_deref().is_some_and(|name| !name.trim().is_empty());
+            let made = named(&server.secret_env);
+            let fixed = named(&server.username) || named(&server.credential_env);
+            let whole = named(&server.username) && named(&server.credential_env);
+            let said = match (server.relays(), made, fixed) {
+                (true, true, false) => server.ttl_s > 0,
+                (true, false, true) => whole,
+                (false, false, false) => true,
+                _ => false,
+            };
+            if !said {
+                return Err(Failure(
+                    "a TURN server of `webrtc.ice_servers` says who may use it in one of two \
+                     ways: `secret_env`, with a `ttl_s` of one at least, or `username` and \
+                     `credential_env`. A STUN server says neither"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// What the configuration says of calls, if it holds together.
@@ -464,7 +660,7 @@ mod tests {
 
     use waveport_assembly::spec::Keeps;
 
-    use super::{Config, Limits, Telephony, is_an_authority};
+    use super::{Config, IceServer, Limits, Telephony, is_an_authority, is_an_ice_server};
 
     #[test]
     fn the_page_is_served_on_this_machine_and_elsewhere_only_if_told_to() {
@@ -604,6 +800,201 @@ signed_streams = true
         assert!(config.telephony.answers());
         let twilio = config.telephony.twilio.unwrap();
         assert_eq!((twilio.account, twilio.signed_streams), (None, false));
+    }
+
+    #[test]
+    fn everything_a_daemon_is_told_of_calls_over_webrtc_can_be_said() {
+        let text = r#"
+[webrtc]
+udp = "0.0.0.0:7071"
+tcp = "[::]:7071"
+reached_at = "203.0.113.5"
+dtls13 = true
+setting_up = 8
+there_within_ms = 5000
+
+[[webrtc.ice_servers]]
+urls = ["stun:stun.example.net"]
+
+[[webrtc.ice_servers]]
+urls = ["turn:turn.example.net:3478?transport=udp", "turns:turn.example.net?transport=tcp"]
+secret_env = "A_TURN_SECRET"
+ttl_s = 600
+
+[[webrtc.ice_servers]]
+urls = ["turn:[2001:db8::7]"]
+username = "everyone"
+credential_env = "A_TURN_PASSWORD"
+
+[agents.night_desk.speech]
+language = "es"
+"#;
+        let config = Config::from_toml(text).unwrap();
+        let webrtc = config.webrtc.as_ref().unwrap();
+        assert_eq!(webrtc.udp, "0.0.0.0:7071".parse().unwrap());
+        assert_eq!(webrtc.tcp, Some("[::]:7071".parse().unwrap()));
+        assert_eq!(webrtc.reached_at, Some("203.0.113.5".parse().unwrap()));
+        assert!(webrtc.dtls13);
+        assert_eq!((webrtc.setting_up, webrtc.there_within_ms), (8, 5_000));
+        let relays: Vec<bool> = webrtc.ice_servers.iter().map(IceServer::relays).collect();
+        assert_eq!(relays, [false, true, true]);
+        let made = &webrtc.ice_servers[1];
+        assert_eq!(
+            (made.secret_env.as_deref(), made.ttl_s, made.urls.len()),
+            (Some("A_TURN_SECRET"), 600, 2)
+        );
+        let fixed = &webrtc.ice_servers[2];
+        assert_eq!(
+            (fixed.username.as_deref(), fixed.credential_env.as_deref()),
+            (Some("everyone"), Some("A_TURN_PASSWORD"))
+        );
+    }
+
+    #[test]
+    fn calls_over_webrtc_are_taken_where_far_ends_can_be_told_to_send() {
+        // A daemon that is told of none answers none.
+        assert_eq!(Config::from_toml("[agents.a]\n").unwrap().webrtc, None);
+        let speaks = "[agents.a.speech]\nlanguage = \"en\"\n";
+        let at = |more: &str| format!("[webrtc]\n{more}\n{speaks}");
+        // What is left out.
+        let least = Config::from_toml(&at("udp = \"192.0.2.7:7071\"")).unwrap();
+        let webrtc = least.webrtc.unwrap();
+        assert_eq!(
+            (webrtc.tcp, webrtc.reached_at, webrtc.dtls13),
+            (None, None, false)
+        );
+        assert_eq!((webrtc.setting_up, webrtc.there_within_ms), (64, 15_000));
+        assert_eq!(webrtc.ice_servers, []);
+        // Every address of the machine, with the one far ends are told.
+        let every = "udp = \"[::]:7071\"\nreached_at = \"2001:db8::7\"";
+        assert!(Config::from_toml(&at(every)).is_ok());
+
+        for (text, why) in [
+            // Nowhere a far end can be told: every address, with none
+            // said or with none said again; and a name.
+            (
+                at("udp = \"0.0.0.0:7071\""),
+                "`webrtc.reached_at` does not say",
+            ),
+            (
+                at("udp = \"192.0.2.7:7071\"\nreached_at = \"0.0.0.0\""),
+                "`webrtc.reached_at` does not say",
+            ),
+            (
+                at("udp = \"0.0.0.0:7071\"\nreached_at = \"voice.example\""),
+                "at line 3",
+            ),
+            (at(""), "udp"),
+            // Nobody may come, and nobody is waited for.
+            (
+                at("udp = \"192.0.2.7:7071\"\nsetting_up = 0"),
+                "one at least",
+            ),
+            (
+                at("udp = \"192.0.2.7:7071\"\nthere_within_ms = 0"),
+                "one at least",
+            ),
+            // Nobody to call.
+            (
+                "[webrtc]\nudp = \"192.0.2.7:7071\"\n[agents.a]\n".to_owned(),
+                "no agent hears or speaks",
+            ),
+        ] {
+            let Err(failure) = Config::from_toml(&text) else {
+                panic!("{text:?} was taken");
+            };
+            assert!(failure.0.contains(why), "{text:?}: {failure}");
+        }
+    }
+
+    #[test]
+    fn a_server_far_ends_are_told_of_says_where_it_is_and_who_may_use_it() {
+        for good in [
+            "stun:stun.example.net",
+            "stuns:stun.example.net:5349",
+            "turn:turn.example.net",
+            "turn:turn.example.net:3478?transport=udp",
+            "turns:turn.example.net?transport=tcp",
+            "turn:192.0.2.7:3478",
+            "turn:[2001:db8::7]:3478",
+        ] {
+            assert!(is_an_ice_server(good), "{good}");
+        }
+        for bad in [
+            "",
+            "stun",
+            "stun:",
+            "turn:?transport=udp",
+            "https://turn.example.net",
+            "sip:turn.example.net",
+            // A server that only says where a far end is, is asked
+            // nothing of how.
+            "stun:stun.example.net?transport=udp",
+            "turn:turn.example.net?transport=sctp",
+            "turn:turn.example.net?transport=udp&x=y",
+            "turn:turn.example.net:0",
+            // What would say who, where that is not said, and what
+            // would end the brackets it is told between.
+            "turn:everyone:wpc1_madeup@turn.example.net",
+            "turn:turn.example.net>; rel=\"x\"",
+            "turn:turn.example.net/path",
+            "turn: turn.example.net",
+        ] {
+            assert!(!is_an_ice_server(bad), "{bad}");
+        }
+
+        let server = |more: &str| {
+            format!(
+                "[webrtc]\nudp = \"192.0.2.7:7071\"\n[[webrtc.ice_servers]]\n{more}\n\
+                 [agents.a.speech]\nlanguage = \"en\"\n"
+            )
+        };
+        let stun = "urls = [\"stun:stun.example.net\"]";
+        let turn = "urls = [\"turn:turn.example.net\"]";
+        let made = format!("{turn}\nsecret_env = \"A_TURN_SECRET\"");
+        let fixed =
+            format!("{turn}\nusername = \"everyone\"\ncredential_env = \"A_TURN_PASSWORD\"");
+        for good in [stun, made.as_str(), fixed.as_str()] {
+            let taken = Config::from_toml(&server(good));
+            assert!(taken.is_ok(), "{good}: {:?}", taken.err());
+        }
+        // A name and a password that are made are good for an hour.
+        let config = Config::from_toml(&server(&made)).unwrap();
+        assert_eq!(config.webrtc.unwrap().ice_servers[0].ttl_s, 3_600);
+
+        let who = "says who may use it";
+        for (more, why) in [
+            ("urls = []".to_owned(), "has no `urls`"),
+            (
+                "urls = [\"turn:everyone:wpc1_madeup@turn.example.net\"]".to_owned(),
+                "is no address of a STUN or TURN server",
+            ),
+            (
+                "urls = [\"stun:stun.example.net\", \"wpc1_madeup\"]".to_owned(),
+                "is no address of a STUN or TURN server",
+            ),
+            // A server calls are sent through, which nobody may use, or
+            // which says so in both ways, or in half of one, or for no
+            // time at all.
+            (turn.to_owned(), who),
+            (format!("{made}\nusername = \"everyone\""), who),
+            (format!("{turn}\nusername = \"everyone\""), who),
+            (format!("{turn}\ncredential_env = \"A_TURN_PASSWORD\""), who),
+            (format!("{turn}\nsecret_env = \" \""), who),
+            (format!("{made}\nttl_s = 0"), who),
+            // One that asks nobody, and is told of somebody.
+            (format!("{stun}\nsecret_env = \"A_TURN_SECRET\""), who),
+            (format!("{stun}\nusername = \"everyone\""), who),
+            // A password where the name of its variable belongs.
+            (format!("{turn}\ncredential = \"wpc1_madeup\""), "at line 5"),
+        ] {
+            let text = server(&more);
+            let Err(failure) = Config::from_toml(&text) else {
+                panic!("{text:?} was taken");
+            };
+            assert!(failure.0.contains(why), "{text:?}: {failure}");
+            assert!(!failure.0.contains("madeup"), "{failure}");
+        }
     }
 
     #[test]

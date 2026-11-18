@@ -46,8 +46,8 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/adapters/store/memory` | A journal that lasts as long as its process |
 | `crates/adapters/store/journal` | A journal in a file on this machine, from which a session goes on after its process died |
 | `apps/waveport-assembly` | What an agent is made of, as one definition, and a session put together from it. Whatever runs agents does it here |
-| `apps/waveport-cli` | The `waveport` command: an agent defined on a command line, at this machine's sound devices, over a WebSocket or in writing |
-| `apps/waveportd` | The `waveportd` daemon: agents defined in a file, and sessions of them for whoever asks over HTTP, comes on a WebSocket, or calls through a carrier |
+| `apps/waveport-cli` | The `waveport` command: an agent defined on a command line, at this machine's sound devices, over a WebSocket or in writing, and a caller of one, over a WebSocket or on a WebRTC call to a daemon |
+| `apps/waveportd` | The `waveportd` daemon: agents defined in a file, and sessions of them for whoever asks over HTTP, comes on a WebSocket, calls over WebRTC, or calls through a carrier |
 | `crates/testing/waveport-sim` | Deterministic simulation: seeded runs with a virtual clock |
 | `crates/testing/waveport-kernel-sim` | The session kernel under test: scenarios explored along every path, random sessions, every path through small sessions, and recorded sessions replayed, with the invariants checked at every step |
 | `crates/testing/waveport-alloc-counter` | Counting allocator, to prove a code path does not allocate |
@@ -90,7 +90,7 @@ The command prints what it heard, what the agent said and how long the first sou
 | `waveport dev` | An agent on this machine's microphone and loudspeaker. `--half-duplex` is for loudspeakers without headphones: the microphone is silenced while the agent speaks, so the agent cannot be interrupted |
 | `waveport run --script <file>` | The same agent with a caller who follows a script of recordings and silences. `--record <file>` keeps what the caller was played |
 | `waveport serve` | The same agent for callers who are somewhere else: it takes calls over a WebSocket, at `127.0.0.1:9283` unless `--listen` says otherwise, as many at a time as come. Nothing asks a caller who they are, so it takes calls from other machines only with `--exposed`. A caller whose connection drops is waited for, and with `--resume` a caller comes back to a call that broke off with the agent's process |
-| `waveport client` | Calls an agent that `waveport serve` runs, from this machine's microphone and loudspeaker or from a script. When its connection drops it comes back to the call by itself |
+| `waveport client` | Calls an agent that `waveport serve` runs, from this machine's microphone and loudspeaker or from a script. When its connection drops it comes back to the call by itself. With `--webrtc --agent <NAME>` it calls an agent of a daemon over WebRTC instead |
 | `waveport chat` | The same agent in writing, at the terminal: it needs the language model alone. What it writes is shown as it is written, and a line typed while it writes stops it there. Lines from a file or another command are said one at a time, each when the one before is answered |
 | `waveport calls` | Lists the calls that broke off and are kept, for `--resume` |
 | `waveport devices` | Lists the sound devices, for `--microphone` and `--loudspeaker` |
@@ -219,6 +219,21 @@ token_env = "TWILIO_AUTH_TOKEN"      # the environment variable that holds the a
 ```
 
 The number is told, at Twilio, to ask `https://voice.example/v1/telephony/twilio/voice` when a call comes in. The daemon checks that the request is signed with the account's token, makes a session of the agent, and answers with the document that connects the call to a stream of its own (`wss://voice.example/v1/telephony/twilio/stream`), which whatever ends TLS in front of the daemon has to pass on as a WebSocket. The session is one like any other from there: an application follows it and writes to it with a control key. This is written from Twilio's documentation and tested against a stand-in for Twilio. **No call has been made through Twilio yet**, and the [architecture](docs/architecture.md), section 8.7, says what is not known until one is.
+
+**On a WebRTC call.** A daemon answers calls over WebRTC, for the sessions of its agents that hear and speak:
+
+```toml
+[webrtc]
+udp = "0.0.0.0:7071"          # where the datagrams of every call are taken
+tcp = "0.0.0.0:7071"          # and connections, from networks that let no datagram out
+reached_at = "203.0.113.5"    # the address far ends are told to send to
+
+[[webrtc.ice_servers]]        # told to far ends with the answer; the daemon uses none itself
+urls = ["turn:turn.example.net?transport=udp"]
+secret_env = "TURN_SECRET"    # the secret the TURN server shares: each far end is made a name and a password of its own
+```
+
+A far end posts its offer to `/v1/webrtc` with the client token of its session, as WHIP has it, and is answered with the answer and where its call is. It then says hello on the data channel of the call, as it would on a WebSocket, and comes back with another call when its call drops. `waveport client --webrtc --agent front-desk` is such a far end, from this machine's microphone or from a script. The daemon answers the checks of a far end and makes none, so `udp` has to be reached from wherever its callers are. This has been run against the client the transport has for itself, and not against a browser yet: the client for a page makes its calls over a WebSocket until the next milestone.
 
 It serves HTTP without TLS, and is to stand behind something that ends TLS. `waveportd --config <file> --check` reads a file and says what is wrong with it.
 

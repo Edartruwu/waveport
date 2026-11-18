@@ -102,6 +102,7 @@ waveport-testkit = { path = "crates/testing/waveport-testkit", version = "0.1.0"
 waveport-transport-local-audio = { path = "crates/adapters/transport/local-audio", version = "0.1.0" }
 waveport-transport-telephony-ws = { path = "crates/adapters/transport/telephony-ws", version = "0.1.0" }
 waveport-transport-webrtc = { path = "crates/adapters/transport/webrtc", version = "0.1.0" }
+waveportd = { path = "apps/waveportd", version = "0.1.0" }
 waveport-transport-websocket = { path = "crates/adapters/transport/websocket", version = "0.1.0" }
 waveport-tts-cartesia = { path = "crates/adapters/tts/cartesia", version = "0.1.0" }
 waveport-tts-elevenlabs = { path = "crates/adapters/tts/elevenlabs", version = "0.1.0" }

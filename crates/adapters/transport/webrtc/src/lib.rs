@@ -168,12 +168,15 @@
 //! [`Dialer`] is the other side, for a command and for tests, and
 //! [`loopback`] a call with no socket at all, which the tests of this
 //! crate lose packets on and the benchmarks count instructions on.
+//! [`fragment`] is for whoever carries offers as WHIP does: a far end
+//! that begins its checks anew then sends only what is about them.
 
 mod call;
 mod crypto;
 mod dial;
 mod endpoint;
 mod engine;
+pub mod fragment;
 pub mod loopback;
 mod media;
 mod net;

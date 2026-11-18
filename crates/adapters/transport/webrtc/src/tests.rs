@@ -13,6 +13,7 @@ use waveport_protocol::client::v1::{ByeReason, ErrorCode, FromClient, FromServer
 use crate::call::{Call, Client, Setup, Step, Told, Unanswered};
 use crate::crypto::certificate;
 use crate::engine::{AGAIN, TURNS};
+use crate::fragment;
 use crate::loopback::{Pair, Weather};
 use crate::peer::{Like, Offers, PeerHeard, PeerStep};
 use crate::rtp::forged_check;
@@ -1379,4 +1380,72 @@ fn a_call_that_is_ended_while_it_is_set_up_is_over_for_whoever_ended_it() {
     pair.peer.close();
     pair.run_for(Duration::from_millis(100));
     assert_eq!(pair.told, [Told::Over]);
+}
+
+#[test]
+fn a_far_end_that_is_somewhere_else_says_only_what_is_about_its_checks() {
+    // As a call that was set up the way WHIP sets one up goes on: the
+    // client does not offer again, and sends the part of its new offer
+    // that is about its checks. Each side puts what it is sent into
+    // the description it had.
+    let mut pair = Pair::fresh(Like::Chrome, Client::V1);
+    for n in 0..5 {
+        pair.client_says(n);
+        pair.server_sends(tag(1), n, false);
+    }
+    let cut = Weather {
+        cut: true,
+        ..Weather::default()
+    };
+    pair.set_weather(cut);
+    pair.run_for(Duration::from_secs(30));
+    assert_eq!(pair.told.last(), Some(&Told::Down));
+    pair.set_weather(Weather::default());
+
+    let (offer, answer) = pair.first.clone();
+    let before = pair.call.name().to_owned();
+    pair.client = "203.0.113.9:61000".parse().unwrap();
+    let again = pair.peer.offer_again(pair.client).unwrap();
+    // What the client sends: other checks than it had, and nothing of
+    // the audio or the channel.
+    let sent = fragment::of(&again).unwrap();
+    assert_ne!(fragment::credentials(&sent), fragment::credentials(&offer));
+    assert!(!sent.contains("a=rtpmap") && !sent.contains("a=fingerprint"));
+    // The server answers the offer it had, with those checks.
+    let offered = fragment::into(&offer, &sent).unwrap();
+    let answered = pair.call.answer_again(&offered).unwrap();
+    assert_ne!(pair.call.name(), before);
+    // And is answered with the part of its answer that is about its
+    // own: that it only answers checks, and where it is reached.
+    let back = fragment::of(&answered).unwrap();
+    assert_eq!(
+        fragment::credentials(&back).map(|(name, _)| name),
+        Some(pair.call.name())
+    );
+    assert!(back.contains("a=ice-lite\r\n"), "{back}");
+    assert_eq!(back.matches("a=candidate:").count(), 1, "{back}");
+    assert!(pair.peer.answered(&fragment::into(&answer, &back).unwrap()));
+
+    pair.told.clear();
+    pair.heard.clear();
+    pair.run_for(Duration::from_secs(2));
+    assert_eq!(pair.told, [Told::Up]);
+    assert_eq!(pair.heard, [PeerHeard::Up]);
+    pair.told.clear();
+    pair.heard.clear();
+    // The call is the one it was.
+    for n in 5..10 {
+        pair.client_says(n);
+        pair.server_sends(tag(1), n, n == 9);
+    }
+    let frames: Vec<u32> = pair.audio().iter().map(|(.., frame)| *frame).collect();
+    assert_eq!(frames, [5, 6, 7, 8, 9]);
+    let frames: Vec<u32> = pair.heard_audio().iter().map(|(_, frame)| *frame).collect();
+    assert_eq!(frames, [5, 6, 7, 8, 9]);
+
+    // A fragment whose checks are the ones the call has is no new
+    // beginning, and one that is put into the first offer is that
+    // offer: the call is answered as it was, and goes on.
+    let same = fragment::of(&offered).unwrap();
+    assert_eq!(fragment::into(&offered, &same).unwrap(), offered);
 }

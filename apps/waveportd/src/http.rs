@@ -10,6 +10,9 @@
 //! | `POST /v1/sessions/{id}/input` | a control key, or the session's resume token | 202 |
 //! | `GET /v1/sessions/{id}/events` | a control key, a client token, or the session's resume token | a stream of server-sent events |
 //! | `GET /v1/client` | a client token or a resume token, in the hello | a WebSocket that speaks client protocol v1 |
+//! | `POST /v1/webrtc` | a client token or a resume token | 201, the answer to an offer, and where the call is |
+//! | `PATCH /v1/webrtc/{call}` | whoever made the offer, with the token they made it with | 204 for where the far end is, 200 and a fragment for checks that begin anew |
+//! | `DELETE /v1/webrtc/{call}` | the same | 200, and the far end has hung up |
 //! | `POST /v1/telephony/{carrier}/voice` | the carrier, which signs what it asks | the document that connects its call to a stream |
 //! | `GET /v1/telephony/{carrier}/stream` | the carrier, with what the answer gave its stream to say | a WebSocket that carries the call |
 //! | `GET /healthz` | anyone | 200, or 503 while the daemon stops |
@@ -34,7 +37,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::Sse;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use futures_util::stream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -51,7 +54,7 @@ use waveport_protocol::control::v1::{Context, CreateSession, Input, Problem, Ses
 use crate::auth::From;
 use crate::daemon::{Shared, failed};
 use crate::events::Following;
-use crate::{calls, line, playground};
+use crate::{calls, line, playground, webrtc};
 use waveport_assembly::shown::{Asked, Position};
 
 /// The daemon, for a request.
@@ -146,6 +149,19 @@ pub(crate) fn router(daemon: &Arc<Shared>) -> Router {
         .route("/v1/sessions/{id}/input", post(input))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/client", get(line::client))
+        .route(
+            "/v1/webrtc",
+            post(webrtc::offer)
+                .get(webrtc::nothing)
+                .options(webrtc::offers),
+        )
+        .route(
+            "/v1/webrtc/{call}",
+            patch(webrtc::again)
+                .delete(webrtc::ends)
+                .get(webrtc::there)
+                .options(webrtc::fragments),
+        )
         .route("/v1/telephony/{carrier}/voice", post(calls::voice))
         .route("/v1/telephony/{carrier}/stream", get(calls::stream))
         .fallback(nowhere)
@@ -193,9 +209,10 @@ async fn gate(State(daemon): Daemon, request: Request, next: Next) -> Response {
     let mut response = if asks_first && allowed.is_some() {
         let mut response = StatusCode::NO_CONTENT.into_response();
         let headers = response.headers_mut();
-        let methods = HeaderValue::from_static("GET, POST, DELETE");
+        let methods = HeaderValue::from_static("GET, POST, PATCH, DELETE");
         headers.insert(ACCESS_CONTROL_ALLOW_METHODS, methods);
-        let asked_with = HeaderValue::from_static("authorization, content-type, last-event-id");
+        let asked_with =
+            HeaderValue::from_static("authorization, content-type, if-match, last-event-id");
         headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, asked_with);
         headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
         response
@@ -215,7 +232,7 @@ async fn gate(State(daemon): Daemon, request: Request, next: Next) -> Response {
         let headers = response.headers_mut();
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         headers.insert(VARY, HeaderValue::from_static("Origin"));
-        let shown = HeaderValue::from_static("Location, Retry-After");
+        let shown = HeaderValue::from_static("ETag, Link, Location, Retry-After");
         headers.insert(ACCESS_CONTROL_EXPOSE_HEADERS, shown);
     }
     response
@@ -243,7 +260,7 @@ async fn health(State(daemon): Daemon) -> Response {
 }
 
 /// What follows `Bearer` in the request, if it says who asks.
-fn bearer(headers: &HeaderMap) -> Result<Option<&str>, Problem> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Result<Option<&str>, Problem> {
     let Some(written) = headers.get(AUTHORIZATION) else {
         return Ok(None);
     };

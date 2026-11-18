@@ -26,6 +26,7 @@ mod report;
 mod script;
 mod serve;
 mod summary;
+mod webrtc;
 
 use std::process::ExitCode;
 

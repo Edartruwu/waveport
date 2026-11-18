@@ -28,16 +28,20 @@ waveport-domain = { workspace = true }
 waveport-ports = { workspace = true }
 waveport-protocol = { workspace = true }
 waveport-transport-telephony-ws = { workspace = true }
+waveport-transport-webrtc = { workspace = true }
 waveport-transport-websocket = { workspace = true }
 
 axum = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
+hmac = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["service", "tokio"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
+sha1 = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 
