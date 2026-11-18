@@ -13,7 +13,7 @@ use waveport_ports::audio::Rate;
 use waveport_protocol::client::v1::{ByeReason, ErrorCode, Fact, Resume};
 use waveport_testkit::servers::{HttpServer, WsServer, WsStep};
 use waveport_testkit::speech;
-use waveport_testkit::stand_in::{HEARD, SAID, slow_answer, spoken};
+use waveport_testkit::stand_in::{HEARD, SAID, spoken};
 use waveport_transport_webrtc::{Dialer, Dialing, Heard, Like, Unconnected, fragment};
 use waveport_transport_websocket::{Client, Hello};
 
@@ -1062,6 +1062,8 @@ async fn a_page_the_daemon_was_told_of_may_ask_what_a_call_takes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_daemon_that_is_told_to_stop_says_so_on_its_calls() {
+    use waveport_testkit::stand_in::slow_answer;
+
     // A model that takes its time, so that an answer is under way when
     // the daemon is told to stop, and the daemon waits for it.
     let providers = Providers {
