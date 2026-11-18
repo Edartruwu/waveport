@@ -177,6 +177,7 @@ pub struct FakeTransportBuilder {
     closes: bool,
     clings: bool,
     holds: Duration,
+    short: MediaDur,
 }
 
 impl FakeTransportBuilder {
@@ -372,6 +373,16 @@ impl FakeTransportBuilder {
         self
     }
 
+    /// The far end plays all it is sent, and stays `ms` short of it in
+    /// what it says it played: as one does that counts what it gave to
+    /// be played, and not what was heard. It never says that it played
+    /// the end of a response, and the log has what it said.
+    #[must_use]
+    pub const fn says_short(mut self, ms: u32) -> Self {
+        self.short = MediaDur::from_millis(ms);
+        self
+    }
+
     /// The transport closes once its script has run out, whatever the
     /// far end is playing then. Without this it stays open, with nothing
     /// more happening at the far end.
@@ -406,6 +417,7 @@ impl FakeTransportBuilder {
             clings: self.clings,
             line: Line::There,
             holds: self.holds,
+            short: self.short,
             playing: None,
             timer: Box::pin(tokio::time::sleep_until(start)),
             waker: None,
@@ -436,6 +448,8 @@ pub struct FakeTransport {
     clings: bool,
     line: Line,
     holds: Duration,
+    /// How far the far end stays short in what it says it played.
+    short: MediaDur,
     playing: Option<Playing>,
     timer: Pin<Box<Sleep>>,
     /// Whoever waits for the next event, to be told when a frame gives
@@ -472,6 +486,7 @@ impl FakeTransport {
             closes: false,
             clings: false,
             holds: Duration::ZERO,
+            short: MediaDur::ZERO,
         }
     }
 
@@ -528,14 +543,17 @@ impl FakeTransport {
         if !self.remote_buffer().reports_played || self.line == Line::Gone {
             return None;
         }
+        let short = self.short;
         let playing = self.playing.as_mut()?;
-        let played = playing.played(now);
+        // What it says it played: what it played, or less.
+        let most = playing.received.saturating_sub(short);
+        let played = playing.played(now).min(most);
         let due = match playing.reported {
             None => true,
             // The end is said at once; on the way there, every so often.
             Some(reported) => {
                 played > reported
-                    && (played == playing.received
+                    && (played == most
                         || played.saturating_sub(reported).as_millis()
                             >= u32::try_from(REPORT_EVERY.as_millis()).unwrap_or(u32::MAX))
             }
@@ -556,18 +574,15 @@ impl FakeTransport {
         }
         let playing = self.playing.as_ref()?;
         let reported = playing.reported.unwrap_or(MediaDur::ZERO);
-        if reported >= playing.received {
+        let most = playing.received.saturating_sub(self.short);
+        if reported >= most {
             return None;
         }
         // The next report is a step on from the last, or the end if that
         // is nearer.
         let step = MediaDur::from_millis(u32::try_from(REPORT_EVERY.as_millis()).unwrap_or(100));
         let target = reported.saturating_add(step);
-        let target = if target < playing.received {
-            target
-        } else {
-            playing.received
-        };
+        let target = if target < most { target } else { most };
         let at = playing.since + Duration::from_micros(u64::from(target.ticks()) * 1_000 / 48);
         Some(at.max(now))
     }
