@@ -26,12 +26,14 @@ use waveport_protocol::control::v1::{
     Mode, Problem, SessionCreated, SessionInfo, SessionState, Sessions,
 };
 use waveport_transport_telephony_ws::Call;
-use waveport_transport_websocket::{Caller, Handle, Link, Welcome};
+use waveport_transport_websocket::Welcome;
 
 use crate::auth::{Gate, Keys, Tickets};
 use crate::calls::Telephony;
 use crate::config::{Config, Limits};
+use crate::line::{ANOTHER_LINE, Caller, Handle, Link};
 use crate::threads::Threads;
+use crate::webrtc::Webrtc;
 use crate::{http, serve};
 
 /// How long the connections that are open have to close once the daemon
@@ -162,6 +164,16 @@ fn waits_for_its_call() -> Problem {
     )
 }
 
+/// What a far end that sends audio is told when its session's agent
+/// has no use for it.
+fn neither_hears_nor_speaks() -> Problem {
+    Problem::of(
+        ErrorCode::Unsupported,
+        "the agent of this session neither hears nor speaks: a hello for it names no audio, \
+         and it is not called",
+    )
+}
+
 /// What a client is told that comes to a session on no line.
 fn no_line() -> Problem {
     Problem::of(
@@ -192,6 +204,8 @@ pub(crate) struct Shared {
     pub(crate) playground: bool,
     /// What answers the calls of carriers, if anything does.
     pub(crate) telephony: Option<Telephony>,
+    /// What answers calls over WebRTC, if anything does.
+    pub(crate) webrtc: Option<Webrtc>,
     sessions: Mutex<BTreeMap<SessionId, Entry>>,
     /// Whether the daemon takes nothing new.
     draining: AtomicBool,
@@ -492,16 +506,11 @@ impl Shared {
         // Audio that nobody hears is not taken, and none is promised
         // that nobody sends.
         let speaks = self.agents.get(&agent).is_some_and(Agent::speaks);
-        if caller.hello().audio.is_some() && !speaks {
-            let problem = Problem::of(
-                ErrorCode::Unsupported,
-                "the agent of this session neither hears nor speaks: a hello for it names no \
-                 audio",
-            );
-            return turned_away(caller, &problem).await;
+        if caller.speaks() && !speaks {
+            return turned_away(caller, &neither_hears_nor_speaks()).await;
         }
         let (transport, handle) = caller.transport(FAR_END);
-        let wire = Wire::Line(Box::new(transport), handle);
+        let wire = Wire::Line(transport, handle);
         match self.start(id, &agent, ran, Some(wire), false).await {
             Ok((life, _, wire)) => self.attach(id, caller, wire, life, back, asked).await,
             Err(problem) => turned_away(caller, &problem).await,
@@ -568,13 +577,40 @@ impl Shared {
                 .map_or(1, |status| status.next_seq.get()),
             grace_ms: Some(wire.grace_ms),
         };
-        match wire.handle.attach(caller, welcome).await {
-            Ok(link) => Some((link, life)),
-            // The session is over, or under way with other audio.
-            Err(unattached) => {
-                unattached.refuse().await;
-                None
+        // One that the line does not take has been told why: the
+        // session is over, under way with other audio, or on another
+        // kind of line.
+        let link = wire.handle.attach(caller, welcome).await?;
+        Some((link, life))
+    }
+
+    /// Whether a far end may come to the session `id` on a WebRTC
+    /// call: its agent hears and speaks, and it is not under way on
+    /// anything else. It is asked before an offer is answered, so that
+    /// no call is set up for nothing, and asked again of whoever comes.
+    pub(crate) fn takes_a_call(&self, id: SessionId) -> Result<(), Problem> {
+        let agent = match self.found(id, stands)? {
+            Stands::Runs(_, Some(line)) if line.handle.is_a_call() => return Ok(()),
+            Stands::Runs(_, Some(_)) => {
+                return Err(Problem::of(ErrorCode::Unsupported, ANOTHER_LINE));
             }
+            Stands::Runs(_, None)
+            | Stands::Rests {
+                ran: true,
+                lined: false,
+                ..
+            } => return Err(no_line()),
+            Stands::Rests {
+                ran: false,
+                lined: true,
+                ..
+            } => return Err(waits_for_its_call()),
+            Stands::Rests { agent, .. } => agent,
+        };
+        if self.agents.get(&agent).is_some_and(Agent::speaks) {
+            Ok(())
+        } else {
+            Err(neither_hears_nor_speaks())
         }
     }
 
@@ -723,6 +759,27 @@ pub struct Running {
     serving: JoinHandle<()>,
 }
 
+/// The sessions a process before this one left, each of the agent its
+/// label names.
+async fn left(stack: &Stack) -> Result<BTreeMap<SessionId, Entry>, Failure> {
+    let mut sessions = BTreeMap::new();
+    for (id, label) in stack.kept.labelled().await? {
+        let Some(label) = label else {
+            continue;
+        };
+        let Label { agent, line } = Label::read(&label);
+        let entry = Entry {
+            agent,
+            phase: Phase::Kept,
+            lined: line,
+            line: None,
+            starting: Arc::default(),
+        };
+        sessions.insert(id, entry);
+    }
+    Ok(sessions)
+}
+
 impl Daemon {
     /// Starts a daemon as `config` says: puts its agents together, finds
     /// the sessions that are kept, and listens.
@@ -766,23 +823,7 @@ impl Daemon {
             notes.extend(agent.notes.iter().map(|note| format!("{name}: {note}")));
             agents.insert(name.clone(), agent);
         }
-        // The sessions a process before this one left, each of the
-        // agent its label names.
-        let mut sessions = BTreeMap::new();
-        for (id, label) in stack.kept.labelled().await? {
-            let Some(label) = label else {
-                continue;
-            };
-            let Label { agent, line } = Label::read(&label);
-            let entry = Entry {
-                agent,
-                phase: Phase::Kept,
-                lined: line,
-                line: None,
-                starting: Arc::default(),
-            };
-            sessions.insert(id, entry);
-        }
+        let sessions = left(&stack).await?;
         match sessions.len() {
             0 => {}
             1 => notes.push(
@@ -798,6 +839,11 @@ impl Daemon {
             );
         }
         let telephony = Telephony::of(&config.telephony)?;
+        let webrtc = match &config.webrtc {
+            Some(config) => Some(Webrtc::start(config).await?),
+            None => None,
+        };
+        notes.extend(webrtc.as_ref().map(Webrtc::note));
         // A daemon that is told where carriers reach it is reached by
         // that name.
         let mut hosts = config.hosts.clone();
@@ -821,6 +867,7 @@ impl Daemon {
             gate: Gate::new(address, &hosts, &config.allowed_origins),
             playground: config.serves_playground(),
             telephony,
+            webrtc,
             sessions: Mutex::new(sessions),
             draining: AtomicBool::new(false),
             going: watch::Sender::new(false),

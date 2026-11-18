@@ -31,6 +31,7 @@
     reason = "a test that cannot be set up, or that finds something missing, fails"
 )]
 
+mod dialled;
 mod resumed;
 mod watched;
 mod written;
@@ -457,7 +458,12 @@ impl Providers {
         let heard = self.stt.connections();
         assert_eq!(heard.len(), 1, "{all}");
         let heard = &heard[0];
-        assert_eq!(heard.header("authorization"), None);
+        // What it was given is not shown where this fails: it would be
+        // a key of whoever runs the tests.
+        assert!(
+            heard.header("authorization").is_none(),
+            "the recogniser was given a key"
+        );
         let sent: Vec<&str> = heard.texts().collect();
         let count = |what: &str| sent.iter().filter(|text| text.contains(what)).count();
         match self.hears {

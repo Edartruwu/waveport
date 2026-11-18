@@ -1,4 +1,10 @@
-//! The line of a session: a WebSocket its far end is on.
+//! The line of a session: what its far end is on, a WebSocket or a
+//! WebRTC call, and the WebSocket.
+//!
+//! A session on a line is told and asked the same things whichever its
+//! far end came on ([`Caller`], [`Handle`], [`Link`]). It stays on the
+//! kind of line it was started on: a client that comes back comes the
+//! way it came.
 //!
 //! `GET /v1/client` asks for the connection to become a WebSocket that
 //! speaks client protocol v1. The request says nothing of who asks: a
@@ -29,11 +35,14 @@ use hyper_util::rt::TokioIo;
 use waveport_adapter_kit::ws::{self, WsConn};
 use waveport_assembly::ResumeToken;
 use waveport_assembly::shown::{self, Asked, Follower, Position};
+use waveport_domain::ids::ParticipantId;
 use waveport_ports::control::SessionInput;
 use waveport_ports::journal::SessionId;
+use waveport_ports::transport::Transport;
 use waveport_protocol::client::v1::{ByeReason, ErrorCode, FromClient, FromServer, Resume};
 use waveport_protocol::control::v1::Problem;
-use waveport_transport_websocket::{Caller, GREETING_TIMEOUT, Hello, Link, PROTOCOL};
+use waveport_transport_webrtc as call;
+use waveport_transport_websocket::{self as socket, GREETING_TIMEOUT, Hello, PROTOCOL, Welcome};
 
 use crate::daemon::{Shared, failed, raised};
 use crate::http::{Refused, not_admitted, problem, said};
@@ -45,6 +54,132 @@ const WEBSOCKET: &str = "13";
 /// is going away. A daemon that stops waits a second for what holds its
 /// sessions, and a client has 300 ms to answer the close of its line.
 const LINE_CLOSES_WITHIN: Duration = Duration::from_millis(500);
+
+/// Whoever came to be on the line of a session.
+pub(crate) enum Caller {
+    /// On a WebSocket.
+    Socket(Box<socket::Caller>),
+    /// On a WebRTC call, with the hello it said there.
+    Call(Box<call::Caller>, Hello),
+}
+
+impl Caller {
+    /// What it said as it came.
+    pub(crate) const fn hello(&self) -> &Hello {
+        match self {
+            Self::Socket(caller) => caller.hello(),
+            Self::Call(_, hello) => hello,
+        }
+    }
+
+    /// Whether it sends audio and is to be sent some. A call is one of
+    /// audio, whatever its hello says.
+    pub(crate) const fn speaks(&self) -> bool {
+        match self {
+            Self::Socket(caller) => caller.hello().audio.is_some(),
+            Self::Call(..) => true,
+        }
+    }
+
+    /// Tells it why it is not served, and lets go of it.
+    pub(crate) async fn refuse(self, code: ErrorCode, why: &str) {
+        match self {
+            Self::Socket(caller) => caller.refuse(code, why).await,
+            Self::Call(caller, _) => caller.refuse(code, why).await,
+        }
+    }
+
+    /// The transport of a session that is started for it, with nobody
+    /// on it yet, and what puts a far end there.
+    pub(crate) fn transport(&self, who: ParticipantId) -> (Box<dyn Transport>, Handle) {
+        match self {
+            Self::Socket(caller) => {
+                let (transport, handle) = caller.transport(who);
+                (Box::new(transport), Handle::Socket(handle))
+            }
+            Self::Call(caller, _) => {
+                let (transport, handle) = caller.transport(who);
+                (Box::new(transport), Handle::Call(handle))
+            }
+        }
+    }
+}
+
+/// What puts a far end on the line of a session that runs.
+#[derive(Clone)]
+pub(crate) enum Handle {
+    Socket(socket::Handle),
+    Call(call::Handle),
+}
+
+impl Handle {
+    /// Whether the line is a WebRTC call.
+    pub(crate) const fn is_a_call(&self) -> bool {
+        matches!(self, Self::Call(_))
+    }
+
+    /// Puts `caller` on the line, welcomed with `welcome`. One that
+    /// cannot be put there has been told why: the session is over, is
+    /// under way with other audio, or is on another kind of line.
+    pub(crate) async fn attach(&self, caller: Caller, welcome: Welcome) -> Option<Link> {
+        match (self, caller) {
+            (Self::Socket(handle), Caller::Socket(caller)) => {
+                match handle.attach(*caller, welcome).await {
+                    Ok(link) => Some(Link::Socket(link)),
+                    Err(unattached) => {
+                        unattached.refuse().await;
+                        None
+                    }
+                }
+            }
+            (Self::Call(handle), Caller::Call(caller, _)) => {
+                match handle.attach(*caller, welcome).await {
+                    Ok(link) => Some(Link::Call(link)),
+                    Err(unattached) => {
+                        unattached.refuse().await;
+                        None
+                    }
+                }
+            }
+            (_, caller) => {
+                caller.refuse(ErrorCode::Unsupported, ANOTHER_LINE).await;
+                None
+            }
+        }
+    }
+}
+
+/// What a far end is told that comes to a session another way than its
+/// far end first came.
+pub(crate) const ANOTHER_LINE: &str = "the session is under way on another kind of line than \
+                                       this one: its client comes back the way it came";
+
+/// What a client on a line is told through, and what it asks through
+/// that its line cannot do.
+pub(crate) enum Link {
+    Socket(socket::Link),
+    Call(call::Link),
+}
+
+impl Link {
+    /// Tells the client `message`. Returns whether there is still
+    /// somebody to tell.
+    pub(crate) async fn tell(&self, message: FromServer) -> bool {
+        match self {
+            Self::Socket(link) => link.tell(message).await.is_ok(),
+            Self::Call(link) => link.tell(message).await.is_ok(),
+        }
+    }
+
+    /// The next thing the client asks. `None` once it is gone from the
+    /// line.
+    pub(crate) async fn asked(&mut self) -> Option<FromClient> {
+        match self {
+            Self::Socket(link) => link.asked().await,
+            Self::Call(link) => link.asked().await,
+        }
+    }
+}
 
 /// Whether `headers` name `value` under `name`, among whatever else
 /// they name there.
@@ -186,7 +321,7 @@ async fn serve(daemon: Arc<Shared>, upgraded: OnUpgrade) {
     let conn = WsConn::from_upgraded(TokioIo::new(upgraded)).await;
     let mut going = daemon.going();
     let greeted = tokio::select! {
-        greeted = Caller::of(conn, None, GREETING_TIMEOUT) => greeted,
+        greeted = socket::Caller::of(conn, None, GREETING_TIMEOUT) => greeted,
         // Whoever has not said who they are is not waited for.
         () = raised(&mut going) => return,
     };
@@ -194,7 +329,14 @@ async fn serve(daemon: Arc<Shared>, upgraded: OnUpgrade) {
     let Ok(caller) = greeted else {
         return;
     };
-    let (id, back) = match admitted(&daemon, caller.hello()).await {
+    seated(&daemon, Caller::Socket(Box::new(caller)), None).await;
+}
+
+/// Serves a far end that has said hello, from the look at who it is to
+/// the end of its line. `offered` is the session its offer was made
+/// for, if it came with one: a hello for another is turned away.
+pub(crate) async fn seated(daemon: &Arc<Shared>, caller: Caller, offered: Option<SessionId>) {
+    let (id, back) = match admitted(daemon, caller.hello()).await {
         Ok(admitted) => admitted,
         Err(problem) => {
             let why = problem.detail.as_deref().unwrap_or_default();
@@ -202,6 +344,11 @@ async fn serve(daemon: Arc<Shared>, upgraded: OnUpgrade) {
             return;
         }
     };
+    if offered.is_some_and(|offered| offered != id) {
+        let why = "the hello is for another session than the offer of the call was made for";
+        caller.refuse(ErrorCode::Token, why).await;
+        return;
+    }
     // What the tools were given and what they answered is for whoever
     // holds a control key, which no client does.
     let wanted = caller.hello().features.iter().map(String::as_str);
@@ -213,7 +360,7 @@ async fn serve(daemon: Arc<Shared>, upgraded: OnUpgrade) {
     let Some((link, life)) = daemon.on_line(id, caller, back.as_ref(), asked).await else {
         return;
     };
-    tells(&daemon, id, life, asked, link, position).await;
+    tells(daemon, id, life, asked, link, position).await;
 }
 
 /// Tells the client on one connection of the session `id`, which is in
@@ -240,7 +387,7 @@ async fn tells(
         tokio::select! {
             () = raised(&mut going) => {
                 let reason = ByeReason::GoingAway;
-                if link.tell(FromServer::Bye { reason }).await.is_ok() {
+                if link.tell(FromServer::Bye { reason }).await {
                     // The goodbye is said, and the line closed, on the
                     // session's own thread. The daemon stops its
                     // sessions once nobody here holds them: so the line
@@ -258,7 +405,7 @@ async fn tells(
                 // How the session ended is the last thing there is to
                 // tell.
                 let last = shown::closes(&message);
-                if link.tell(message).await.is_err() || last {
+                if !link.tell(message).await || last {
                     return;
                 }
             }

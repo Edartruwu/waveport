@@ -1814,6 +1814,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_far_end_that_is_behind_as_its_call_ends_still_has_the_goodbye() {
+        for tcp in [false, true] {
+            let endpoint = endpoint_with_a_listener().await;
+            let (mut transport, _handle, link, mut dialer) =
+                on_a_call_over(&endpoint, Like::Chrome, tcp).await;
+            drop(link);
+            // It goes on sending what its microphone hears, and reads
+            // nothing of what it is sent for longer than it is waited
+            // for: a machine that has too much to do.
+            let far = tokio::spawn(async move {
+                let behind_until = now() + 2 * super::LAST_WORDS;
+                while now() < behind_until {
+                    dialer.audio(&packet(1)).unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                loop {
+                    match dialer.next().await.unwrap() {
+                        Some(Heard::Bye(reason)) => return Some(reason),
+                        Some(_) => {}
+                        None => return None,
+                    }
+                }
+            });
+            // It is waited for a moment, and no longer.
+            let took = closes(&mut transport).await;
+            assert!(
+                (Duration::from_millis(250)..Duration::from_secs(2)).contains(&took),
+                "{took:?}"
+            );
+            drop(transport);
+            assert_eq!(endpoint.calls(), 0);
+            // What it was told last is there when it comes to read it,
+            // though the call is gone by then: a connection is not
+            // closed under what was said on it.
+            let told = tokio::time::timeout(SOON, far).await;
+            assert_eq!(told.unwrap().unwrap(), Some(ByeReason::Ended), "{tcp}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_far_end_that_hangs_up_at_the_goodbye_is_not_waited_for() {
         let endpoint = endpoint().await;
         let (mut transport, _handle, link, mut dialer) = on_a_call(&endpoint, Like::Chrome).await;

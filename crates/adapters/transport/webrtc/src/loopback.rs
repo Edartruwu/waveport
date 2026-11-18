@@ -114,6 +114,9 @@ pub struct Pair {
     /// its call's.
     #[cfg(test)]
     pub(crate) refused: usize,
+    /// The offer the call began with, and its answer.
+    #[cfg(test)]
+    pub(crate) first: (String, String),
 }
 
 /// The response every frame of a benchmark is of.
@@ -194,6 +197,8 @@ impl Pair {
             carried: true,
             #[cfg(test)]
             refused: 0,
+            #[cfg(test)]
+            first: (offer, answer),
         })
     }
 

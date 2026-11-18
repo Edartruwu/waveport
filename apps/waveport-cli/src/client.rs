@@ -1,6 +1,7 @@
-//! The caller's side of a call that goes over a WebSocket: the sound
-//! devices of this machine, or a scripted caller, joined to an agent
-//! that runs somewhere else.
+//! The caller's side of a call to an agent that runs somewhere else:
+//! the sound devices of this machine, or a scripted caller, on a
+//! WebSocket to an agent that `waveport serve` runs, or on a WebRTC
+//! call to one that a daemon runs ([`crate::webrtc`]).
 //!
 //! The agent's side tells the call in the facts of client protocol v1,
 //! and they are told here line by line, as the agent's side tells them
@@ -8,9 +9,11 @@
 //! the caller comes back with the token it was given, for as long as
 //! the call can be expected to wait.
 
+use core::fmt;
 use core::future::poll_fn;
 use core::time::Duration;
 
+use bytes::Bytes;
 use tokio::time::Instant;
 use waveport_adapter_kit::stream::{Either, first};
 use waveport_domain::ids::{Epoch, GenId, OpTag};
@@ -22,10 +25,11 @@ use waveport_protocol::client::v1::{
     ToolOutcome, features,
 };
 use waveport_transport_local_audio::{Choice, LocalAudio, Options, RATE};
-use waveport_transport_websocket::{Client, Heard, Hello, Unconnected};
+use waveport_transport_websocket::{Client, Heard, Hello, Unconnected, Welcome};
 
 use crate::args::Client as Args;
 use crate::call::{Outcome, tell_health};
+use crate::webrtc::{Daemon, OnCall};
 use crate::{Context, Failure, script};
 
 /// How long the agent's server has to answer a call.
@@ -60,6 +64,117 @@ enum Over {
     Gone(String),
 }
 
+/// Why a caller is not on a call.
+pub(crate) enum Unreached {
+    /// The agent's side is there, and the call is not, or not for this
+    /// caller.
+    Refused(String),
+    /// The agent's side was not reached, and may be later.
+    Failed(PortError),
+}
+
+impl fmt::Display for Unreached {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(why) => write!(f, "the agent's side turned the caller away: {why}"),
+            Self::Failed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Where the agent is reached, and how.
+enum Reached {
+    /// At an address where a WebSocket is taken, by a caller that says
+    /// this hello.
+    Socket(String, Hello),
+    /// Through its daemon, over WebRTC.
+    Daemon(Daemon),
+}
+
+impl Reached {
+    /// Calls the agent. `resume` is where a caller that comes back was.
+    async fn connect(&self, resume: Option<Resume>) -> Result<Far, Unreached> {
+        match self {
+            Self::Socket(url, hello) => {
+                let hello = Hello {
+                    resume,
+                    ..hello.clone()
+                };
+                match Client::connect(url, &hello, ANSWER_WITHIN).await {
+                    Ok(client) => Ok(Far::Socket(Box::new(client))),
+                    Err(Unconnected::Refused { message, .. }) => Err(Unreached::Refused(message)),
+                    Err(Unconnected::Failed(error)) => Err(Unreached::Failed(error)),
+                }
+            }
+            Self::Daemon(daemon) => {
+                let call = daemon.call(resume, ANSWER_WITHIN).await?;
+                Ok(Far::Call(Box::new(call)))
+            }
+        }
+    }
+}
+
+/// The agent's side of the call, on the line the caller is on. Either
+/// way the audio is samples of 16 bits at the rate of the devices.
+enum Far {
+    Socket(Box<Client>),
+    Call(Box<OnCall>),
+}
+
+impl Far {
+    /// What the agent's side said as it took the caller.
+    const fn welcome(&self) -> &Welcome {
+        match self {
+            Self::Socket(client) => client.welcome(),
+            Self::Call(call) => call.welcome(),
+        }
+    }
+
+    /// The next thing the agent's side says. `None` means the line is
+    /// closed.
+    async fn next(&mut self) -> Result<Option<Heard>, PortError> {
+        match self {
+            Self::Socket(client) => client.next().await,
+            Self::Call(call) => call.next().await,
+        }
+    }
+
+    /// Sends what the microphone heard.
+    async fn audio(&mut self, audio: Bytes) -> Result<(), PortError> {
+        match self {
+            Self::Socket(client) => client.audio(audio).await,
+            Self::Call(call) => call.audio(&audio),
+        }
+    }
+
+    /// Says how much of the run `run` has been played.
+    async fn played(&mut self, run: u32, samples: u32) -> Result<(), PortError> {
+        match self {
+            Self::Socket(client) => client.played(run, samples).await,
+            Self::Call(call) => call.played(run, samples),
+        }
+    }
+
+    /// The caller has left by itself. On a WebSocket a goodbye is all
+    /// there is to leaving, and it is said here. A call is hung up
+    /// ([`hang_up`](Self::hang_up)), which says it.
+    async fn parts(&mut self) {
+        if let Self::Socket(client) = self {
+            let _ = client.say(&protocol::FromClient::Bye).await;
+        }
+    }
+
+    /// Lets go of the line of a caller who left. A call is hung up, on
+    /// the call and where it was offered: its daemon does not wait for
+    /// a caller who said that they are gone. A WebSocket goes with the
+    /// command.
+    async fn hang_up(self) {
+        if let Self::Call(call) = self {
+            call.hang_up().await;
+        }
+    }
+}
+
 /// What the devices of this machine know a run of audio by. The agent's
 /// side numbers its runs, from nought on each line: a run is known here
 /// by its line and its number.
@@ -91,7 +206,7 @@ struct Held {
 
 impl Held {
     /// Takes what the agent's side said as it took the caller.
-    fn welcomed(&mut self, far: &Client) {
+    fn welcomed(&mut self, far: &Far) {
         let welcome = far.welcome();
         self.token.clone_from(&welcome.resume_token);
         self.life = welcome.life;
@@ -221,7 +336,7 @@ fn said(text: &str, truncated: bool) -> String {
     line
 }
 
-/// Calls the agent at `args.url` and stays on the call to its end.
+/// Calls the agent `args` say and stays on the call to its end.
 pub(crate) async fn call(args: Args) -> Result<Outcome, Failure> {
     let (mut near, recording) = if let Some(file) = &args.script {
         let steps = script::read(file).map_err(Failure)?;
@@ -247,18 +362,25 @@ pub(crate) async fn call(args: Args) -> Result<Outcome, Failure> {
         (near, None)
     };
     let health = near.health();
-    let hello = Hello {
-        // A caller at a terminal is told what the tools did, as far as
-        // the agent's side lets it.
-        features: vec![features::TOOLS.to_owned()],
-        ..Hello::new(Some(AudioFormat {
-            codec: protocol::Codec::Pcm16,
-            rate: RATE.hz(),
-        }))
+    let reached = if let (Some(agent), true) = (&args.agent, args.webrtc) {
+        let key_env = args.key_env.as_deref();
+        Reached::Daemon(Daemon::session(args.at(), agent, key_env, args.tcp).await?)
+    } else {
+        let hello = Hello {
+            // A caller at a terminal is told what the tools did, as far
+            // as the agent's side lets it.
+            features: vec![features::TOOLS.to_owned()],
+            ..Hello::new(Some(AudioFormat {
+                codec: protocol::Codec::Pcm16,
+                rate: RATE.hz(),
+            }))
+        };
+        Reached::Socket(args.at().to_owned(), hello)
     };
-    let mut far = Client::connect(&args.url, &hello, ANSWER_WITHIN)
+    let mut far = reached
+        .connect(None)
         .await
-        .with(|| format!("no agent took the call at {}", args.url))?;
+        .with(|| format!("no agent took the call at {}", args.at()))?;
     println!("the call has begun");
     let mut held = Held::default();
     held.welcomed(&far);
@@ -278,7 +400,7 @@ pub(crate) async fn call(args: Args) -> Result<Outcome, Failure> {
         };
         eprintln!("waveport: the line to the agent dropped ({why}): coming back to the call");
         let back = tokio::select! {
-            back = comes_back(&mut near, &args.url, &hello, &held) => back,
+            back = comes_back(&mut near, &reached, &held) => back,
             _ = tokio::signal::ctrl_c() => Err(Over::Left),
         };
         match back {
@@ -291,6 +413,9 @@ pub(crate) async fn call(args: Args) -> Result<Outcome, Failure> {
             Err(over) => break over,
         }
     };
+    if matches!(over, Over::Left) {
+        far.hang_up().await;
+    }
     tell_health(&health);
     if let (Some(recording), Some(file)) = (recording, &args.record) {
         std::fs::write(file, recording.wav())
@@ -307,32 +432,23 @@ pub(crate) async fn call(args: Args) -> Result<Outcome, Failure> {
     }
 }
 
-/// Comes back to the call on another connection, for as long as the
-/// call can be expected to be there. What the microphone hears
-/// meanwhile is heard by nobody.
-async fn comes_back(
-    near: &mut LocalAudio,
-    url: &str,
-    hello: &Hello,
-    held: &Held,
-) -> Result<Client, Over> {
+/// Comes back to the call on another connection, or on another call,
+/// for as long as the call can be expected to be there. What the
+/// microphone hears meanwhile is heard by nobody.
+async fn comes_back(near: &mut LocalAudio, reached: &Reached, held: &Held) -> Result<Far, Over> {
     let Some(resume) = held.resume() else {
         let why = "it gave the caller nothing to come back with";
         return Err(Over::Gone(why.to_owned()));
     };
-    let hello = Hello {
-        resume: Some(resume),
-        ..hello.clone()
-    };
     let trying = async {
         let until = Instant::now() + COMES_BACK_FOR;
         loop {
-            match Client::connect(url, &hello, ANSWER_WITHIN).await {
-                Ok(client) => return Ok(client),
+            match reached.connect(Some(resume.clone())).await {
+                Ok(far) => return Ok(far),
                 // It is there, and the call is not, or not for this
                 // caller.
-                Err(Unconnected::Refused { message, .. }) => return Err(Over::Gone(message)),
-                Err(Unconnected::Failed(error)) => {
+                Err(Unreached::Refused(message)) => return Err(Over::Gone(message)),
+                Err(Unreached::Failed(error)) => {
                     if Instant::now() >= until {
                         return Err(Over::Gone(format!("it did not come back: {error}")));
                     }
@@ -405,7 +521,7 @@ fn told(held: &mut Held, heard: Heard) -> Option<Over> {
 /// `error`. It may have said how the call ended before it stopped
 /// listening, so what it sent is read to its end. A call that was said
 /// to be over is over, and one that was not may still be there.
-async fn last_words(far: &mut Client, held: &mut Held, error: &PortError) -> Over {
+async fn last_words(far: &mut Far, held: &mut Held, error: &PortError) -> Over {
     let reading = async {
         loop {
             match far.next().await {
@@ -427,7 +543,7 @@ async fn last_words(far: &mut Client, held: &mut Held, error: &PortError) -> Ove
 /// Carries the call on one line: what the microphone hears goes to the
 /// agent, what the agent says goes to the loudspeaker, and the agent is
 /// told how much of it has been played.
-async fn stay(near: &mut LocalAudio, far: &mut Client, held: &mut Held, line: u32) -> Over {
+async fn stay(near: &mut LocalAudio, far: &mut Far, held: &mut Held, line: u32) -> Over {
     // The run whose audio arrives, and how many samples of it have.
     let mut open: Option<(u32, usize)> = None;
     loop {
@@ -436,34 +552,41 @@ async fn stay(near: &mut LocalAudio, far: &mut Client, held: &mut Held, line: u3
         // more to send.
         let here = poll_fn(|cx| near.poll_event(cx));
         let heard = match first(far.next(), here).await {
-            Either::Right(Some(TransportEvent::Audio { payload, .. })) => {
-                if let Err(error) = far.audio(payload).await {
-                    return last_words(far, held, &error).await;
-                }
-                continue;
-            }
-            Either::Right(Some(TransportEvent::Played { tag, played })) => {
-                // What was played of a line that is gone is told to
-                // nobody: this one knows nothing of its runs.
-                if tag.epoch.0 != line {
-                    continue;
-                }
-                let samples = u32::try_from(RATE.samples_in(played)).unwrap_or(u32::MAX);
-                if let Err(error) = far.played(tag.generation.0, samples).await {
-                    return last_words(far, held, &error).await;
-                }
-                continue;
-            }
-            Either::Right(Some(TransportEvent::Left { .. }) | None) => {
-                let _ = far.say(&protocol::FromClient::Bye).await;
-                return Over::Left;
-            }
-            Either::Right(Some(_)) => continue,
             Either::Left(Ok(Some(heard))) => heard,
             Either::Left(Ok(None)) => {
                 return Over::Dropped("its connection closed with no goodbye".to_owned());
             }
             Either::Left(Err(error)) => return Over::Dropped(error.to_string()),
+            Either::Right(here) => {
+                match here {
+                    Some(TransportEvent::Audio { payload, .. }) => {
+                        if let Err(error) = far.audio(payload).await {
+                            return last_words(far, held, &error).await;
+                        }
+                    }
+                    // What was played of a line that is gone is told to
+                    // nobody: this one knows nothing of its runs.
+                    Some(TransportEvent::Played { tag, played }) if tag.epoch.0 == line => {
+                        let samples = u32::try_from(RATE.samples_in(played)).unwrap_or(u32::MAX);
+                        if let Err(error) = far.played(tag.generation.0, samples).await {
+                            return last_words(far, held, &error).await;
+                        }
+                    }
+                    Some(TransportEvent::Left { .. }) | None => {
+                        far.parts().await;
+                        return Over::Left;
+                    }
+                    Some(_) => {}
+                }
+                // Sound devices that are behind have something every
+                // time they are asked, and saying it on a call waits
+                // for nothing. The thread is given back between two
+                // such things: nothing that arrives on the line is read
+                // while it is kept, and a caller that only speaks does
+                // not hear that it is spoken to.
+                tokio::task::yield_now().await;
+                continue;
+            }
         };
         match heard {
             Heard::Begins { run, .. } => open = Some((run, 0)),

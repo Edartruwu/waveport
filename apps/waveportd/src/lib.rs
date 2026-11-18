@@ -16,8 +16,11 @@
 //!   that carries the whole protocol, and audio if its hello names any.
 //!   Such a session hears and speaks if its agent does either, and
 //!   reads and writes over the line otherwise. A client whose
-//!   connection drops comes back and is on the line again.
-//!
+//!   connection drops comes back and is on the line again. Or the far
+//!   end is on a WebRTC call (`POST /v1/webrtc`), which carries audio
+//!   as a call does and the protocol on a data channel: such a session
+//!   hears and speaks. A session stays on the kind of line it was
+//!   started on while it runs.
 //! - **On a call.** A carrier asks the daemon what to do with a call
 //!   (`POST /v1/telephony/{carrier}/voice`), and is answered with the
 //!   address of a stream of the daemon's and a ticket that is good once
@@ -69,6 +72,53 @@
 //! None of this has been held against a carrier yet: it is written
 //! from Twilio's documentation, and tested with a stand-in.
 //!
+//! # Calls over WebRTC
+//!
+//! A daemon answers calls over WebRTC when its file says where their
+//! datagrams are taken (`[webrtc]`, [`config::Webrtc`]). A far end
+//! posts its offer, as WHIP has it (RFC 9725), and says the client
+//! token of its session, or the token it came back with:
+//!
+//! ```text
+//! POST /v1/webrtc                 Content-Type: application/sdp, Authorization: Bearer <token>
+//!   201, the answer               Location: /v1/webrtc/<call>, ETag: "1", Link: <stun:...>; rel="ice-server"
+//! PATCH /v1/webrtc/<call>         Content-Type: application/trickle-ice-sdpfrag, If-Match: "1" or *
+//!   204                           where the far end is: nothing is done with it
+//!   200, a fragment, ETag: "2"    its checks begin anew, and the call goes on
+//! DELETE /v1/webrtc/<call>        200: the far end hung up, and its session is over
+//! ```
+//!
+//! It is the shape of WHIP and is not WHIP. A call carries audio both
+//! ways, and its far end speaks the client protocol on a data channel
+//! the offer has to have: an offer without one is turned away, and so
+//! is one for a session whose agent neither hears nor speaks.
+//!
+//! The token is not used up by the offer. It is used up by the hello
+//! the far end says on its call, which names it again, as on a
+//! WebSocket: so a far end whose call never got through still holds a
+//! token it can come another way with. What is asked of a call later
+//! is asked with the token its offer was made with, and the name of a
+//! call is one nobody can guess.
+//!
+//! The daemon answers the checks of a far end and makes none, so it
+//! has to be reached at an address a far end can send to, and it runs
+//! no server that helps a far end get through. It tells a far end of
+//! the ones its file names (`[[webrtc.ice_servers]]`), each as a
+//! `Link` with the answer. For a TURN server that shares a secret with
+//! it, it makes each far end a name and a password that are good for a
+//! while (the scheme coturn calls `use-auth-secret`): the file names
+//! the environment variable the secret is in, and never holds it.
+//!
+//! A far end has a quarter of a minute to be there once its offer is
+//! answered, and only so many calls are on their way at once (four of
+//! one session, sixty-four in all, unless the file says otherwise): an
+//! offer beyond that is told to come again. **Nothing limits how often
+//! a far end has its checks begin anew**, and nothing how many offers
+//! one address makes: that is for whatever stands before the daemon.
+//!
+//! None of this has been held against a browser yet: the far end in
+//! its tests is the client the transport has for itself.
+//!
 //! # The page
 //!
 //! A daemon serves a page to try its agents on, at `/playground/`,
@@ -107,6 +157,7 @@ mod line;
 mod playground;
 mod serve;
 mod threads;
+mod webrtc;
 
 pub use crate::config::Config;
 pub use crate::daemon::{Daemon, Running};

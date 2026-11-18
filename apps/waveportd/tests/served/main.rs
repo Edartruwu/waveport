@@ -25,6 +25,7 @@ mod far_end;
 mod aloud;
 mod asked;
 mod called;
+mod dialled;
 mod kept;
 mod lined;
 mod page;

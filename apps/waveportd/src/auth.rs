@@ -17,7 +17,7 @@ use waveport_protocol::client::v1::CLIENT_TOKEN;
 const DOMAIN: &[u8] = b"waveportd secret v1\0";
 
 /// What is kept of a secret: from this the secret cannot be had.
-fn digest(secret: &str) -> [u8; 32] {
+pub(crate) fn digest(secret: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN);
     hasher.update(secret.as_bytes());
@@ -26,7 +26,7 @@ fn digest(secret: &str) -> [u8; 32] {
 
 /// Whether two hashes are the same, found out in the same time whether
 /// they are or not.
-fn same(a: &[u8; 32], b: &[u8; 32]) -> bool {
+pub(crate) fn same(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.iter().zip(b).fold(0, |differ, (a, b)| differ | (a ^ b)) == 0
 }
 
@@ -140,6 +140,15 @@ impl Tickets {
     /// It is used up either way.
     pub(crate) fn redeem_for_its_session(&self, token: &str) -> Option<SessionId> {
         let ticket = self.held().remove(&digest(token))?;
+        (ticket.until > Instant::now()).then_some(ticket.session)
+    }
+
+    /// The session `token` was made for, if it is still good and was
+    /// not used. It is not used up by this: whoever only asks which
+    /// session a token is for has not connected to it.
+    pub(crate) fn names(&self, token: &str) -> Option<SessionId> {
+        let held = self.held();
+        let ticket = held.get(&digest(token))?;
         (ticket.until > Instant::now()).then_some(ticket.session)
     }
 
@@ -282,6 +291,27 @@ mod tests {
         tickets.revoke(b);
         assert!(!tickets.redeem(&revoked, b));
         assert!(tickets.redeem(&kept, a));
+    }
+
+    #[test]
+    fn a_client_token_names_its_session_and_is_not_used_up_by_that() {
+        let tickets = Tickets::default();
+        let (a, b) = (SessionId(1), SessionId(2));
+        let for_a = tickets.mint(a, Duration::from_secs(60)).unwrap();
+        let for_b = tickets.mint(b, Duration::from_secs(60)).unwrap();
+        // As often as it is asked, and it is still good afterwards.
+        assert_eq!(tickets.names(&for_a), Some(a));
+        assert_eq!(tickets.names(&for_a), Some(a));
+        assert_eq!(tickets.names(&for_b), Some(b));
+        assert!(tickets.redeem(&for_a, a));
+        // One that was used names nothing, and neither does one that
+        // nobody came for in time, was taken back, or was never made.
+        assert_eq!(tickets.names(&for_a), None);
+        let late = tickets.mint(a, Duration::ZERO).unwrap();
+        assert_eq!(tickets.names(&late), None);
+        tickets.revoke(b);
+        assert_eq!(tickets.names(&for_b), None);
+        assert_eq!(tickets.names("wpc1_madeup"), None);
     }
 
     #[test]

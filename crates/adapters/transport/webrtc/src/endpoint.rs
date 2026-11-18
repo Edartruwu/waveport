@@ -18,6 +18,12 @@
 //!
 //! A call that is behind is not waited for: a datagram that finds its
 //! call with too many waiting is dropped, as a network would drop it.
+//!
+//! A call that is over hands its connection to the pump, which lets go
+//! of it as one that is closed and not as one that broke. What a call
+//! says last is its goodbye, and its far end sends all the time: a
+//! connection that is closed while something is unread is reset by the
+//! system, and a reset can take what was just said with it.
 
 use core::fmt;
 use core::future::poll_fn;
@@ -64,6 +70,15 @@ const WAITING: usize = 64;
 
 /// How long a connection may take to say which call it is for.
 const FIRST_WORD: Duration = Duration::from_secs(5);
+
+/// How many connections of calls that are over may be on their way out
+/// at once. One that comes when as many are is closed where it stands.
+const LEAVING: usize = 64;
+
+/// How long the connection of a call that is over is given to end as
+/// one that was closed: for what was said last on it to arrive, and for
+/// its far end to close it too.
+const LEAVES_WITHIN: Duration = Duration::from_secs(1);
 
 /// The longest datagram that is read whole.
 const LONGEST: usize = 2048;
@@ -234,6 +249,9 @@ struct Shared {
     table: Mutex<Table>,
     /// The number of the next call.
     next: AtomicU64,
+    /// Where the connection of a call that is over goes, to be let go
+    /// of by what carries the server's arrivals.
+    leaving: mpsc::Sender<Box<Framed>>,
 }
 
 impl Shared {
@@ -325,6 +343,7 @@ impl Endpoint {
             }
             None => (None, None),
         };
+        let (leaving, left) = mpsc::channel(LEAVING);
         let shared = Arc::new(Shared {
             udp,
             udp_at: SocketAddr::new(at, bound.port()),
@@ -333,10 +352,12 @@ impl Endpoint {
             dtls13: config.dtls13,
             table: Mutex::new(Table::default()),
             next: AtomicU64::new(1),
+            leaving,
         });
         let pump = Pump {
             shared: Arc::clone(&shared),
             tcp,
+            left,
         };
         Ok((Self { shared }, pump))
     }
@@ -538,6 +559,13 @@ impl Wire for Line {
 impl Drop for Line {
     fn drop(&mut self) {
         self.shared.table().forget(self.id);
+        // The connection of a call is not closed under what was said
+        // on it last, which is the goodbye: it is handed to what
+        // carries the server's arrivals, and let go of there. With
+        // nothing to hand it to, it is closed where it stands.
+        if let Some(connection) = self.connection.take() {
+            let _ = self.shared.leaving.try_send(connection);
+        }
     }
 }
 
@@ -553,6 +581,8 @@ struct Waiting {
 pub struct Pump {
     shared: Arc<Shared>,
     tcp: Option<TcpListener>,
+    /// The connections of calls that are over.
+    left: mpsc::Receiver<Box<Framed>>,
 }
 
 impl fmt::Debug for Pump {
@@ -566,10 +596,16 @@ impl Pump {
     /// it is run. It ends only when the system fails the socket, and
     /// returns why.
     pub async fn run(self) -> io::Error {
-        let Self { shared, tcp } = self;
+        let Self {
+            shared,
+            tcp,
+            mut left,
+        } = self;
         let mut waiting: Vec<Waiting> = Vec::new();
+        let mut leaving: Vec<Waiting> = Vec::new();
         let mut datagram = vec![0_u8; LONGEST];
-        // What wakes it to let go of connections that say nothing.
+        // What wakes it to let go of connections that say nothing, and
+        // of those that do not end.
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         poll_fn(|cx| {
             let mut carried = 0;
@@ -629,6 +665,21 @@ impl Pump {
                     Poll::Pending => waiting.by > now,
                 }
             });
+            while let Poll::Ready(Some(connection)) = left.poll_recv(cx) {
+                if leaving.len() < LEAVING {
+                    leaving.push(Waiting {
+                        connection: Some(connection),
+                        by: now + LEAVES_WITHIN,
+                    });
+                }
+            }
+            leaving.retain_mut(|leaving| {
+                let ended = leaving
+                    .connection
+                    .as_mut()
+                    .is_none_or(|connection| connection.poll_let_go(cx).is_ready());
+                !ended && leaving.by > now
+            });
             while tick.poll_tick(cx).is_ready() {}
             Poll::Pending
         })
@@ -638,12 +689,63 @@ impl Pump {
 
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
     use tokio::sync::mpsc;
+    use tokio::time::Instant;
 
-    use super::{Known, NAMES, PEERS, Table};
+    use super::{Config, Endpoint, Known, LEAVES_WITHIN, Line, NAMES, PEERS, Table};
     use crate::rtp::forged_check as check;
+    use crate::tcp::testing::{connection, has_something_unread, next, says, sends_no_more};
+
+    #[tokio::test]
+    async fn the_connection_of_a_call_that_is_over_is_closed_and_not_broken() {
+        let local = "127.0.0.1:0".parse().unwrap();
+        let config = Config {
+            tcp: Some(local),
+            ..Config::at(local)
+        };
+        let (endpoint, pump) = Endpoint::bind(config).await.unwrap();
+        tokio::spawn(pump.run());
+        // A call with the connection its far end made, which sends all
+        // the time: something of it is unread when the call says its
+        // last, and is over.
+        let (mut near, mut far) = connection().await;
+        says(&mut far, b"what the microphone hears").await;
+        has_something_unread(&near).await;
+        says(&mut near, b"goodbye").await;
+        let (_inbox, arrives) = mpsc::channel(1);
+        let line = Line {
+            shared: Arc::clone(&endpoint.shared),
+            id: 7,
+            arrives,
+            connection: Some(Box::new(near)),
+            offered: None,
+            unknown: None,
+            deaf: false,
+        };
+        drop(line);
+        // Nothing refuses what the far end sends next, as a connection
+        // that was closed with something unread would.
+        says(&mut far, b"more of it").await;
+        assert!(!sends_no_more(&far));
+        // It has the goodbye, and then that nothing follows.
+        assert_eq!(next(&mut far).await.unwrap(), b"goodbye"[..]);
+        assert_eq!(next(&mut far).await, None);
+        says(&mut far, b"and more").await;
+        assert!(!sends_no_more(&far));
+        // A far end that does not close it too is waited for a moment,
+        // and no longer: what it sends is refused then.
+        let since = Instant::now();
+        while !sends_no_more(&far) {
+            assert!(since.elapsed() < Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            says(&mut far, b"still there").await;
+        }
+        assert!(since.elapsed() > LEAVES_WITHIN / 2, "{:?}", since.elapsed());
+    }
 
     fn peer(port: u16) -> SocketAddr {
         SocketAddr::from(([198, 51, 100, 7], port))

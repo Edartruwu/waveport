@@ -7,10 +7,11 @@
 //! trying again can help.
 //!
 //! The same client asks the smaller things: a carrier that is told to
-//! place a call, or asked how one stands. Those say who asks in a way of
-//! their own ([`Auth`]), some take a form and not JSON ([`Body`]), and
-//! their answers are short enough to be read whole
-//! ([`HttpResponse::body`]).
+//! place a call, or asked how one stands, and a server that is offered
+//! a call and told when it is over. Those say who asks in a way of
+//! their own ([`Auth`]), some take a form or a description of a call
+//! and not JSON ([`Body`]), and their answers are short enough to be
+//! read whole ([`HttpResponse::body`]).
 
 use core::fmt;
 use core::fmt::Write as _;
@@ -129,6 +130,15 @@ pub enum Body<'a> {
     /// Names and their values, as a form sends them
     /// (`application/x-www-form-urlencoded`).
     Form(&'a [(&'a str, &'a str)]),
+    /// Bytes of the kind it says they are, as they are: the description
+    /// of a call (`application/sdp`), and whatever else is neither JSON
+    /// nor a form.
+    Of {
+        /// What the bytes are, as `Content-Type` says it.
+        kind: &'a str,
+        /// The bytes.
+        bytes: &'a [u8],
+    },
 }
 
 /// Names and values as a form sends them.
@@ -230,6 +240,19 @@ impl HttpClient {
         self.send(Method::GET, request).await
     }
 
+    /// Sends a `DELETE` and waits for the answer to begin.
+    ///
+    /// # Errors
+    ///
+    /// As [`post`](Self::post). A request that carries something is not
+    /// sent: what is let go of is named by the address.
+    pub async fn delete(&self, request: HttpRequest<'_>) -> Result<HttpResponse, PortError> {
+        if !matches!(request.body, Body::None) {
+            return Err(PortError::permanent("a DELETE carries nothing"));
+        }
+        self.send(Method::DELETE, request).await
+    }
+
     /// The request as it is sent.
     fn built(
         &self,
@@ -245,6 +268,7 @@ impl HttpClient {
             Body::Form(fields) => builder
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(form(fields)),
+            Body::Of { kind, bytes } => builder.header("content-type", kind).body(bytes.to_vec()),
         };
         for (name, value) in request.headers {
             builder = builder.header(*name, *value);
@@ -800,5 +824,76 @@ mod tests {
         let error = client.get(carrying).await.unwrap_err();
         assert_eq!(error.class, RetryClass::Permanent, "{error}");
         assert!(error.message.contains("a GET carries nothing"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_description_is_posted_as_what_it_is_and_what_it_made_is_let_go_of() {
+        let url = server(|mut stream, request| async move {
+            let lower = request.to_ascii_lowercase();
+            let (status, more, body) = if request.starts_with("POST ") {
+                assert!(
+                    lower.contains("content-type: application/sdp\r\n"),
+                    "{request}"
+                );
+                assert!(
+                    lower.contains("authorization: bearer tok-secret-123\r\n"),
+                    "{request}"
+                );
+                // The bytes are sent as they are.
+                assert!(request.ends_with("\r\n\r\nv=0\r\n"), "{request}");
+                ("201 Created", "location: /calls/made-up\r\n", "v=0\r\n")
+            } else {
+                assert!(
+                    request.starts_with("DELETE /v1/chat/completions HTTP/1.1\r\n"),
+                    "{request}"
+                );
+                assert!(!lower.contains("content-type:"), "{request}");
+                assert!(request.ends_with("\r\n\r\n"));
+                ("200 OK", "", "")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{more}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        })
+        .await;
+        let key = Secret::new("tok-secret-123");
+        let client = client();
+        let offered = client
+            .post(HttpRequest {
+                url: &url,
+                headers: &[],
+                auth: Auth::Bearer(&key),
+                body: Body::Of {
+                    kind: "application/sdp",
+                    bytes: b"v=0\r\n",
+                },
+            })
+            .await
+            .unwrap();
+        // Where what was made is, is in the head of the answer.
+        assert_eq!(offered.header("location"), Some("/calls/made-up"));
+        assert_eq!(offered.body(64).await.unwrap(), b"v=0\r\n");
+
+        let gone = HttpRequest {
+            url: &url,
+            headers: &[],
+            auth: Auth::Bearer(&key),
+            body: Body::None,
+        };
+        let answered = client.delete(gone).await.unwrap();
+        assert_eq!(answered.body(64).await.unwrap(), b"");
+        // And a DELETE that was to carry something is not sent.
+        let carrying = HttpRequest {
+            body: Body::Json(b"{}"),
+            ..gone
+        };
+        let error = client.delete(carrying).await.unwrap_err();
+        assert_eq!(error.class, RetryClass::Permanent, "{error}");
+        assert!(
+            error.message.contains("a DELETE carries nothing"),
+            "{error}"
+        );
     }
 }

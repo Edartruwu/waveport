@@ -278,6 +278,75 @@ const fn before(time: u32, limit: u32) -> bool {
     time.wrapping_sub(limit) >= 1 << 31
 }
 
+/// How many stretches of one run are remembered: a run is one stretch
+/// unless its audio came with a break in it.
+const STRETCHES: usize = 16;
+
+/// A run a client was told of: where it is in the stream, and what was
+/// given of it.
+///
+/// The audio of a run is not always one piece of the stream. A server
+/// that was late with a frame goes on later in the stream by as much,
+/// and a packet that did not arrive leaves a hole. So how much of a run
+/// was played says where in the stream the client is only together
+/// with which audio it was that the client was given.
+#[derive(Debug)]
+struct Run {
+    number: u32,
+    /// Where it begins.
+    begins: u32,
+    /// The audio that was given of it, as stretches with no break in
+    /// them: where each begins, and how many samples it holds.
+    given: VecDeque<(u32, u32)>,
+    /// How many samples were given in stretches that are no longer
+    /// remembered.
+    forgotten: u32,
+    /// Where it ends, once the server said that it was sent whole.
+    ends: Option<u32>,
+}
+
+impl Run {
+    /// Audio of the run was given to the client: `samples` from `time`
+    /// on.
+    fn took(&mut self, time: u32, samples: u32) {
+        match self.given.back_mut() {
+            Some((began, length)) if began.wrapping_add(*length) == time => {
+                *length = length.saturating_add(samples);
+            }
+            _ => {
+                if self.given.len() >= STRETCHES
+                    && let Some((_, length)) = self.given.pop_front()
+                {
+                    self.forgotten = self.forgotten.saturating_add(length);
+                }
+                self.given.push_back((time, samples));
+            }
+        }
+    }
+
+    /// Where in the stream the client is when it has played `samples`
+    /// of what it was given of the run.
+    fn place(&self, samples: u32) -> u32 {
+        let mut left = samples.saturating_sub(self.forgotten);
+        let mut at = self.begins;
+        let mut stretches = self.given.iter().peekable();
+        while let Some((time, length)) = stretches.next() {
+            // The end of a stretch that another follows is where it
+            // ends, and not where the next begins: nothing of the next
+            // was played.
+            if left < *length || (left == *length && stretches.peek().is_some()) {
+                return time.wrapping_add(left);
+            }
+            left -= *length;
+            at = time.wrapping_add(*length);
+        }
+        // Everything it was given was played. Of a run that was sent
+        // whole no more is coming: what did not arrive of it will not
+        // be played, and the run has been played to its end.
+        self.ends.unwrap_or(at)
+    }
+}
+
 /// What a client was sent, put in the order it means: the audio of a
 /// response after what says that it begins, and before what says that
 /// it ends or is discarded. The audio and what is said of it travel
@@ -294,8 +363,10 @@ struct Order {
     /// Where in the stream the run that is being heard has been heard
     /// to.
     heard_to: Option<u32>,
-    /// Where the runs that were heard of begin, the oldest first.
-    begun: VecDeque<(u32, u32)>,
+    /// The run that is being heard, if it was said where it begins.
+    open: Option<u32>,
+    /// The runs that were heard of, the oldest first.
+    begun: VecDeque<Run>,
     /// What needs no ordering.
     aside: VecDeque<Heard>,
     /// Until when something that is held back waits for what is to
@@ -314,8 +385,21 @@ impl Order {
         if self.hearing {
             let samples = opus_samples(&audio).unwrap_or(0);
             self.heard_to = Some(time.wrapping_add(samples));
+            if let Some(open) = self.open
+                && let Some(run) = self.run(open)
+            {
+                run.took(time, samples);
+            }
         }
         Some(Heard::Audio(audio))
+    }
+
+    /// The run `run`, if the client was told where it begins.
+    fn run(&mut self, run: u32) -> Option<&mut Run> {
+        self.begun
+            .iter_mut()
+            .rev()
+            .find(|known| known.number == run)
     }
 
     /// Holds something back until `until`.
@@ -379,20 +463,34 @@ impl Order {
                 } => {
                     self.hearing = true;
                     self.heard_to = ts;
+                    self.open = ts.map(|_| run);
                     if let Some(begins) = ts {
                         if self.begun.len() >= RUNS {
                             self.begun.pop_front();
                         }
-                        self.begun.push_back((run, begins));
+                        self.begun.push_back(Run {
+                            number: run,
+                            begins,
+                            given: VecDeque::new(),
+                            forgotten: 0,
+                            ends: None,
+                        });
                     }
                     Heard::Begins { run, generation }
                 }
-                FromServer::Mark { run, end: true, .. } => {
+                FromServer::Mark {
+                    run, end: true, ts, ..
+                } => {
                     self.hearing = false;
+                    self.open = None;
+                    if let Some(known) = self.run(run) {
+                        known.ends = ts;
+                    }
                     Heard::Ends(run)
                 }
                 FromServer::Clear { run } => {
                     self.hearing = false;
+                    self.open = None;
                     Heard::Clear(run)
                 }
                 FromServer::Fact { seq, fact } => Heard::Fact { seq, fact },
@@ -413,10 +511,12 @@ impl Order {
         }
     }
 
-    /// Where the run `run` begins in the stream.
-    fn begins(&self, run: u32) -> Option<u32> {
-        let begun = self.begun.iter().rev().find(|(known, _)| *known == run);
-        begun.map(|(_, begins)| *begins)
+    /// Where in the stream a client is that has played `samples` of
+    /// what it was given of the run `run`. `None` for a run it was
+    /// never told of.
+    fn place(&self, run: u32, samples: u32) -> Option<u32> {
+        let known = self.begun.iter().rev().find(|known| known.number == run);
+        known.map(|known| known.place(samples))
     }
 }
 
@@ -585,20 +685,26 @@ impl Dialer {
         }
     }
 
-    /// Says how many samples of the run `run` have been played so far,
-    /// on the clock of the call: as a place in the stream, which is how
-    /// it is said on a call. A run the client was never told of is said
-    /// nothing about.
+    /// Says how many samples of what the client was given of the run
+    /// `run` have been played so far, on the clock of the call: as a
+    /// place in the stream, which is how it is said on a call. A run
+    /// the client was never told of is said nothing about.
+    ///
+    /// The place is that of the audio that was played, wherever in the
+    /// stream it was: audio that came after a break, or after a packet
+    /// that did not arrive, is further on than what was played before
+    /// it adds up to. A run that was sent whole has been played to its
+    /// end once everything that arrived of it has been.
     ///
     /// # Errors
     ///
     /// The call is over.
     pub fn played(&mut self, run: u32, samples: u32) -> Result<(), PortError> {
-        let Some(begins) = self.order.begins(run) else {
+        let Some(place) = self.order.place(run, samples) else {
             return Ok(());
         };
         self.say_now(&FromClient::PlayedRtp {
-            ts: Some(begins.wrapping_add(samples)),
+            ts: Some(place),
             emitted: None,
             concealed: None,
             delay_ms: 0,
@@ -812,7 +918,7 @@ mod tests {
     use waveport_adapter_kit::client::Welcome;
     use waveport_protocol::client::v1::FromServer;
 
-    use super::{HOLD, Heard, Order, before};
+    use super::{HOLD, Heard, Order, STRETCHES, before};
 
     /// A packet of 20 ms that is told from others by `n`.
     fn packet(n: u8) -> Bytes {
@@ -904,10 +1010,10 @@ mod tests {
             [audio(3), Heard::Ends(4), begins, audio(4), Heard::Clear(5)]
         );
         assert_eq!(
-            (order.begins(4), order.begins(5)),
+            (order.place(4, 0), order.place(5, 0)),
             (Some(1_000), Some(9_000))
         );
-        assert_eq!(order.begins(6), None);
+        assert_eq!(order.place(6, 0), None);
 
         // Audio that nothing is said about is given after a while, as
         // it is.
@@ -939,6 +1045,96 @@ mod tests {
             given(&mut order, now),
             [Heard::Down, Heard::Gap { resumes: 3 }]
         );
+    }
+
+    #[test]
+    fn how_much_of_a_run_was_played_is_a_place_among_the_audio_that_was_given() {
+        let now = Instant::now();
+        let mut order = Order::default();
+        let hears = |order: &mut Order, time: u32, n: u8| {
+            order.audio.push_back((time, packet(n), now));
+        };
+        // A run of four packets. The server was late with the third,
+        // by 480 ms: it is that much further on in the stream.
+        order.said.push_back((mark(4, false, 1_000), now));
+        hears(&mut order, 1_000, 1);
+        hears(&mut order, 1_960, 2);
+        hears(&mut order, 26_000, 3);
+        hears(&mut order, 26_960, 4);
+        assert_eq!(given(&mut order, now).len(), 5);
+        let place = |order: &Order, samples| order.place(4, samples).unwrap();
+        assert_eq!(place(&order, 0), 1_000);
+        assert_eq!(place(&order, 1), 1_001);
+        // Two packets were played: the client is where they end, and
+        // not where the audio goes on, of which it has played nothing.
+        assert_eq!(place(&order, 1_920), 2_920);
+        assert_eq!(place(&order, 1_921), 26_001);
+        assert_eq!(place(&order, 3_839), 27_919);
+        assert_eq!(place(&order, 3_840), 27_920);
+        // No more was played than was given.
+        assert_eq!(place(&order, 9_999), 27_920);
+
+        // The run was sent whole, and ends a packet later than the
+        // client has heard it to: one did not arrive. Its end waits for
+        // that packet, and then is given without it.
+        order.said.push_back((mark(4, true, 28_880), now));
+        assert_eq!(given(&mut order, now), []);
+        assert_eq!(given(&mut order, now + HOLD), [Heard::Ends(4)]);
+        // What was played of it is where it was. Once all that arrived
+        // has been played, the run has been played to its end: nothing
+        // more of it is coming.
+        assert_eq!(place(&order, 3_839), 27_919);
+        assert_eq!(place(&order, 3_840), 28_880);
+        assert_eq!(place(&order, 9_999), 28_880);
+
+        // Audio that comes after the end of its run is of no run, and
+        // changes nothing of where the run was played to.
+        hears(&mut order, 27_920, 5);
+        assert_eq!(given(&mut order, now + HOLD), [audio(5)]);
+        assert_eq!(place(&order, 3_840), 28_880);
+        // A run of which nothing arrived, and one that was discarded.
+        order.said.push_back((mark(5, false, 40_000), now));
+        order.said.push_back((mark(5, true, 40_960), now));
+        order.said.push_back((mark(6, false, 50_000), now));
+        hears(&mut order, 50_000, 6);
+        order.said.push_back((FromServer::Clear { run: 6 }, now));
+        assert_eq!(given(&mut order, now + HOLD).len(), 5);
+        // What comes of a run after it was discarded is not its audio.
+        hears(&mut order, 50_960, 7);
+        assert_eq!(given(&mut order, now + HOLD), [audio(7)]);
+        assert_eq!(order.place(5, 0), Some(40_960));
+        assert_eq!(order.place(6, 0), Some(50_000));
+        assert_eq!(order.place(6, 960), Some(50_960));
+        assert_eq!(order.place(6, 1_920), Some(50_960));
+        assert_eq!(order.place(7, 0), None);
+    }
+
+    #[test]
+    fn a_run_in_many_pieces_is_still_counted_from_its_beginning() {
+        let now = Instant::now();
+        let mut order = Order::default();
+        order.said.push_back((mark(1, false, 0), now));
+        // Twenty packets with a break before each: more pieces than
+        // are remembered.
+        let pieces = 20_u32;
+        for n in 0..pieces {
+            let time = n * 10_000;
+            order.audio.push_back((time, packet(1), now));
+        }
+        assert_eq!(given(&mut order, now).len(), 21);
+        // The pieces that are remembered are where they are.
+        let remembered = u32::try_from(STRETCHES).unwrap();
+        for n in (pieces - remembered)..pieces {
+            let played = n * 960;
+            assert_eq!(order.place(1, played + 1), Some(n * 10_000 + 1), "{n}");
+            assert_eq!(order.place(1, played + 960), Some(n * 10_000 + 960), "{n}");
+        }
+        // What was played of the ones that are not is before the first
+        // that is.
+        let first = (pieces - remembered) * 10_000;
+        assert_eq!(order.place(1, 0), Some(first));
+        assert_eq!(order.place(1, 960), Some(first));
+        assert_eq!(order.place(1, 20 * 960), Some(19 * 10_000 + 960));
     }
 
     #[test]

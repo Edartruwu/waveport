@@ -27,7 +27,7 @@ Phase numbers refer to the roadmap. Locations are relative to the repository roo
 |---|---|---|
 | Local audio | `crates/adapters/transport/local-audio` | 1 |
 | WebSocket | `crates/adapters/transport/websocket` | 1 |
-| WebRTC direct endpoint with HTTP signalling and jitter buffer | `crates/adapters/transport/webrtc` | 2 |
+| WebRTC direct endpoint with HTTP signalling and jitter buffer | `crates/adapters/transport/webrtc`, `apps/waveportd` | 2 |
 | Carrier media streams: Twilio, Telnyx, Plivo, Vonage, Exotel, jambonz | `crates/adapters/transport/telephony-ws` | 2 |
 | Text-only over HTTP with server-sent events | `apps/waveportd` | 2 |
 | Native SIP and RTP | `crates/adapters/transport/sip` | 6 |

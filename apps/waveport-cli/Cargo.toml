@@ -22,21 +22,22 @@ bench = false
 waveport-adapter-kit = { workspace = true }
 waveport-assembly = { workspace = true }
 waveport-domain = { workspace = true }
+waveport-media = { workspace = true }
 waveport-ports = { workspace = true }
 waveport-protocol = { workspace = true }
 waveport-runtime = { workspace = true }
 waveport-transport-local-audio = { workspace = true }
+waveport-transport-webrtc = { workspace = true }
 waveport-transport-websocket = { workspace = true }
 
+bytes = { workspace = true }
 clap = { workspace = true, features = ["derive", "env", "error-context", "help", "std", "suggestions", "usage"] }
 serde_json = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "sync", "time"] }
 
 [dev-dependencies]
 waveport-testkit = { workspace = true }
-
-bytes = { workspace = true }
-tokio = { workspace = true, features = ["net"] }
+waveportd = { workspace = true }
 
 [lints]
 workspace = true

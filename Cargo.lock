@@ -3407,12 +3407,15 @@ dependencies = [
  "waveport-adapter-kit",
  "waveport-assembly",
  "waveport-domain",
+ "waveport-media",
  "waveport-ports",
  "waveport-protocol",
  "waveport-runtime",
  "waveport-testkit",
  "waveport-transport-local-audio",
+ "waveport-transport-webrtc",
  "waveport-transport-websocket",
+ "waveportd",
 ]
 
 [[package]]
@@ -3705,14 +3708,17 @@ name = "waveportd"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "clap",
  "futures-util",
  "getrandom 0.4.3",
+ "hmac",
  "hyper",
  "hyper-util",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tokio",
  "waveport-adapter-kit",
@@ -3723,6 +3729,7 @@ dependencies = [
  "waveport-protocol",
  "waveport-testkit",
  "waveport-transport-telephony-ws",
+ "waveport-transport-webrtc",
  "waveport-transport-websocket",
 ]
 
