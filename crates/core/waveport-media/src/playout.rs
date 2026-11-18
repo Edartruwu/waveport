@@ -27,6 +27,18 @@
 //! hears a gap. The pace starts again from the moment more audio arrives.
 //! The same happens when a call comes more than 100 ms late: what is due
 //! by then would only pile up at the far end.
+//!
+//! # What was played
+//!
+//! A transport whose far end says what it played is believed
+//! ([`ack`](Playout::ack)), and one that says nothing is taken to play
+//! as the clock says. A far end that says some and then stops short of a
+//! response it was handed whole is waited for, since what it says is
+//! better than the clock, but not for ever: once the last of the
+//! response has been due for [`ack_wait`](PlayoutConfig::ack_wait), the
+//! response is taken to have been played to its end. A report can be
+//! lost, and a far end can be a little short in what it counts; a
+//! response is not held open for either.
 
 use core::time::Duration;
 
@@ -55,14 +67,20 @@ pub struct PlayoutConfig {
     /// How much audio the far end is taken to hold that it has not played
     /// yet. It is used when the transport does not say what was played.
     pub far_buffer: MediaDur,
+    /// How long a far end that says what it played may stay short of a
+    /// response it was handed whole, from the time the last of it is
+    /// heard by the clock, before it is waited for no longer: the
+    /// response is then taken to have been played to its end.
+    pub ack_wait: Duration,
     /// How many marks it holds for audio not yet played.
     pub marks: usize,
 }
 
 impl PlayoutConfig {
     /// The settings of the design for audio at `rate`: a lead of one
-    /// frame, 3 s of audio held, and a quarter of the volume while someone
-    /// speaks over the agent.
+    /// frame, 3 s of audio held, a quarter of the volume while someone
+    /// speaks over the agent, and 2 s for a far end to say that it played
+    /// the end of a response.
     #[must_use]
     pub const fn new(rate: Rate) -> Self {
         Self {
@@ -71,6 +89,7 @@ impl PlayoutConfig {
             buffer: MediaDur::from_millis(3_000),
             ducked: Gain::ratio(1, 4),
             far_buffer: MediaDur::ZERO,
+            ack_wait: Duration::from_secs(2),
             marks: 256,
         }
     }
@@ -158,6 +177,9 @@ pub struct Playout {
     played: u64,
     /// Whether the end of the response was reported.
     drained: bool,
+    /// Ticks of the media clock in one sample of the response: worked
+    /// out once, since every report of a position asks for it.
+    tick: u32,
 }
 
 impl Playout {
@@ -178,6 +200,7 @@ impl Playout {
             acked: None,
             played: 0,
             drained: false,
+            tick: config.rate.ticks_per_sample(),
             config,
         }
     }
@@ -368,11 +391,31 @@ impl Playout {
             .after(self.span(self.handed.saturating_sub(self.anchor_at)))
     }
 
-    /// A length of the response's audio.
+    /// When the last of what was handed over is heard, by the clock and
+    /// what the far end is taken to hold.
+    fn heard_out(&self) -> MonoTime {
+        let far = u64::from(self.config.far_buffer.ticks()) * 1_000_000_000 / 48_000;
+        self.due().after(Duration::from_nanos(far))
+    }
+
+    /// Whether a far end that says what it played has stayed short of the
+    /// end of what it was handed for too long at `now`, and is waited for
+    /// no longer. It is asked only between the last frame of a response
+    /// and its end, and is kept out of the way of what is asked at every
+    /// step.
+    #[cold]
+    #[inline(never)]
+    fn waited_out(&self, now: MonoTime) -> bool {
+        self.acked.is_some() && now >= self.heard_out().after(self.config.ack_wait)
+    }
+
+    /// A length of the response's audio. One the media clock cannot
+    /// hold, about a day, is given as the longest it can.
     fn length(&self, samples: u64) -> MediaDur {
-        self.config
-            .rate
-            .length_of(usize::try_from(samples).unwrap_or(usize::MAX))
+        let ticks = u32::try_from(samples)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(self.tick);
+        MediaDur::from_ticks(ticks)
     }
 
     /// When to call [`poll`](Self::poll) next: the time the next frame is
@@ -390,10 +433,12 @@ impl Playout {
                     self.due().as_nanos().saturating_sub(lead),
                 ))
             }
-            Stage::Playing if self.finished && !self.drained && self.acked.is_none() => {
-                let far = u64::from(self.config.far_buffer.ticks()) * 1_000_000_000 / 48_000;
-                Some(self.due().after(Duration::from_nanos(far)))
-            }
+            Stage::Playing if self.finished && !self.drained => Some(match self.acked {
+                // The far end says what it played, and is given a while
+                // to say that it played the end.
+                Some(_) => self.heard_out().after(self.config.ack_wait),
+                None => self.heard_out(),
+            }),
             Stage::Waiting | Stage::Playing | Stage::Over => None,
         }
     }
@@ -458,14 +503,14 @@ impl Playout {
             Stage::Playing => true,
             Stage::Fading { .. } | Stage::Over => return None,
         };
-        let played = match self.acked {
+        let mut played = match self.acked {
             Some(acked) => acked,
             None if playing => {
                 // What was handed over is heard at its time, less what
                 // the far end still holds.
                 let since = now.since(self.anchor).as_nanos();
                 let since = since * u128::from(self.config.rate.hz()) / 1_000_000_000;
-                let far = self.config.rate.samples_in(self.config.far_buffer) as u64;
+                let far = u64::from(self.config.far_buffer.ticks() / self.tick);
                 self.anchor_at
                     .saturating_add(u64::try_from(since).unwrap_or(u64::MAX))
                     .saturating_sub(far)
@@ -473,7 +518,13 @@ impl Playout {
             None => 0,
         };
         let all_handed = self.finished && self.buffer.is_empty();
-        self.drained = playing && all_handed && played >= self.handed;
+        self.drained = false;
+        if playing && all_handed {
+            if played < self.handed && self.waited_out(now) {
+                played = self.handed;
+            }
+            self.drained = played >= self.handed;
+        }
         self.played = self.played.max(played.min(self.handed));
         let played = self.length(self.played);
         Some(Position {
@@ -1014,7 +1065,9 @@ mod tests {
         let position = deck.position(1_300);
         assert_eq!((position.played, position.heard_text), (ms(120), 0));
         assert!(!position.drained);
-        assert_eq!(deck.playout.wake(), None, "the transport will say");
+        // The last of it was due at 1,200. The transport is given two
+        // seconds from then to say that it was played.
+        assert_eq!(deck.playout.wake(), Some(at(3_200)));
         // What it says does not go back, nor past what it was given.
         deck.playout.ack(TAG, ms(100));
         assert_eq!(deck.position(1_300).played, ms(120));
@@ -1026,6 +1079,107 @@ mod tests {
         // back.
         deck.playout.ack(TAG, ms(50));
         assert!(deck.position(1_300).drained);
+        assert_eq!(deck.playout.wake(), None, "nothing is left to wait for");
+    }
+
+    /// A response of 200 ms with one word, handed over whole from 1,000
+    /// on, to a far end that says what it plays: of this, 120 ms.
+    fn short_of_the_end(config: PlayoutConfig) -> Deck {
+        let mut deck = Deck::with(config);
+        deck.playout.start(TAG, at(1_000)).unwrap();
+        deck.playout.ack(TAG, ms(0));
+        deck.playout.push(TAG, at(1_000), &level(200)).unwrap();
+        deck.playout.mark(TAG, word(9, 150)).unwrap();
+        deck.playout.finish(TAG).unwrap();
+        deck.run(1_000, 1_300);
+        deck.playout.ack(TAG, ms(120));
+        deck
+    }
+
+    #[test]
+    fn a_far_end_that_stops_short_of_the_end_is_not_waited_for_for_ever() {
+        let mut deck = short_of_the_end(PlayoutConfig::new(RATE));
+        // It says no more. Until its time is up, it is believed.
+        assert_eq!(deck.playout.wake(), Some(at(3_200)));
+        let before = deck.position(3_199);
+        assert_eq!(
+            (before.played, before.heard_text, before.drained),
+            (ms(120), 0, false)
+        );
+        assert_eq!(deck.playout.wake(), Some(at(3_200)));
+        // Then the response is taken to have been played to its end.
+        let end = deck.position(3_200);
+        assert_eq!(
+            (end.played, end.heard_text, end.drained),
+            (ms(200), 9, true)
+        );
+        assert_eq!(deck.playout.wake(), None);
+        // What it says afterwards changes nothing.
+        deck.playout.ack(TAG, ms(150));
+        let after = deck.position(3_300);
+        assert_eq!((after.played, after.drained), (ms(200), true));
+    }
+
+    #[test]
+    fn a_runtime_that_calls_when_it_is_asked_to_sees_such_a_response_end() {
+        let mut deck = short_of_the_end(PlayoutConfig::new(RATE));
+        deck.run(1_300, 60_000);
+        assert_eq!(deck.playout.wake(), None);
+        assert!(deck.position(3_200).drained);
+    }
+
+    #[test]
+    fn how_long_a_far_end_is_waited_for_counts_from_when_it_hears_the_end() {
+        let mut deck = short_of_the_end(PlayoutConfig {
+            far_buffer: ms(100),
+            ack_wait: Duration::from_millis(500),
+            ..PlayoutConfig::new(RATE)
+        });
+        // The end is heard at 1,300, with what the far end holds.
+        assert_eq!(deck.playout.wake(), Some(at(1_800)));
+        assert!(!deck.position(1_799).drained);
+        assert!(deck.position(1_800).drained);
+    }
+
+    #[test]
+    fn a_far_end_that_says_it_played_the_end_in_time_is_believed_at_once() {
+        let mut deck = short_of_the_end(PlayoutConfig::new(RATE));
+        deck.playout.ack(TAG, ms(200));
+        let end = deck.position(1_400);
+        assert_eq!((end.played, end.drained), (ms(200), true));
+        assert_eq!(deck.playout.wake(), None);
+    }
+
+    #[test]
+    fn a_far_end_is_waited_for_while_more_of_the_response_may_come() {
+        // The response is not finished: what the far end did not play
+        // of it is not taken as played, however long it takes.
+        let mut deck = Deck::new();
+        deck.playout.start(TAG, at(1_000)).unwrap();
+        deck.playout.ack(TAG, ms(0));
+        deck.playout.push(TAG, at(1_000), &level(200)).unwrap();
+        deck.run(1_000, 1_300);
+        deck.playout.ack(TAG, ms(120));
+        assert_eq!(deck.playout.wake(), None);
+        let late = deck.position(90_000);
+        assert_eq!((late.played, late.drained), (ms(120), false));
+        // Its time runs from when the last of it is heard: the rest
+        // comes late, and is handed over from then on.
+        deck.playout.push(TAG, at(90_000), &level(100)).unwrap();
+        deck.playout.finish(TAG).unwrap();
+        deck.run(90_000, 90_200);
+        assert_eq!(deck.playout.wake(), Some(at(92_100)));
+        assert!(!deck.position(92_099).drained);
+        let end = deck.position(92_100);
+        assert_eq!((end.played, end.drained), (ms(300), true));
+    }
+
+    #[test]
+    fn a_response_that_was_stopped_is_not_played_to_its_end_by_waiting() {
+        let mut deck = short_of_the_end(PlayoutConfig::new(RATE));
+        deck.playout.stop(TAG, 5);
+        assert_eq!(deck.playout.wake(), None);
+        assert_eq!(deck.playout.position(at(10_000)), None);
     }
 
     #[test]

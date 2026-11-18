@@ -392,6 +392,59 @@ async fn a_caller_asks_and_hears_the_whole_answer() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_far_end_that_stays_short_in_what_it_says_it_played_heard_the_end() {
+    // The caller asks, hears the answer out, and asks again.
+    let speech = [
+        (1_000, 2_200, "what time is it please"),
+        (9_000, 10_200, "and tomorrow"),
+    ];
+    let answer = "It is a quarter past nine. Anything else?";
+    let world = World::new(
+        &speech,
+        ScriptedLlm::replies(vec![
+            vec![LlmStep::say(answer)],
+            vec![LlmStep::say("The same.")],
+        ]),
+    );
+    // The far end plays all of each answer, and never says that it
+    // played the last 60 ms of one.
+    let transport = FakeTransport::sound_card()
+        .join(0, CALLER)
+        .microphone(CALLER, 0, 14_000, &talks(&speech))
+        .says_short(60);
+    let mut running = Running::start(&world, transport).await;
+    assert_eq!(running.until(14_000).await, None, "the session goes on");
+    let log = running.far_end.log();
+    let tag = log.frames[0].tag;
+    let length = MediaDur::from_millis(41 * 60);
+    assert_eq!(log.sent(tag), length);
+    assert_eq!(log.heard(tag), MediaDur::from_millis(41 * 60 - 60));
+
+    // The answer is over two seconds after the last of it was heard, and
+    // not when the time a response may take at most has run out: the far
+    // end is given that long to say that it played the end.
+    let over = running
+        .watch
+        .first("generation: Some(GenId(1)), activity: Listening")
+        .unwrap();
+    let heard_out = ms(&log.frames[0]) + 41 * 60;
+    let waited = over - heard_out;
+    assert!((1_950..=2_050).contains(&waited), "{waited} ms");
+    // So what the caller says next stops nothing and cuts nothing off:
+    // both answers were heard whole, and are kept whole.
+    assert_eq!(running.watch.first("Stop {"), None);
+    assert_eq!(log.cleared, []);
+    assert_eq!(
+        running.utterances(),
+        [(answer.to_owned(), false), ("The same.".to_owned(), false)]
+    );
+    assert_eq!(
+        running.session.stats(),
+        waveport_runtime::session::SessionStats::default()
+    );
+}
+
 const STORY: &str = "Of course. Once upon a time there was a ship that sailed all the seas \
                      of the world and never came home.";
 
