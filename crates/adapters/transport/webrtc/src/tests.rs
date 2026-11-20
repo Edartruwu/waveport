@@ -4,6 +4,7 @@ use core::time::Duration;
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
+use str0m::net::Protocol;
 use waveport_adapter_kit::client::{Hello, Welcome, write};
 use waveport_domain::event::Key;
 use waveport_domain::ids::{Epoch, GenId, OpTag};
@@ -12,10 +13,11 @@ use waveport_protocol::client::v1::{ByeReason, ErrorCode, FromClient, FromServer
 
 use crate::call::{Call, Client, Setup, Step, Told, Unanswered};
 use crate::crypto::certificate;
+use crate::dialect::{Dialect, Meant};
 use crate::engine::{AGAIN, TURNS};
 use crate::fragment;
 use crate::loopback::{Pair, Weather};
-use crate::peer::{Like, Offers, PeerHeard, PeerStep};
+use crate::peer::{Like, Offers, Peer, PeerHeard, PeerStep};
 use crate::rtp::forged_check;
 
 const FRAME: Duration = Duration::from_millis(20);
@@ -24,6 +26,7 @@ const FRAME: Duration = Duration::from_millis(20);
 const OFFERS: Offers = Offers {
     like: Like::Chrome,
     speaks: true,
+    opens: None,
     tcp: false,
     dtls13: false,
 };
@@ -867,6 +870,348 @@ fn audio_of(answer: &str) -> (String, Vec<&str>) {
             .any(|what| line.starts_with(what))
     };
     (kinds, answer.lines().filter(about).collect())
+}
+
+/// A protocol that is no protocol: what a far end says in it means the
+/// same text typed, a far end that asks is answered twice, and what it
+/// is told is told in capitals, where it is told at all.
+struct Shouted {
+    /// What it was asked to put into the far end's protocol.
+    asked: std::sync::Arc<std::sync::Mutex<Vec<FromServer>>>,
+}
+
+impl Dialect for Shouted {
+    fn channel(&self) -> &'static str {
+        "chat"
+    }
+
+    fn heard(&mut self, said: &str) -> Meant {
+        match said {
+            "?" => Meant {
+                means: None,
+                answers: vec!["ONE".to_owned(), "TWO".to_owned()],
+            },
+            "stop" => Meant {
+                means: Some(FromClient::Interrupt),
+                answers: Vec::new(),
+            },
+            said => Meant {
+                means: Some(FromClient::Text {
+                    text: said.to_owned(),
+                }),
+                answers: Vec::new(),
+            },
+        }
+    }
+
+    fn told(&mut self, message: &FromServer) -> Vec<String> {
+        self.asked.lock().unwrap().push(message.clone());
+        match message {
+            FromServer::Error { message, .. } => vec![message.to_uppercase()],
+            FromServer::Mark { run, end, .. } => {
+                vec![format!("RUN {run}"), format!("END {end}")]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl Pair {
+    /// A pair that is connected, whose client speaks [`Shouted`] on a
+    /// channel it opened, with what the dialect is asked.
+    fn shouting(like: Like) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<FromServer>>>) {
+        let asked = std::sync::Arc::default();
+        let dialect = Shouted {
+            asked: std::sync::Arc::clone(&asked),
+        };
+        let mut pair = Self::connected_in(like, Box::new(dialect)).unwrap();
+        pair.run_for(Duration::from_millis(50));
+        pair.told.clear();
+        pair.heard.clear();
+        (pair, asked)
+    }
+
+    /// What the client was told on the channel it opened since it was
+    /// last asked.
+    fn heard_text(&mut self) -> Vec<String> {
+        let heard = core::mem::take(&mut self.heard);
+        let mut said = Vec::new();
+        for heard in heard {
+            match heard {
+                PeerHeard::Text(text) => said.push(text),
+                other => self.heard.push(other),
+            }
+        }
+        said
+    }
+
+    /// The client says `text` on the channel it opened, and a moment
+    /// goes by.
+    fn client_writes(&mut self, text: &str) {
+        assert!(self.peer.say_raw(false, text.as_bytes()));
+        self.run_for(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_far_end_that_speaks_another_protocol_is_heard_and_told_in_it() {
+    for like in [Like::Chrome, Like::Firefox] {
+        let (mut pair, asked) = Pair::shouting(like);
+        assert_eq!(pair.call.client(), Client::Other);
+        // What it says is what the dialect says it means, and is dealt
+        // with as if it had said that.
+        pair.client_writes("what time is it");
+        pair.client_writes("stop");
+        let text = "what time is it".to_owned();
+        assert_eq!(
+            pair.told,
+            [
+                Told::Said(FromClient::Text { text }),
+                Told::Said(FromClient::Interrupt)
+            ],
+            "{like:?}"
+        );
+        // What the dialect answers by itself is said back, in order,
+        // and means nothing to anybody else.
+        pair.told.clear();
+        pair.client_writes("?");
+        assert_eq!(pair.heard_text(), ["ONE", "TWO"]);
+        assert_eq!(pair.told, []);
+        // What is no text is nothing in a protocol that is written,
+        // and the dialect is not asked about it.
+        assert!(pair.peer.say_raw(true, b"what time is it"));
+        pair.run_for(Duration::from_millis(5));
+        assert_eq!(pair.told, []);
+        // What the far end is told is told as the dialect says it: in
+        // one message, in several, or not at all.
+        let code = ErrorCode::Busy;
+        let message = "too much is waiting".to_owned();
+        assert!(pair.call.tell(&FromServer::Error { code, message }));
+        let reason = ByeReason::GoingAway;
+        assert!(pair.call.tell(&FromServer::Bye { reason }));
+        pair.run_for(Duration::from_millis(5));
+        assert_eq!(pair.heard_text(), ["TOO MUCH IS WAITING"]);
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        assert!(pair.call.has_told_all());
+    }
+}
+
+#[test]
+fn a_far_end_that_speaks_another_protocol_is_told_of_responses_and_counts_nothing() {
+    let (mut pair, asked) = Pair::shouting(Like::Chrome);
+    for n in 0..3 {
+        pair.server_sends(tag(1), n, n == 2);
+    }
+    pair.run_for(Duration::from_millis(40));
+    // Where a response begins and that it was sent whole is the
+    // dialect's to say or not.
+    assert_eq!(
+        pair.heard_text(),
+        ["RUN 0", "END false", "RUN 0", "END true"]
+    );
+    assert_eq!(pair.heard_audio().len(), 3);
+    let marks = asked.lock().unwrap().clone();
+    assert!(
+        matches!(
+            marks[..],
+            [
+                FromServer::Mark {
+                    run: 0,
+                    generation: 1,
+                    end: false,
+                    ts: Some(_)
+                },
+                FromServer::Mark {
+                    run: 0,
+                    generation: 1,
+                    end: true,
+                    ts: Some(_)
+                },
+            ]
+        ),
+        "{marks:?}"
+    );
+    // Such a far end does not say what it has played, and nothing is
+    // taken as played for it: its session goes by the pace.
+    assert_eq!(pair.told, []);
+    // And nothing it holds is discarded for it: the dialect is asked,
+    // and says nothing.
+    pair.call.clear(&mut pair.runs, tag(1));
+    pair.run_for(Duration::from_millis(5));
+    assert_eq!(pair.heard_text(), Vec::<String>::new());
+}
+
+#[test]
+fn what_is_told_before_a_far_end_has_opened_its_channel_waits_for_it() {
+    let asked = std::sync::Arc::default();
+    let dialect = Shouted { asked };
+    let offers = Offers {
+        speaks: false,
+        opens: Some("chat"),
+        ..OFFERS
+    };
+    let now = std::time::Instant::now();
+    let certificate = certificate().unwrap();
+    let client: SocketAddr = "192.0.2.20:50000".parse().unwrap();
+    let server: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+    let (mut peer, offer) = Peer::offer(&certificate, offers, client, now).unwrap();
+    let setup = Setup {
+        certificate: &certificate,
+        dtls13: false,
+        client: Client::Other,
+        udp: Some(server),
+        tcp: None,
+    };
+    // One that is said to speak another protocol, and nothing says
+    // which, is not answered.
+    assert_eq!(
+        Call::answer(&setup, &offer, now).unwrap_err(),
+        Unanswered::NoDialect
+    );
+    let (mut call, answer) = Call::answer_in(&setup, &offer, now, Box::new(dialect)).unwrap();
+    assert!(peer.answered(&answer));
+    // Nothing is connected, and the far end is told something already.
+    let code = ErrorCode::Busy;
+    for n in 0..3 {
+        let message = format!("early {n}");
+        assert!(call.tell(&FromServer::Error { code, message }));
+    }
+    assert!(!call.has_told_all());
+    // The two ends are carried to each other until both are quiet.
+    let mut heard = Vec::new();
+    let mut now = now;
+    for _ in 0..400 {
+        loop {
+            match call.poll(now) {
+                Step::Send(transmit) => {
+                    peer.receive(now, Protocol::Udp, server, client, &transmit.contents);
+                }
+                Step::Told(_) => {}
+                Step::Wait(_) => break,
+            }
+        }
+        loop {
+            match peer.poll(now) {
+                PeerStep::Send(transmit) => {
+                    call.receive(now, Protocol::Udp, client, server, &transmit.contents);
+                }
+                PeerStep::Told(PeerHeard::Text(text)) => heard.push(text),
+                PeerStep::Told(_) => {}
+                PeerStep::Wait(_) => break,
+            }
+        }
+        now += Duration::from_millis(5);
+    }
+    assert_eq!(heard, ["EARLY 0", "EARLY 1", "EARLY 2"]);
+    assert!(call.has_told_all());
+}
+
+#[test]
+fn the_first_channel_of_its_name_is_the_one_a_far_end_is_spoken_with_on() {
+    let (mut pair, _asked) = Pair::shouting(Like::Chrome);
+    // The far end opens another channel of the same name, and others.
+    pair.peer.opens_another("chat");
+    pair.peer.opens_another("else");
+    pair.run_for(Duration::from_millis(50));
+    // What it says where it said it before is heard as before, and
+    // what it is told is told there.
+    pair.client_writes("what time is it");
+    let text = "what time is it".to_owned();
+    assert_eq!(pair.told, [Told::Said(FromClient::Text { text })]);
+    pair.client_writes("?");
+    assert_eq!(pair.heard_text(), ["ONE", "TWO"]);
+}
+
+#[test]
+fn a_channel_of_another_name_than_the_dialects_is_not_read() {
+    struct Elsewhere(Shouted);
+    impl Dialect for Elsewhere {
+        fn channel(&self) -> &'static str {
+            "elsewhere"
+        }
+        fn heard(&mut self, said: &str) -> Meant {
+            self.0.heard(said)
+        }
+        fn told(&mut self, message: &FromServer) -> Vec<String> {
+            self.0.told(message)
+        }
+    }
+    let asked = std::sync::Arc::default();
+    let dialect = Elsewhere(Shouted { asked });
+    let offers = Offers {
+        speaks: false,
+        opens: Some("chat"),
+        ..OFFERS
+    };
+    let begun = Pair::begun_with(offers, Client::Other, Weather::default(), false, {
+        let dialect: Box<dyn Dialect> = Box::new(dialect);
+        Some(dialect)
+    });
+    let mut pair = begun.and_then(Pair::connects).unwrap();
+    pair.run_for(Duration::from_millis(50));
+    pair.told.clear();
+    pair.heard.clear();
+    pair.client_writes("what time is it");
+    assert_eq!(pair.told, []);
+    // And nothing is said on it: what the far end is told waits for
+    // the channel it was to open.
+    let code = ErrorCode::Busy;
+    let message = "too much is waiting".to_owned();
+    assert!(pair.call.tell(&FromServer::Error { code, message }));
+    pair.run_for(Duration::from_millis(20));
+    assert_eq!(pair.heard_text(), Vec::<String>::new());
+    assert!(!pair.call.has_told_all());
+}
+
+#[test]
+fn what_the_stock_client_of_another_server_offers_is_answered() {
+    let certificate = certificate().unwrap();
+    let setup = Setup {
+        certificate: &certificate,
+        dtls13: false,
+        client: Client::Other,
+        udp: Some("192.0.2.10:40000".parse().unwrap()),
+        tcp: None,
+    };
+    let now = std::time::Instant::now();
+    for (offer, audio) in [
+        ("pipecat-chrome.sdp", "63 111 110"),
+        ("pipecat-firefox.sdp", "109 101"),
+    ] {
+        let asked = std::sync::Arc::default();
+        let dialect = Box::new(Shouted { asked });
+        let (_, answer) = Call::answer_in(&setup, &fixture(offer), now, dialect).unwrap();
+        // Its audio is taken, as a browser's is.
+        assert_eq!(audio_of(&answer).0, audio, "{offer}");
+        // Its two lines of video are refused, each in its place, and
+        // nothing is said of what they would carry.
+        let lines: Vec<&str> = answer
+            .lines()
+            .filter(|line| line.starts_with("m="))
+            .collect();
+        assert_eq!(lines.len(), 4, "{offer}: {lines:?}");
+        assert!(lines[0].starts_with("m=audio 9 "), "{offer}: {lines:?}");
+        assert!(lines[1].starts_with("m=video 0 "), "{offer}: {lines:?}");
+        assert!(lines[2].starts_with("m=video 0 "), "{offer}: {lines:?}");
+        assert_eq!(lines[3], "m=application 9 UDP/DTLS/SCTP webrtc-datachannel");
+        // The call is the audio and the channel, and they share what
+        // carries them.
+        assert!(answer.contains("a=group:BUNDLE 0 3\r\n"), "{offer}");
+        assert!(answer.contains("a=ice-lite\r\n"));
+        // A line that is refused names no kind of video: nothing of
+        // what was offered for it is taken.
+        assert_eq!(lines[1], "m=video 0 UDP/TLS/RTP/SAVPF 0", "{offer}");
+        assert!(!answer.contains("a=rtpmap:96 "), "{offer}");
+    }
+    // Without a channel there is nothing to speak a protocol on.
+    let no_channel = fixture("chrome.sdp").replace("BUNDLE 0 1", "BUNDLE 0");
+    let no_channel = no_channel.split("m=application").next().unwrap();
+    let asked = std::sync::Arc::default();
+    let dialect = Box::new(Shouted { asked });
+    assert_eq!(
+        Call::answer_in(&setup, no_channel, now, dialect).unwrap_err(),
+        Unanswered::NoChannel
+    );
 }
 
 #[test]

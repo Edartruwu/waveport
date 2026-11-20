@@ -1,0 +1,19 @@
+{
+  "name": "waveport-pipecat-stock",
+  "version": "0.0.0",
+  "description": "The stock Pipecat client on a page, which the daemon's RTVI gateway is held against. A test, and nothing that is shipped.",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "browser": "node test/run.js --daemon ../../target/debug/examples/stand_in"
+  },
+  "devDependencies": {
+    "@pipecat-ai/client-js": "1.16.0",
+    "@pipecat-ai/small-webrtc-transport": "1.11.2",
+    "esbuild": "0.28.2"
+  }
+}

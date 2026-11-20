@@ -54,6 +54,7 @@ Waveport follows a ports-and-adapters design with a domain-driven core. Dependen
 | `crates/testing/waveport-testkit` | Fakes of every port, and the checks every implementation of a port has to pass |
 | `benches/` | Wall-clock and instruction-count benchmarks |
 | `sdks/js` | The client for a page in a browser, and the page a daemon serves to try its agents on |
+| `sdks/pipecat-stock` | Not a client of ours: the stock client of Pipecat's on a page, which the daemon is held against in a browser |
 | `xtask/` | The repository's gates, run as `cargo xtask <command>` |
 | `assets/` | The lock file that pins model files; `cargo xtask fetch-assets` downloads them |
 | `perf/` | What the performance gates hold the code to (`targets.toml`), the record of a machine (`baselines/`), and what the density spike measured (`spike/`) |
@@ -234,6 +235,17 @@ secret_env = "TURN_SECRET"    # the secret the TURN server shares: each far end 
 ```
 
 A far end posts its offer to `/v1/webrtc` with the client token of its session, as WHIP has it, and is answered with the answer and where its call is. It then says hello on the data channel of the call, as it would on a WebSocket, and comes back with another call when its call drops. `waveport client --webrtc --agent front-desk` is such a far end, from this machine's microphone or from a script. The daemon answers the checks of a far end and makes none, so `udp` has to be reached from wherever its callers are. The client for a page (`sdks/js`) makes its spoken calls this way, and over a WebSocket where no call gets through: a headless Chrome on the daemon's page does in every test run, and a Firefox did when it was run by hand. **Firefox makes no call to `127.0.0.1`**: to be called by one from the same machine, a daemon takes its calls at the address the machine has on its network. Safari has not been tried.
+
+**From an application written for Pipecat's client.** A daemon that answers calls over WebRTC also answers what Pipecat's JavaScript client asks of a Pipecat server, and speaks that client's protocol (RTVI 2.3.0) on the call. An application built on `@pipecat-ai/client-js` with its `SmallWebRTC` transport calls an agent by being given the daemon's address:
+
+```js
+const client = new PipecatClient({ transport: new SmallWebRTCTransport(), enableMic: true });
+await client.connect({ webrtcRequestParams: { endpoint: "http://127.0.0.1:7070/api/offer?agent=front-desk" } });
+// or, for an application that has its bot started first:
+await client.startBotAndConnect({ endpoint: "http://127.0.0.1:7070/start?agent=front-desk" });
+```
+
+The page such an application is served from is named in the daemon's file (`allowed_origins`), or it may ask nothing. A daemon with a control key makes a session for whoever says the key, which is for a server and not for a page: the application's server asks for the session (`POST /v1/sessions`) and gives its page the client token, which the page says as `headers` (`Authorization: Bearer`) with what it asks. The client is told who speaks, what is recognised, what the agent says as it goes out and as it is heard, tool calls by their name, and when its bot has left; `sendText`, `sendDTMF` and `disconnectBot` do what they say, and a client whose network failed is back on its session with its next call. Everything else of RTVI is refused by the id of the message, and [decision 0006](docs/decisions/0006-rtvi-gateway.md) says which. Such a client does not say what it played, so what its listener heard is estimated, as on a telephone, and it has no call that resumes and no other way when none gets through: those are what the client of ours is for. The stock client is on whole sessions with the daemon in a headless Chrome in every test run, at the versions [`sdks/pipecat-stock`](sdks/pipecat-stock/README.md) names, and every night at the newest. **No application that anybody wrote has been pointed at a daemon, and Pipecat's clients for phones have not been tried.**
 
 It serves HTTP without TLS, and is to stand behind something that ends TLS. `waveportd --config <file> --check` reads a file and says what is wrong with it.
 

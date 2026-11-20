@@ -18,6 +18,7 @@ use waveport_domain::ids::{Epoch, GenId, OpTag};
 
 use crate::call::{Call, Client, Setup, Step, Told};
 use crate::crypto::certificate;
+use crate::dialect::Dialect;
 use crate::peer::{Like, Offers, Peer, PeerHeard, PeerStep};
 
 /// Where the two ends are, in the ranges that are set aside for
@@ -153,10 +154,32 @@ impl Pair {
         let offers = Offers {
             like,
             speaks: client == Client::V1,
+            opens: None,
             tcp: false,
             dtls13: false,
         };
         Self::begun_as(offers, client, weather, false)
+    }
+
+    /// Two ends that are connected, of which the client speaks
+    /// `dialect` on a data channel it opens itself.
+    #[cfg(test)]
+    pub(crate) fn connected_in(like: Like, dialect: Box<dyn Dialect>) -> Option<Self> {
+        let offers = Offers {
+            like,
+            speaks: false,
+            opens: Some(dialect.channel()),
+            tcp: false,
+            dtls13: false,
+        };
+        Self::begun_with(
+            offers,
+            Client::Other,
+            Weather::default(),
+            false,
+            Some(dialect),
+        )?
+        .connects()
     }
 
     /// As [`begun`](Self::begun), with all that the client offers, and
@@ -166,6 +189,16 @@ impl Pair {
         client: Client,
         weather: Weather,
         server13: bool,
+    ) -> Option<Self> {
+        Self::begun_with(offers, client, weather, server13, None)
+    }
+
+    pub(crate) fn begun_with(
+        offers: Offers,
+        client: Client,
+        weather: Weather,
+        server13: bool,
+        dialect: Option<Box<dyn Dialect>>,
     ) -> Option<Self> {
         let now = Instant::now();
         let (mut peer, offer) = Peer::offer(&certificate()?, offers, CLIENT, now)?;
@@ -177,7 +210,10 @@ impl Pair {
             udp: Some(SERVER),
             tcp: None,
         };
-        let (call, answer) = Call::answer(&setup, &offer, now).ok()?;
+        let (call, answer) = match dialect {
+            Some(dialect) => Call::answer_in(&setup, &offer, now, dialect).ok()?,
+            None => Call::answer(&setup, &offer, now).ok()?,
+        };
         if !peer.answered(&answer) {
             return None;
         }

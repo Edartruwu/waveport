@@ -231,7 +231,10 @@ impl Knock {
         let client = live.line.core.client();
         let mut up = false;
         let mut hello = None;
-        while !(up && (client == Client::Plain || hello.is_some())) {
+        // Only a client that speaks the protocol says hello. One that
+        // speaks another says what it says to whoever it is attached
+        // to.
+        while !(up && (client != Client::V1 || hello.is_some())) {
             let next = tokio::time::timeout_at(by, next(&mut live)).await;
             let Ok(next) = next else {
                 let why = if up {
@@ -266,7 +269,7 @@ impl Knock {
                         "the call ended before the far end was there",
                     ));
                 }
-                Heard::Told(Told::Said(said)) => said,
+                Heard::Told(Told::Said(said)) if client == Client::V1 => said,
                 // What it says and plays before there is a session to
                 // hear it is not kept.
                 Heard::Told(_) => continue,
@@ -616,7 +619,8 @@ fn samples_in(length: waveport_domain::time::MediaDur) -> u32 {
 impl Transport for RtcTransport {
     fn caps(&self) -> TransportCaps {
         // Only a client that speaks the protocol is told to discard
-        // what it holds, and says what it has played.
+        // what it holds, and says what it has played. One that speaks
+        // another protocol can still write and be written to.
         let told = self.client == Client::V1;
         TransportCaps {
             audio: Some(AudioCaps {
@@ -627,7 +631,7 @@ impl Transport for RtcTransport {
                     reports_played: told,
                 },
             }),
-            text: told,
+            text: self.client != Client::Plain,
             keys: Some(if self.keys {
                 KeysOut::OutOfBand
             } else {
@@ -875,7 +879,18 @@ impl Far {
                                 events.send(TransportEvent::Detached).await;
                             }
                         }
-                        After::Left => break End::Left,
+                        After::Left => {
+                            // One that speaks a protocol of its own may
+                            // have been answered in it as it said
+                            // goodbye, and has that answer before its
+                            // call is ended.
+                            if self.client == Client::Other
+                                && let Some(there) = here.take()
+                            {
+                                there.live.last_words().await;
+                            }
+                            break End::Left;
+                        }
                     }
                 }
             }
@@ -1014,11 +1029,12 @@ impl Far {
             Told::Played { tag, played } => TransportEvent::Played { tag, played },
             Told::Lost(percent) => TransportEvent::Loss { percent },
             Told::Said(said) => return self.hear(here, said, events).await,
-            // A client that speaks the protocol and did not say goodbye
-            // may come back on another call. Any other has hung up.
+            // A client that speaks a protocol and did not say goodbye
+            // in it may come back on another call. Any other has hung
+            // up.
             Told::Over => {
                 return match self.client {
-                    Client::V1 => After::Dropped,
+                    Client::V1 | Client::Other => After::Dropped,
                     Client::Plain => After::Left,
                 };
             }
@@ -1128,7 +1144,8 @@ mod tests {
 
     use super::{Caller, Handle, Link, RtcTransport, Signals};
     use crate::call::Client;
-    use crate::dial::{Dialer, Heard, Unconnected};
+    use crate::dial::{Dialer, Heard, Strange, Stranger, Unconnected};
+    use crate::dialect::{Dialect, Meant};
     use crate::endpoint::{Config, Endpoint};
     use crate::net::now;
     use crate::peer::{Like, PeerHeard};
@@ -1554,6 +1571,228 @@ mod tests {
         let (welcomed, said) = meanwhile(&mut transport, again).await;
         welcomed.unwrap().unwrap();
         assert_eq!(said, []);
+    }
+
+    /// A protocol of a few words, for a far end that speaks another
+    /// than the protocol.
+    struct FewWords;
+
+    impl Dialect for FewWords {
+        fn channel(&self) -> &'static str {
+            "chat"
+        }
+
+        fn heard(&mut self, said: &str) -> Meant {
+            let means = match said {
+                "stop" => Some(FromClient::Interrupt),
+                "bye" => Some(FromClient::Bye),
+                "ready?" => None,
+                text => Some(FromClient::Text {
+                    text: text.to_owned(),
+                }),
+            };
+            let answers = match said {
+                "ready?" => vec!["ready".to_owned()],
+                "bye" => vec!["farewell".to_owned()],
+                _ => Vec::new(),
+            };
+            Meant { means, answers }
+        }
+
+        fn told(&mut self, message: &FromServer) -> Vec<String> {
+            match message {
+                FromServer::Welcome { session, .. } => vec![format!("welcome to {session}")],
+                FromServer::Error { message, .. } => vec![format!("no: {message}")],
+                FromServer::Bye { reason } => vec![format!("goodbye: {reason:?}")],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_far_end_that_speaks_another_protocol_is_on_a_transport_as_a_client_is() {
+        let endpoint = endpoint().await;
+        let local = "127.0.0.1:0".parse().unwrap();
+        let offered = Dialer::offer_as_a_stranger(Like::Chrome, local, false, "chat").await;
+        let (dialing, offer) = offered.unwrap();
+        let answered = endpoint.offer_in(&offer, Box::new(FewWords)).unwrap();
+        let answer = answered.answer;
+        let far = tokio::spawn(async move { dialing.opened(&answer, SOON).await });
+        // It is there with no hello: it says none.
+        let caller = answered.knock.connect(SOON).await.unwrap();
+        assert_eq!(caller.client(), Client::Other);
+        assert!(caller.hello().is_none());
+        let (mut transport, handle) = caller.transport(CALLER);
+        // It writes and is written to. It does not say what it has
+        // played, and nothing it holds is discarded for it.
+        let caps = transport.caps();
+        assert!(caps.text);
+        let buffer = caps.audio.unwrap().remote_buffer;
+        assert!(!buffer.clearable && !buffer.reports_played);
+        let mut link = handle.attach(caller, welcome()).await.unwrap();
+        let joined = TransportEvent::Joined { who: CALLER };
+        assert_eq!(says(&mut transport, 1).await, [joined]);
+        let (stranger, said) = meanwhile(&mut transport, far).await;
+        let mut stranger = stranger.unwrap().unwrap();
+        assert_eq!(said, []);
+        // What it is told it is told in what it speaks: the welcome,
+        // and what whoever is attached to it says of the session.
+        let refused = FromServer::Error {
+            code: ErrorCode::Busy,
+            message: "not now".to_owned(),
+        };
+        link.tell(refused).await.unwrap();
+        let mut heard = Vec::new();
+        while heard.len() < 2 {
+            let (next, _) = meanwhile(&mut transport, stranger.next()).await;
+            heard.push(next.unwrap());
+        }
+        let text = |text: &str| Strange::Text(text.to_owned());
+        assert_eq!(heard, [text("welcome to s-7"), text("no: not now")]);
+        // What it asks of whoever speaks its protocol is answered by
+        // that, and is nothing to the session.
+        stranger.say("ready?").unwrap();
+        let (next, said) = meanwhile(&mut transport, stranger.next()).await;
+        assert_eq!(next, Some(text("ready")));
+        assert_eq!(said, []);
+        // What it writes is written to the session, and what a
+        // transport cannot do for it is asked of whoever is attached.
+        stranger.say("what time is it").unwrap();
+        stranger.say("stop").unwrap();
+        let (asked, said) = meanwhile(&mut transport, link.asked()).await;
+        assert_eq!(asked, Some(FromClient::Interrupt));
+        let written = TransportEvent::Text {
+            who: CALLER,
+            text: "what time is it".to_owned(),
+        };
+        assert_eq!(said, [written]);
+        // A page that is closed has not said goodbye: its session
+        // waits for it, as for a client whose call dropped.
+        stranger.hang_up();
+        assert_eq!(says(&mut transport, 1).await, [TransportEvent::Detached]);
+        assert!(!handle.is_over());
+    }
+
+    /// A far end that speaks [`FewWords`] on the transport of its
+    /// session, welcomed.
+    async fn a_stranger_on_a_call(
+        endpoint: &Endpoint,
+        like: Like,
+    ) -> (RtcTransport, Handle, Link, Stranger) {
+        let local = "127.0.0.1:0".parse().unwrap();
+        let offered = Dialer::offer_as_a_stranger(like, local, false, "chat").await;
+        let (dialing, offer) = offered.unwrap();
+        let answered = endpoint.offer_in(&offer, Box::new(FewWords)).unwrap();
+        let answer = answered.answer;
+        let far = tokio::spawn(async move { dialing.opened(&answer, SOON).await });
+        let caller = answered.knock.connect(SOON).await.unwrap();
+        let (mut transport, handle) = caller.transport(CALLER);
+        let link = handle.attach(caller, welcome()).await.unwrap();
+        let joined = TransportEvent::Joined { who: CALLER };
+        assert_eq!(says(&mut transport, 1).await, [joined]);
+        let (stranger, _) = meanwhile(&mut transport, far).await;
+        let mut stranger = stranger.unwrap().unwrap();
+        let (welcomed, _) = meanwhile(&mut transport, stranger.next()).await;
+        assert_eq!(welcomed, Some(Strange::Text("welcome to s-7".to_owned())));
+        (transport, handle, link, stranger)
+    }
+
+    /// What a far end hears until its call is over.
+    async fn hears_to_the_end(stranger: &mut Stranger) -> Vec<Strange> {
+        let mut heard = Vec::new();
+        let over = async {
+            while let Some(next) = stranger.next().await {
+                heard.push(next);
+            }
+        };
+        tokio::time::timeout(SOON, over).await.unwrap();
+        heard
+    }
+
+    #[tokio::test]
+    async fn a_far_end_that_speaks_another_protocol_is_told_goodbye_in_it() {
+        let endpoint = endpoint().await;
+        let text = |text: &str| Strange::Text(text.to_owned());
+        // The session is over: it closes its transport, and whoever
+        // told the far end of it has nothing more to tell.
+        let (mut transport, _handle, link, mut stranger) =
+            a_stranger_on_a_call(&endpoint, Like::Chrome).await;
+        let closed = async {
+            poll_fn(|cx| transport.poll_close(cx)).await;
+            drop(link);
+        };
+        let ((), heard) = tokio::join!(closed, hears_to_the_end(&mut stranger));
+        assert_eq!(heard, [text("goodbye: Ended")]);
+        // Whoever tells it of its session says goodbye for the session:
+        // the daemon is going away.
+        let (mut transport, _handle, link, mut stranger) =
+            a_stranger_on_a_call(&endpoint, Like::Firefox).await;
+        let reason = ByeReason::GoingAway;
+        link.tell(FromServer::Bye { reason }).await.unwrap();
+        let (heard, _) = meanwhile(&mut transport, hears_to_the_end(&mut stranger)).await;
+        assert_eq!(heard, [text("goodbye: GoingAway")]);
+        // Another far end takes its place.
+        let (mut transport, handle, _link, mut first) =
+            a_stranger_on_a_call(&endpoint, Like::Chrome).await;
+        let local = "127.0.0.1:0".parse().unwrap();
+        let offered = Dialer::offer_as_a_stranger(Like::Chrome, local, false, "chat").await;
+        let (dialing, offer) = offered.unwrap();
+        let answered = endpoint.offer_in(&offer, Box::new(FewWords)).unwrap();
+        let answer = answered.answer;
+        let second = tokio::spawn(async move { dialing.opened(&answer, SOON).await });
+        let caller = answered.knock.connect(SOON).await.unwrap();
+        let _link = handle.attach(caller, welcome()).await.unwrap();
+        let (heard, _) = meanwhile(&mut transport, hears_to_the_end(&mut first)).await;
+        assert_eq!(heard, [text("goodbye: Replaced")]);
+        second.abort();
+    }
+
+    #[tokio::test]
+    async fn a_far_end_that_says_goodbye_in_another_protocol_has_left() {
+        let endpoint = endpoint().await;
+        let local = "127.0.0.1:0".parse().unwrap();
+        let offered = Dialer::offer_as_a_stranger(Like::Firefox, local, false, "chat").await;
+        let (dialing, offer) = offered.unwrap();
+        let answered = endpoint.offer_in(&offer, Box::new(FewWords)).unwrap();
+        let answer = answered.answer;
+        let far = tokio::spawn(async move { dialing.opened(&answer, SOON).await });
+        let caller = answered.knock.connect(SOON).await.unwrap();
+        let (mut transport, handle) = caller.transport(CALLER);
+        let _link = handle.attach(caller, welcome()).await.unwrap();
+        let joined = TransportEvent::Joined { who: CALLER };
+        assert_eq!(says(&mut transport, 1).await, [joined]);
+        let (stranger, _) = meanwhile(&mut transport, far).await;
+        let mut stranger = stranger.unwrap().unwrap();
+        stranger.say("bye").unwrap();
+        let left = TransportEvent::Left { who: CALLER };
+        let said = says(&mut transport, 2).await;
+        assert_eq!(said.first(), Some(&left), "{said:?}");
+        // Its call is ended for it, once it has what it was answered:
+        // that is how it knows this from a network that failed.
+        let heard = hears_to_the_end(&mut stranger).await;
+        let answered = Strange::Text("farewell".to_owned());
+        assert!(heard.contains(&answered), "{heard:?}");
+    }
+
+    #[tokio::test]
+    async fn a_far_end_that_says_goodbye_in_another_protocol_is_given_a_moment_for_its_answer() {
+        let endpoint = endpoint().await;
+        let (mut transport, _handle, _link, mut stranger) =
+            a_stranger_on_a_call(&endpoint, Like::Chrome).await;
+        // It says goodbye and is gone with that word: nothing says
+        // that what it was answered arrived. An answer that was lost
+        // is sent again for as long as the call is served, so the call
+        // is served a moment longer, and then the far end has left.
+        stranger.say("bye").unwrap();
+        stranger.drop_line();
+        let since = now();
+        let left = TransportEvent::Left { who: CALLER };
+        assert_eq!(says(&mut transport, 1).await, [left]);
+        let took = since.elapsed();
+        assert!(
+            (Duration::from_millis(250)..Duration::from_secs(2)).contains(&took),
+            "{took:?}"
+        );
     }
 
     #[tokio::test]

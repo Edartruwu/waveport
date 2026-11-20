@@ -136,6 +136,38 @@ jobs:
       - run: rustup toolchain install
       - run: cargo test --release --locked -p waveport-benches --test memory -- --ignored
 
+  # The stock client of Pipecat's at its newest, on a page in a browser,
+  # against the daemon as it is: pull requests hold the daemon to the
+  # versions the lock file names, and this says when the client has moved
+  # on from them. "Newest" is the newest that is a week old, as with
+  # everything that is installed here (`sdks/pipecat-stock/.npmrc`). The
+  # run prints the versions it had.
+  pipecat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci
+        working-directory: sdks/pipecat-stock
+      - run: npm install --no-save --no-package-lock @pipecat-ai/client-js@latest @pipecat-ai/small-webrtc-transport@latest
+        working-directory: sdks/pipecat-stock
+      - run: cargo build --locked -p waveportd --example stand_in
+      # The models that listen: see the `test` job of `ci.yml`.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/assets
+          key: assets-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('assets/assets.lock.toml') }}
+      - run: cargo xtask fetch-assets
+      - run: node test/run.js --daemon ../../target/debug/examples/stand_in
+        working-directory: sdks/pipecat-stock
+
   # How much of a thread a session takes: fifty calls on one shard of the
   # runtime, in real time. A share of a thread says as much about the
   # runner as about the code, so it is divided by what a piece of

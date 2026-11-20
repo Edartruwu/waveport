@@ -44,7 +44,7 @@ use waveport_ports::journal::SessionId;
 use waveport_protocol::client::v1::{CLIENT_TOKEN, ErrorCode, RESUME_TOKEN};
 use waveport_protocol::control::v1::Problem;
 use waveport_transport_webrtc::{
-    Answered, BindError, Client, Endpoint, Knock, Signals, Unanswered, fragment,
+    Answered, BindError, Client, Dialect, Endpoint, Knock, Signals, Unanswered, fragment,
 };
 
 use crate::auth::{digest, same};
@@ -52,6 +52,7 @@ use crate::config;
 use crate::daemon::{Shared, failed, raised};
 use crate::http::{Refused, bearer, not_admitted, problem, said};
 use crate::line::{self, Caller};
+use crate::pipecat;
 
 /// What an offer is, and an answer.
 const SDP: &str = "application/sdp";
@@ -82,6 +83,13 @@ enum KnownAs {
         username: String,
         credential: Secret,
     },
+}
+
+/// Who a far end says it is to a server, as it is told to say it.
+enum SaidAs {
+    Nobody,
+    /// A name and a password.
+    Somebody(String, String),
 }
 
 /// What is put between the quotes of a parameter of a header.
@@ -137,11 +145,11 @@ impl Server {
         })
     }
 
-    /// What a far end of `session` is told of the server at `now`: a
-    /// `Link` for each of its addresses (RFC 9725, section 4.6).
-    fn links(&self, session: SessionId, now: SystemTime) -> Vec<HeaderValue> {
-        let who = match &self.known_as {
-            KnownAs::Nobody => String::new(),
+    /// Who a far end of `session` says it is to the server at `now`.
+    /// Nothing where a name and a password could not be made.
+    fn said_as(&self, session: SessionId, now: SystemTime) -> Option<SaidAs> {
+        match &self.known_as {
+            KnownAs::Nobody => Some(SaidAs::Nobody),
             KnownAs::Made { secret, good_for } => {
                 // A name that says until when it is good, and whose it
                 // is, and a password that only whoever holds the secret
@@ -151,21 +159,32 @@ impl Server {
                     .and_then(|until| until.duration_since(UNIX_EPOCH).ok())
                     .map_or(0, |until| until.as_secs());
                 let username = format!("{until}:{session}");
-                let Ok(mut mac) = Hmac::<sha1::Sha1>::new_from_slice(secret.expose().as_bytes())
-                else {
-                    return Vec::new();
-                };
+                let mut mac =
+                    Hmac::<sha1::Sha1>::new_from_slice(secret.expose().as_bytes()).ok()?;
                 mac.update(username.as_bytes());
                 let credential = STANDARD.encode(mac.finalize().into_bytes());
-                format!("; username=\"{username}\"; credential=\"{credential}\"")
+                Some(SaidAs::Somebody(username, credential))
             }
             KnownAs::Fixed {
                 username,
                 credential,
-            } => format!(
+            } => Some(SaidAs::Somebody(
+                username.clone(),
+                credential.expose().to_owned(),
+            )),
+        }
+    }
+
+    /// What a far end of `session` is told of the server at `now`: a
+    /// `Link` for each of its addresses (RFC 9725, section 4.6).
+    fn links(&self, session: SessionId, now: SystemTime) -> Vec<HeaderValue> {
+        let who = match self.said_as(session, now) {
+            None => return Vec::new(),
+            Some(SaidAs::Nobody) => String::new(),
+            Some(SaidAs::Somebody(username, credential)) => format!(
                 "; username=\"{}\"; credential=\"{}\"",
-                quoted(username),
-                quoted(credential.expose())
+                quoted(&username),
+                quoted(&credential)
             ),
         };
         self.urls
@@ -181,13 +200,24 @@ impl Server {
     }
 }
 
+/// A server, as a far end is told of it where it is told in JSON: what
+/// a browser takes for one of its `iceServers`.
+#[derive(serde::Serialize)]
+pub(crate) struct IceServer {
+    urls: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
+}
+
 /// A call, from its offer to its end.
-struct Held {
+pub(crate) struct Held {
     /// Whoever made the offer, as the hash of the token they said.
     by: [u8; 32],
-    session: SessionId,
+    pub(crate) session: SessionId,
     /// What the far end says of the call here reaches it through this.
-    signals: Signals,
+    pub(crate) signals: Signals,
     /// Which of the call's rounds of checks this is, from one.
     round: u64,
     /// The offer of the call, with the checks of this round.
@@ -206,6 +236,8 @@ pub(crate) struct Webrtc {
     setting_up: usize,
     there_within: Duration,
     calls: Mutex<HashMap<String, Held>>,
+    /// What the clients of Pipecat's are known by.
+    pub(crate) pipecat: pipecat::Known,
     /// Whether what carries datagrams to their calls is gone.
     deaf: Arc<AtomicBool>,
     pump: JoinHandle<()>,
@@ -219,7 +251,7 @@ impl Drop for Webrtc {
 
 /// The name of a new call: nothing that can be guessed, since whoever
 /// names a call may ask about it.
-fn name() -> Result<String, Problem> {
+pub(crate) fn name() -> Result<String, Problem> {
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random)
         .map_err(|_| Problem::of(ErrorCode::Internal, "no name could be made for the call"))?;
@@ -237,8 +269,14 @@ fn holds(if_match: &str, round: u64) -> bool {
     if_match.trim() == "*" || if_match.split(',').any(|named| named.trim() == current)
 }
 
-fn unanswered(unanswered: Unanswered) -> Problem {
+pub(crate) fn unanswered(unanswered: Unanswered) -> Problem {
     match unanswered {
+        // An offer is answered here for a client of the protocol, or
+        // with what its far end speaks.
+        Unanswered::NoDialect => Problem::of(
+            ErrorCode::Internal,
+            "the offer was to be answered for a far end that speaks nothing",
+        ),
         Unanswered::Unreadable => Problem::of(
             ErrorCode::Malformed,
             "the body is no offer that can be answered",
@@ -256,7 +294,7 @@ fn unanswered(unanswered: Unanswered) -> Problem {
     }
 }
 
-fn no_call() -> Problem {
+pub(crate) fn no_call() -> Problem {
     Problem::of(
         ErrorCode::NoSession,
         "there is no such call of whoever asks",
@@ -315,6 +353,7 @@ impl Webrtc {
             setting_up: config.setting_up,
             there_within: Duration::from_millis(u64::from(config.there_within_ms)),
             calls: Mutex::default(),
+            pipecat: pipecat::Known::default(),
             deaf,
             pump,
         })
@@ -336,6 +375,42 @@ impl Webrtc {
         self.calls.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// How long a far end is waited for once its offer is answered.
+    pub(crate) const fn there_within(&self) -> Duration {
+        self.there_within
+    }
+
+    /// The call `call` is one whose far end has come.
+    pub(crate) fn is_there(&self, call: &str) {
+        if let Some(held) = self.calls().get_mut(call) {
+            held.there = true;
+        }
+    }
+
+    /// Lets go of the call `call`, whoever made its offer. Returns it
+    /// if it was held.
+    pub(crate) fn forget(&self, call: &str) -> Option<Held> {
+        self.calls().remove(call)
+    }
+
+    /// What a far end of `session` is told of the servers, where it is
+    /// told in JSON.
+    pub(crate) fn ice_servers(&self, session: SessionId) -> Vec<IceServer> {
+        let now = SystemTime::now();
+        let told = |server: &Server| {
+            let (username, credential) = match server.said_as(session, now)? {
+                SaidAs::Nobody => (None, None),
+                SaidAs::Somebody(username, credential) => (Some(username), Some(credential)),
+            };
+            Some(IceServer {
+                urls: server.urls.clone(),
+                username,
+                credential,
+            })
+        };
+        self.servers.iter().filter_map(told).collect()
+    }
+
     /// What a far end of `session` is told of the servers.
     fn links(&self, session: SessionId) -> Vec<HeaderValue> {
         let now = SystemTime::now();
@@ -346,13 +421,15 @@ impl Webrtc {
     }
 
     /// Answers `offer` for `session`, made by whoever said the token
-    /// whose hash is `by`. Returns the name of the call, the answer,
-    /// and the call, which has not begun.
-    fn answer(
+    /// whose hash is `by`: for a client of the protocol, or for a far
+    /// end that speaks `dialect` on a channel it opens. Returns the
+    /// name of the call, the answer, and the call, which has not begun.
+    pub(crate) fn answer(
         &self,
         session: SessionId,
         by: [u8; 32],
         offer: &str,
+        dialect: Option<Box<dyn Dialect>>,
     ) -> Result<(String, String, Knock), Problem> {
         if self.deaf.load(Ordering::Relaxed) {
             return Err(Problem::of(
@@ -371,11 +448,15 @@ impl Webrtc {
                  moment",
             ));
         }
+        let answered = match dialect {
+            Some(dialect) => self.endpoint.offer_in(offer, dialect),
+            None => self.endpoint.offer(offer, Client::V1),
+        };
         let Answered {
             answer,
             knock,
             signals,
-        } = self.endpoint.offer(offer, Client::V1).map_err(unanswered)?;
+        } = answered.map_err(unanswered)?;
         let held = Held {
             by,
             session,
@@ -391,7 +472,12 @@ impl Webrtc {
 
     /// The call `call`, for whoever made its offer: they say the token
     /// they made it with, whose hash is `by`.
-    fn held<T>(&self, call: &str, by: &[u8; 32], of: impl FnOnce(&mut Held) -> T) -> Option<T> {
+    pub(crate) fn held<T>(
+        &self,
+        call: &str,
+        by: &[u8; 32],
+        of: impl FnOnce(&mut Held) -> T,
+    ) -> Option<T> {
         let mut calls = self.calls();
         let held = calls.get_mut(call).filter(|held| same(&held.by, by))?;
         Some(of(held))
@@ -413,7 +499,7 @@ impl Drop for Forgets {
 }
 
 /// What answers calls, for a request that asks about one.
-fn answering(daemon: &Shared) -> Result<&Webrtc, Problem> {
+pub(crate) fn answering(daemon: &Shared) -> Result<&Webrtc, Problem> {
     daemon.webrtc.as_ref().ok_or_else(|| {
         problem(
             StatusCode::NOT_FOUND,
@@ -547,7 +633,7 @@ pub(crate) async fn offer(
     if !offer.starts_with("v=0") {
         return Err(unanswered(Unanswered::Unreadable).into());
     }
-    let (call, answer, knock) = webrtc.answer(session, by, &offer)?;
+    let (call, answer, knock) = webrtc.answer(session, by, &offer, None)?;
     let mut response = (StatusCode::CREATED, answer).into_response();
     let said = response.headers_mut();
     said.insert(CONTENT_TYPE, HeaderValue::from_static(SDP));
@@ -587,9 +673,7 @@ async fn serve(daemon: Arc<Shared>, call: String, session: SessionId, knock: Kno
     let Ok(caller) = came else {
         return;
     };
-    if let Some(held) = webrtc.calls().get_mut(&call) {
-        held.there = true;
-    }
+    webrtc.is_there(&call);
     let Some(hello) = caller.hello().cloned() else {
         // A client of the protocol has said hello by now.
         caller

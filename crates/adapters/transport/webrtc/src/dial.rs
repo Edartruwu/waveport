@@ -580,12 +580,39 @@ impl Dialer {
         local: SocketAddr,
         tcp: bool,
     ) -> Result<(Dialing, String), PortError> {
+        Self::offers(like, local, tcp, None).await
+    }
+
+    /// Makes the offer of a client that speaks another protocol than
+    /// client protocol v1, on a data channel it opens itself under the
+    /// name `opens`: as a browser does that was written for another
+    /// server. The answer is given to [`Dialing::opened`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`offer`](Self::offer).
+    pub async fn offer_as_a_stranger(
+        like: Like,
+        local: SocketAddr,
+        tcp: bool,
+        opens: &'static str,
+    ) -> Result<(Dialing, String), PortError> {
+        Self::offers(like, local, tcp, Some(opens)).await
+    }
+
+    async fn offers(
+        like: Like,
+        local: SocketAddr,
+        tcp: bool,
+        opens: Option<&'static str>,
+    ) -> Result<(Dialing, String), PortError> {
         let (udp, at) = socket(local).await?;
         let connects_from = SocketAddr::new(at.ip(), DISCARD);
         let from = if tcp { connects_from } else { at };
         let offers = Offers {
             like,
-            speaks: true,
+            speaks: opens.is_none(),
+            opens,
             tcp,
             dtls13: false,
         };
@@ -626,7 +653,8 @@ impl Dialer {
             PeerHeard::Key(key) => self.order.aside.push_back(Heard::Key(key)),
             PeerHeard::Down => self.order.aside.push_back(Heard::Down),
             PeerHeard::Up => self.order.aside.push_back(Heard::Up),
-            PeerHeard::Open => {}
+            // A client of the protocol opens no channel of its own.
+            PeerHeard::Open | PeerHeard::Text(_) => {}
             PeerHeard::Over => self.over = true,
         }
     }
@@ -897,7 +925,7 @@ impl Dialing {
                 PeerHeard::Audio { time, payload } => {
                     order.audio.push_back((time, payload, Instant::now()));
                 }
-                PeerHeard::Key(_) | PeerHeard::Up | PeerHeard::Down => {}
+                PeerHeard::Key(_) | PeerHeard::Up | PeerHeard::Down | PeerHeard::Text(_) => {}
             }
         };
         Ok(Dialer {
@@ -906,6 +934,155 @@ impl Dialing {
             order,
             over: false,
         })
+    }
+
+    /// Takes the answer to the offer of a client that speaks another
+    /// protocol, and makes the call: the checks, the handshake, and the
+    /// data channel the client opens. Nothing is said on it yet.
+    ///
+    /// # Errors
+    ///
+    /// The answer is none to the offer, or the call and its channel
+    /// were not there within `timeout`.
+    pub async fn opened(self, answer: &str, timeout: Duration) -> Result<Stranger, Unconnected> {
+        let mut driven = self.driven;
+        if !driven.core.answered(answer) {
+            return Err(PortError::permanent("the answer is not one to the offer").into());
+        }
+        let by = Instant::now() + timeout;
+        let mut early = VecDeque::new();
+        loop {
+            let Ok(told) = tokio::time::timeout_at(by, driven.told()).await else {
+                let error = PortError::timeout(format!(
+                    "the call and its channel were not there within {} ms",
+                    timeout.as_millis()
+                ));
+                return Err(error.into());
+            };
+            match told {
+                PeerHeard::Open => break,
+                PeerHeard::Over => {
+                    let error = PortError::transient("the call ended before it began");
+                    return Err(error.into());
+                }
+                // What outran the channel is kept.
+                PeerHeard::Audio { payload, .. } => early.push_back(Strange::Audio(payload)),
+                PeerHeard::Key(key) => early.push_back(Strange::Key(key)),
+                PeerHeard::Text(text) => early.push_back(Strange::Text(text)),
+                PeerHeard::Up | PeerHeard::Down | PeerHeard::Said(_) => {}
+            }
+        }
+        Ok(Stranger {
+            driven,
+            early,
+            over: false,
+        })
+    }
+}
+
+/// Something a [`Stranger`] was sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Strange {
+    /// What the server said on the data channel, as the text it sent.
+    Text(String),
+    /// One packet of audio.
+    Audio(Bytes),
+    /// The server pressed a key.
+    Key(Key),
+    /// The server cannot be reached. It may be again.
+    Down,
+    /// The server is reached again.
+    Up,
+}
+
+/// A client on a call that speaks another protocol than client
+/// protocol v1, on a data channel it opened itself: what a server that
+/// takes such clients is tried with. It knows nothing of the protocol
+/// it speaks: what is said is text, both ways.
+pub struct Stranger {
+    driven: Box<Driven<Peer, Own>>,
+    early: VecDeque<Strange>,
+    over: bool,
+}
+
+impl fmt::Debug for Stranger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stranger")
+            .field("over", &self.over)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Stranger {
+    /// The next thing the server sent. `None` when the call is over.
+    ///
+    /// The call goes on only while this is waited for, or something is
+    /// said: a client that does neither for some seconds is taken by
+    /// its server to have dropped.
+    pub async fn next(&mut self) -> Option<Strange> {
+        loop {
+            if let Some(early) = self.early.pop_front() {
+                return Some(early);
+            }
+            if self.over {
+                return None;
+            }
+            match self.driven.told().await {
+                PeerHeard::Audio { payload, .. } => return Some(Strange::Audio(payload)),
+                PeerHeard::Text(text) => return Some(Strange::Text(text)),
+                PeerHeard::Key(key) => return Some(Strange::Key(key)),
+                PeerHeard::Down => return Some(Strange::Down),
+                PeerHeard::Up => return Some(Strange::Up),
+                PeerHeard::Open | PeerHeard::Said(_) => {}
+                PeerHeard::Over => self.over = true,
+            }
+        }
+    }
+
+    /// Says `text` on the data channel.
+    ///
+    /// # Errors
+    ///
+    /// The call is over, or its channel takes no more.
+    pub fn say(&mut self, text: &str) -> Result<(), PortError> {
+        let said = self.driven.core.say_raw(false, text.as_bytes());
+        self.driven.flush();
+        if said {
+            Ok(())
+        } else {
+            Err(PortError::transient("the call is over"))
+        }
+    }
+
+    /// Sends one Opus packet of what the microphone heard.
+    ///
+    /// # Errors
+    ///
+    /// It is no packet of Opus, or the call is over.
+    pub fn audio(&mut self, audio: &[u8]) -> Result<(), PortError> {
+        let said = self.driven.core.speak(now(), audio);
+        self.driven.flush();
+        if said {
+            Ok(())
+        } else {
+            Err(PortError::transient(
+                "the packet is not one of Opus, or the call is over",
+            ))
+        }
+    }
+
+    /// Ends the call, as a page does that closes it: the server is
+    /// told so by the call itself, and nothing is said in whatever is
+    /// spoken on it.
+    pub fn hang_up(mut self) {
+        self.driven.core.close();
+        self.driven.flush();
+    }
+
+    /// Lets go of the call without a word, as a client does whose
+    /// network is gone.
+    pub fn drop_line(self) {
+        drop(self.driven);
     }
 }
 

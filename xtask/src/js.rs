@@ -8,6 +8,14 @@
 //! Node, for the tests. A test here fails when a package takes on
 //! anything else, or takes it some other way than pinned, locked and a
 //! week old.
+//!
+//! One package is no client of ours (`sdks/pipecat-stock`): the stock
+//! client of Pipecat's on a page, which the daemon's gateway is held
+//! against in a browser. It is a test and ships nothing. What it is
+//! installed with is that client, its transport and what bundles them
+//! for a page, and what those bring is listed here by name: a name
+//! that is not listed is something the client took on since, and is
+//! looked at before it is installed.
 
 /// Where the client is, from the root of the repository.
 pub(crate) const DIR: &str = "sdks/js";
@@ -23,6 +31,17 @@ pub(crate) const STAND_IN: &str = "cargo build --locked -p waveportd --example s
 /// A browser on the page that daemon serves.
 pub(crate) const BROWSER: &str =
     "node test/browser/run.js --daemon ../../target/debug/examples/stand_in";
+
+/// Where the stock client of Pipecat's is held against the daemon.
+pub(crate) const STOCK_DIR: &str = "sdks/pipecat-stock";
+/// A browser with that client on a page, against that daemon.
+pub(crate) const STOCK: &str = "node test/run.js --daemon ../../target/debug/examples/stand_in";
+/// The newest of that client that is a week old, in place of what the
+/// lock file names: for the run that says when the client has moved.
+/// Only the workflow of every night runs it, which a test holds to it.
+#[cfg(test)]
+pub(crate) const STOCK_NEWEST: &str = "npm install --no-save --no-package-lock \
+     @pipecat-ai/client-js@latest @pipecat-ai/small-webrtc-transport@latest";
 
 #[cfg(test)]
 mod tests {
@@ -40,6 +59,48 @@ mod tests {
         TOOLS.contains(&name)
             || name == "undici-types"
             || name.starts_with("@typescript/typescript-")
+    }
+
+    /// The package that is a test of the daemon and no client of ours.
+    const STOCK: &str = "pipecat-stock";
+
+    /// What it is installed with: the stock client of Pipecat's, its
+    /// transport, and what bundles them for a page.
+    const STOCK_TOOLS: [&str; 3] = [
+        "@pipecat-ai/client-js",
+        "@pipecat-ai/small-webrtc-transport",
+        "esbuild",
+    ];
+
+    /// What those bring with them, by name.
+    const STOCK_BRINGS: [&str; 22] = [
+        "@babel/runtime",
+        "@daily-co/daily-js",
+        "@sentry-internal/browser-utils",
+        "@sentry-internal/feedback",
+        "@sentry-internal/replay",
+        "@sentry-internal/replay-canvas",
+        "@sentry/browser",
+        "@sentry/core",
+        "@types/events",
+        "bowser",
+        "clone-deep",
+        "dequal",
+        "events",
+        "is-plain-object",
+        "isobject",
+        "kind-of",
+        "lodash",
+        "rxjs",
+        "shallow-clone",
+        "tslib",
+        "typed-emitter",
+        "uuid",
+    ];
+
+    /// Those, and the bundler as it is built for each kind of machine.
+    fn is_brought_by_the_stock_client(name: &str) -> bool {
+        STOCK_TOOLS.contains(&name) || STOCK_BRINGS.contains(&name) || name.starts_with("@esbuild/")
     }
 
     /// Every `package.json` under `dir` that is not something installed.
@@ -123,10 +184,17 @@ mod tests {
                 assert!(none, "{at} has {kind}");
             }
             // What it is checked with is listed here, and is one version.
+            let folder = path.parent().unwrap();
+            let stock = folder.file_name().is_some_and(|name| name == STOCK);
+            let (listed, brought): (&[&str], fn(&str) -> bool) = if stock {
+                (&STOCK_TOOLS, is_brought_by_the_stock_client)
+            } else {
+                (&TOOLS, is_brought)
+            };
             let tools = package["devDependencies"].as_object();
             for (name, version) in tools.into_iter().flatten() {
                 assert!(
-                    TOOLS.contains(&name.as_str()),
+                    listed.contains(&name.as_str()),
                     "{at} is checked with {name}"
                 );
                 let version = version.as_str().unwrap_or_default();
@@ -134,7 +202,6 @@ mod tests {
             }
             // Nothing runs as it is installed, and nothing is installed
             // that is not a week old.
-            let folder = path.parent().unwrap();
             let rules = std::fs::read_to_string(folder.join(".npmrc"))
                 .unwrap_or_else(|error| panic!("{at} has no .npmrc beside it: {error}"));
             for rule in ["min-release-age=7", "ignore-scripts=true"] {
@@ -154,7 +221,7 @@ mod tests {
             );
             for (place, held) in locked.iter().filter(|(place, _)| !place.is_empty()) {
                 let name = place.rsplit("node_modules/").next().unwrap_or_default();
-                assert!(is_brought(name), "{at} locks {name}");
+                assert!(brought(name), "{at} locks {name}");
                 assert!(held["dev"] == true, "{at} locks {name} to run with");
                 let from = held["resolved"].as_str().unwrap_or_default();
                 assert!(

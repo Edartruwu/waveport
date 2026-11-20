@@ -29,6 +29,7 @@ mod dialled;
 mod kept;
 mod lined;
 mod page;
+mod pipecat;
 mod placed;
 
 use core::sync::atomic::{AtomicU32, Ordering};

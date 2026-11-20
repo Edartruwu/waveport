@@ -1,0 +1,28 @@
+{"label":"rtvi-ai","type":"bot-ready","id":"0dca44e2","data":{"version":"2.3.0","about":{"library":"waveport","library_version":"0.1.0"},"capabilities":{"audio_in":true,"audio_out":true,"video_in":false,"screen_in":false,"video_out":false,"metrics":false}}}
+{"label":"rtvi-ai","type":"error","data":{"error":"the session has failed","fatal":true}}
+{"label":"rtvi-ai","type":"error-response","id":"c4","data":{"error":"text that is not answered at once is not taken"}}
+{"label":"rtvi-ai","type":"user-started-speaking"}
+{"label":"rtvi-ai","type":"user-stopped-speaking"}
+{"label":"rtvi-ai","type":"bot-started-speaking"}
+{"label":"rtvi-ai","type":"bot-stopped-speaking"}
+{"label":"rtvi-ai","type":"bot-interrupted"}
+{"label":"rtvi-ai","type":"user-input","data":{"text":"what time","input_type":"transcription","timestamp":"2026-11-20T10:00:00.000Z","final":false,"user_id":"1"}}
+{"label":"rtvi-ai","type":"user-input","data":{"text":"what time is it","input_type":"chat","timestamp":"2026-11-20T10:00:01.000Z","final":true,"user_id":"1","msg_id":"c1"}}
+{"label":"rtvi-ai","type":"user-input","data":{"text":"mhm","input_type":"backchannel","timestamp":"2026-11-20T10:00:02.000Z","final":true}}
+{"label":"rtvi-ai","type":"user-transcription","data":{"text":"what time is it","user_id":"1","timestamp":"2026-11-20T10:00:01.000Z","final":true}}
+{"label":"rtvi-ai","type":"bot-output","data":{"text":"It is ten o'clock.","output_type":"sentence","text_type":"sentence","aggregated_by":"sentence","segment_id":3,"will_be_spoken":true,"spoken_status":"new","spoken_progress":{"accumulated_text":"","remaining_text":"It is ten o'clock."}}}
+{"label":"rtvi-ai","type":"bot-output","data":{"text":"It is ","output_type":"sentence","text_type":"sentence","aggregated_by":"sentence","segment_id":3,"will_be_spoken":true,"spoken_status":"in-progress","spoken_progress":{"accumulated_text":"It is ","remaining_text":"ten o'clock."}}}
+{"label":"rtvi-ai","type":"bot-output","data":{"text":"ten o'clock.","output_type":"sentence","text_type":"sentence","aggregated_by":"sentence","segment_id":3,"will_be_spoken":true,"spoken_status":"completed","spoken_progress":{"accumulated_text":"It is ten o'clock.","remaining_text":""}}}
+{"label":"rtvi-ai","type":"bot-output","data":{"text":"It is ten o'clock.","output_type":"sentence","text_type":"sentence","aggregated_by":"sentence","segment_id":4,"will_be_spoken":false,"spoken_status":"new"}}
+{"label":"rtvi-ai","type":"bot-llm-started"}
+{"label":"rtvi-ai","type":"bot-llm-stopped"}
+{"label":"rtvi-ai","type":"bot-llm-text","data":{"text":"It is ten o'clock."}}
+{"label":"rtvi-ai","type":"bot-tts-started"}
+{"label":"rtvi-ai","type":"bot-tts-stopped"}
+{"label":"rtvi-ai","type":"bot-tts-text","data":{"text":"It is "}}
+{"label":"rtvi-ai","type":"llm-function-call-started","data":{"function_name":"clock"}}
+{"label":"rtvi-ai","type":"llm-function-call-started","data":{}}
+{"label":"rtvi-ai","type":"llm-function-call-in-progress","data":{"tool_call_id":"7","function_name":"clock","arguments":{"zone":"UTC"}}}
+{"label":"rtvi-ai","type":"llm-function-call-in-progress","data":{"tool_call_id":"7"}}
+{"label":"rtvi-ai","type":"llm-function-call-stopped","data":{"tool_call_id":"7","cancelled":false,"function_name":"clock","result":"10:00"}}
+{"label":"rtvi-ai","type":"llm-function-call-stopped","data":{"tool_call_id":"8","cancelled":true}}

@@ -183,6 +183,7 @@
 mod call;
 mod crypto;
 mod dial;
+mod dialect;
 mod endpoint;
 mod engine;
 pub mod fragment;
@@ -200,7 +201,8 @@ mod tcp;
 mod tests;
 
 pub use crate::call::{CHANNEL, CHANNEL_LABEL, Client, Unanswered};
-pub use crate::dial::{Dialer, Dialing, Heard, Unconnected};
+pub use crate::dial::{Dialer, Dialing, Heard, Strange, Stranger, Unconnected};
+pub use crate::dialect::{Dialect, Meant};
 pub use crate::endpoint::{Answered, BindError, Config, Endpoint, Pump};
 pub use crate::peer::Like;
 pub use crate::server::{Caller, Gone, Handle, Knock, Link, RtcTransport, Signals, Unattached};
