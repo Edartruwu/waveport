@@ -1,0 +1,55 @@
+{"given":{"label":"rtvi-ai","type":"client-ready","data":{"version":"2.3.0","about":{"library":"@pipecat-ai/client-js","library_version":"1.16.0","platform_details":{"browser":"Chrome","browser_version":"157.0.0.0","platform_type":"desktop","engine":"Blink"},"platform":"Linux"}},"id":"0dca44e2"},"read":{"id":"0dca44e2","asks":"client-ready","version":"2.3.0","library":"@pipecat-ai/client-js","library_version":"1.16.0","platform":"Linux"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","data":{"version":"2.3.0","about":{"library":"@pipecat-ai/client-js","library_version":"1.16.0","platform_details":{"browser":"Firefox","browser_version":"158.0","platform_type":"desktop","engine":"Gecko"},"platform":"Linux"}},"id":"40cf0104"},"read":{"id":"40cf0104","asks":"client-ready","version":"2.3.0","library":"@pipecat-ai/client-js","library_version":"1.16.0","platform":"Linux"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","data":{"version":"1.4.0","about":{"library":"an-older-client"}},"id":"a1"},"read":{"id":"a1","asks":"client-ready","version":"1.4.0","library":"an-older-client"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","data":{"version":"2.3.0","about":{"library_version":"1.16.0"}},"id":"a2"},"read":{"id":"a2","asks":"client-ready","version":"2.3.0"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","data":{"version":2,"about":{"library":"a-client"}},"id":"a3"},"read":{"id":"a3","asks":"client-ready","library":"a-client"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","data":{},"id":"a4"},"read":{"id":"a4","asks":"client-ready"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","id":"a5"},"read":{"id":"a5","asks":"client-ready"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","data":null,"id":"a6"},"read":{"id":"a6","asks":"client-ready"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","data":{"version":"2.3.0","about":["a-client"]},"id":"a7"},"read":{"id":"a7","asks":"client-ready","version":"2.3.0"}}
+{"given":{"label":"rtvi-ai","type":"client-ready","data":["2.3.0"],"id":"a8"},"read":{"id":"a8","asks":"client-ready"}}
+{"given":{"label":"rtvi-ai","type":"disconnect-bot","data":{},"id":"b1"},"read":{"id":"b1","asks":"disconnect-bot"}}
+{"given":{"label":"rtvi-ai","type":"disconnect-bot","id":"b2"},"read":{"id":"b2","asks":"disconnect-bot"}}
+{"given":{"label":"rtvi-ai","type":"disconnect-bot","data":"whatever","id":"b3"},"read":{"id":"b3","asks":"disconnect-bot"}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"what time is it","options":{"run_immediately":true,"audio_response":true}},"id":"c1"},"read":{"id":"c1","asks":"send-text","content":"what time is it","run_immediately":true,"audio_response":true}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"what time is it"},"id":"c2"},"read":{"id":"c2","asks":"send-text","content":"what time is it","run_immediately":true,"audio_response":true}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"what time is it","options":{}},"id":"c3"},"read":{"id":"c3","asks":"send-text","content":"what time is it","run_immediately":true,"audio_response":true}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"note this","options":{"run_immediately":false}},"id":"c4"},"read":{"id":"c4","asks":"send-text","content":"note this","run_immediately":false,"audio_response":true}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"answer in writing","options":{"audio_response":false,"more":1}},"id":"c5"},"read":{"id":"c5","asks":"send-text","content":"answer in writing","run_immediately":true,"audio_response":false}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":7},"id":"c6"},"read":{"id":"c6","asks":"invalid","kind":"send-text"}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"options":{}},"id":"c7"},"read":{"id":"c7","asks":"invalid","kind":"send-text"}}
+{"given":{"label":"rtvi-ai","type":"send-text","id":"c8"},"read":{"id":"c8","asks":"invalid","kind":"send-text"}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"now","options":{"run_immediately":"yes"}},"id":"c9"},"read":{"id":"c9","asks":"invalid","kind":"send-text"}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":["what time is it"],"id":"c10"},"read":{"id":"c10","asks":"invalid","kind":"send-text"}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"now","options":[false,false]},"id":"c11"},"read":{"id":"c11","asks":"invalid","kind":"send-text"}}
+{"given":{"label":"rtvi-ai","type":"dtmf","data":{"buttons":["1","2","#"]},"id":"d1"},"read":{"id":"d1","asks":"dtmf","buttons":["1","2","#"]}}
+{"given":{"label":"rtvi-ai","type":"dtmf","data":{"buttons":[]},"id":"d2"},"read":{"id":"d2","asks":"dtmf","buttons":[]}}
+{"given":{"label":"rtvi-ai","type":"dtmf","data":{"buttons":["1","two"]},"id":"d3"},"read":{"id":"d3","asks":"dtmf","buttons":["1","two"]}}
+{"given":{"label":"rtvi-ai","type":"dtmf","data":{"button":"1"},"id":"d4"},"read":{"id":"d4","asks":"invalid","kind":"dtmf"}}
+{"given":{"label":"rtvi-ai","type":"dtmf","data":{"buttons":[1,2]},"id":"d5"},"read":{"id":"d5","asks":"invalid","kind":"dtmf"}}
+{"given":{"label":"rtvi-ai","type":"dtmf","data":{"buttons":"12"},"id":"d6"},"read":{"id":"d6","asks":"invalid","kind":"dtmf"}}
+{"given":{"label":"rtvi-ai","type":"dtmf","data":[["1","2"]],"id":"d7"},"read":{"id":"d7","asks":"invalid","kind":"dtmf"}}
+{"given":{"label":"rtvi-ai","type":"send-file","data":{"content":"look at this","file":{"format":"application/pdf","source":{"type":"url","url":"https://example.test/a.pdf"}}},"id":"e1"},"read":{"id":"e1","asks":"other","kind":"send-file"}}
+{"given":{"label":"rtvi-ai","type":"llm-function-call-result","data":{"function_name":"lookup","tool_call_id":"call-1","arguments":{},"result":"done"},"id":"e2"},"read":{"id":"e2","asks":"other","kind":"llm-function-call-result"}}
+{"given":{"label":"rtvi-ai","type":"client-message","data":{"t":"anything","d":[1,2,{"x":null}]},"id":"e3"},"read":{"id":"e3","asks":"other","kind":"client-message"}}
+{"given":{"label":"rtvi-ai","type":"ui-event","data":{"event":"click","payload":{"ref":"e7"}},"id":"e4"},"read":{"id":"e4","asks":"other","kind":"ui-event"}}
+{"given":{"label":"rtvi-ai","type":"ui-snapshot","data":{"tree":{"root":{"ref":"e1","role":"document"},"captured_at":1}},"id":"e5"},"read":{"id":"e5","asks":"other","kind":"ui-snapshot"}}
+{"given":{"label":"rtvi-ai","type":"ui-cancel-job-group","data":{"job_id":"j1"},"id":"e6"},"read":{"id":"e6","asks":"other","kind":"ui-cancel-job-group"}}
+{"given":{"label":"rtvi-ai","type":"append-to-context","data":{"role":"user","content":"remember this","run_immediately":false},"id":"e7"},"read":{"id":"e7","asks":"other","kind":"append-to-context"}}
+{"given":{"label":"rtvi-ai","type":"something-new","data":"of any shape","id":"e8"},"read":{"id":"e8","asks":"other","kind":"something-new"}}
+{"given":{"label":"rtvi-ai","type":"something-new","data":[1,[2,[3]]],"id":"e9"},"read":{"id":"e9","asks":"other","kind":"something-new"}}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"hello"}},"read":"unreadable"}
+{"given":{"label":"rtvi-ai","type":"send-text","data":{"content":"hello"},"id":7},"read":"unreadable"}
+{"given":{"label":"rtvi-ai","data":{"content":"hello"},"id":"f3"},"read":"unreadable"}
+{"given":{"label":"rtvi-ai","type":null,"id":"f4"},"read":"unreadable"}
+{"given":{"label":"rtvi-ai"},"read":"unreadable"}
+{"given":{"type":"signalling","message":{"type":"trackStatus","receiver_index":0,"enabled":true}},"read":"foreign"}
+{"given":{"label":"another","type":"client-ready","id":"g2"},"read":"foreign"}
+{"given":{"label":7,"type":"client-ready","id":"g3"},"read":"foreign"}
+{"given":{"type":"client-ready","id":"g4","data":{"version":"2.3.0"}},"read":"foreign"}
+{"given":"ping: 1794862249583","read":"foreign"}
+{"given":"","read":"foreign"}
+{"given":"{\"label\":\"rtvi-ai\",\"type\":\"disconnect-bot\",\"id\":\"g7\"","read":"foreign"}
+{"given":["rtvi-ai"],"read":"foreign"}
+{"given":["rtvi-ai","send-text","g9"],"read":"foreign"}
+{"given":"rtvi-ai","read":"foreign"}

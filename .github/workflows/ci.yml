@@ -284,6 +284,11 @@ jobs:
       - run: cargo xtask fetch-assets
       - run: node test/browser/run.js --daemon ../../target/debug/examples/stand_in
         working-directory: sdks/js
+      # The stock client of Pipecat's on a page, against the same daemon.
+      - run: npm ci
+        working-directory: sdks/pipecat-stock
+      - run: node test/run.js --daemon ../../target/debug/examples/stand_in
+        working-directory: sdks/pipecat-stock
 
   # The single required check. It fails unless every job above succeeded.
   ci-ok:

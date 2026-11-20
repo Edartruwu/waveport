@@ -372,7 +372,7 @@ pub(crate) async fn seated(daemon: &Arc<Shared>, caller: Caller, offered: Option
 /// what was told here, or with the daemon, which says that it is going
 /// away: the session is kept, and its client comes back to the daemon
 /// that is started next.
-async fn tells(
+pub(crate) async fn tells(
     daemon: &Shared,
     id: SessionId,
     life: u64,

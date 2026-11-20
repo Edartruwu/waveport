@@ -272,7 +272,7 @@ impl Shared {
     }
 
     /// How long a client token can be connected with.
-    fn connect_within(&self) -> Duration {
+    pub(crate) fn connect_within(&self) -> Duration {
         Duration::from_millis(u64::from(self.limits.connect_within_ms))
     }
 
@@ -582,6 +582,17 @@ impl Shared {
         // kind of line.
         let link = wire.handle.attach(caller, welcome).await?;
         Some((link, life))
+    }
+
+    /// How long the session `id` waits for a far end whose line
+    /// dropped, while it runs on a line a far end can come back to.
+    pub(crate) fn waits_for(&self, id: SessionId) -> Option<Duration> {
+        match self.found(id, stands) {
+            Ok(Stands::Runs(_, Some(line))) => {
+                Some(Duration::from_millis(u64::from(line.grace_ms)))
+            }
+            _ => None,
+        }
     }
 
     /// Whether a far end may come to the session `id` on a WebRTC

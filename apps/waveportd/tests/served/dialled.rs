@@ -22,26 +22,26 @@ use crate::far_end::{Answer, ask};
 use crate::{Served, answer, desk};
 
 /// How many samples a packet holds: 20 ms at 48 kHz.
-const PACKET: usize = 960;
+pub(crate) const PACKET: usize = 960;
 
 /// How long anything on one machine may take.
-const SOON: Duration = Duration::from_secs(10);
+pub(crate) const SOON: Duration = Duration::from_secs(10);
 
 /// What a daemon is told to have it answer calls, on ports that are
 /// free.
-const CALLED: &str = "[webrtc]\nudp = \"127.0.0.1:0\"\ntcp = \"127.0.0.1:0\"\n";
+pub(crate) const CALLED: &str = "[webrtc]\nudp = \"127.0.0.1:0\"\ntcp = \"127.0.0.1:0\"\n";
 
 /// The providers an agent that hears and speaks is given.
-struct Providers {
-    stt: WsServer,
-    llm: HttpServer,
-    tts: WsServer,
+pub(crate) struct Providers {
+    pub(crate) stt: WsServer,
+    pub(crate) llm: HttpServer,
+    pub(crate) tts: WsServer,
 }
 
 impl Providers {
     /// The ones of a call in which the agent is asked the time, says
     /// it, and ends the call.
-    async fn of_one_call() -> Self {
+    pub(crate) async fn of_one_call() -> Self {
         Self {
             stt: WsServer::start(vec![WsStep::script(HEARD)]).await,
             llm: HttpServer::start(vec![
@@ -57,7 +57,7 @@ impl Providers {
     /// The configuration of a daemon whose agent `desk` hears and
     /// speaks with these, and has an agent `clerk` that only writes.
     /// `webrtc` is what it is told of calls.
-    fn config(&self, webrtc: &str) -> String {
+    pub(crate) fn config(&self, webrtc: &str) -> String {
         format!(
             "listen = \"127.0.0.1:0\"\n\
              assets = '{}'\n\
@@ -83,7 +83,7 @@ impl Providers {
 }
 
 /// A daemon that answers calls, with these providers.
-async fn daemon(providers: &Providers, webrtc: &str) -> Served {
+pub(crate) async fn daemon(providers: &Providers, webrtc: &str) -> Served {
     Served::start(&desk(), &providers.config(webrtc), &[]).await
 }
 
@@ -228,7 +228,7 @@ async fn talks(dialer: &mut Dialer, speech: &[i16]) -> Call {
 }
 
 /// The question, after a moment of nothing.
-fn question() -> Vec<i16> {
+pub(crate) fn question() -> Vec<i16> {
     let mut speech = vec![0_i16; 48 * 400];
     speech.extend(speech::what_time_is_it(Rate::Hz48000));
     speech

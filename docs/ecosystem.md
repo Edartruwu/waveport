@@ -124,6 +124,8 @@ Phase numbers refer to the roadmap. Locations are relative to the repository roo
 | Component | Location | Phase |
 |---|---|---|
 | Client protocol v1 with an RTVI-compatible gateway | `crates/core/waveport-protocol`, `apps/waveportd` | 2 |
+| The stock client of Pipecat's on a page, which the gateway is held against in a browser | `sdks/pipecat-stock` | 2 |
+| A transport for Pipecat's JavaScript client over the daemon's own signalling | `sdks/pipecat-transport` | 2 |
 | JavaScript SDK and playground | `sdks/js` | 2 |
 | React SDK, UI kit, embeddable widget | `sdks/react` | 7 |
 | Python and Node.js bindings | `crates/bindings/python`, `node` | 8 |

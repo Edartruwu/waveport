@@ -51,6 +51,7 @@ use tokio::time::Instant;
 
 use crate::call::{Call, Client, Setup, Unanswered};
 use crate::crypto::{Certificate, certificate};
+use crate::dialect::Dialect;
 use crate::net::{Arrived, Driven, Wire, now};
 use crate::rtp::{Datagram, asked_of};
 use crate::server::{Knock, Signals};
@@ -398,6 +399,27 @@ impl Endpoint {
     /// The offer is not one that can be answered. Nothing is said of
     /// what it held.
     pub fn offer(&self, offer: &str, client: Client) -> Result<Answered, Unanswered> {
+        self.answered(offer, client, None)
+    }
+
+    /// Answers the offer of a far end that speaks `dialect` on a data
+    /// channel it opens itself ([`Client::Other`]). The rest is as for
+    /// [`offer`](Self::offer).
+    ///
+    /// # Errors
+    ///
+    /// The offer is not one that can be answered. Nothing is said of
+    /// what it held.
+    pub fn offer_in(&self, offer: &str, dialect: Box<dyn Dialect>) -> Result<Answered, Unanswered> {
+        self.answered(offer, Client::Other, Some(dialect))
+    }
+
+    fn answered(
+        &self,
+        offer: &str,
+        client: Client,
+        dialect: Option<Box<dyn Dialect>>,
+    ) -> Result<Answered, Unanswered> {
         let setup = Setup {
             certificate: &self.shared.certificate,
             dtls13: self.shared.dtls13,
@@ -405,7 +427,10 @@ impl Endpoint {
             udp: Some(self.shared.udp_at),
             tcp: self.shared.tcp_at,
         };
-        let (call, answer) = Call::answer(&setup, offer, now())?;
+        let (call, answer) = match dialect {
+            Some(dialect) => Call::answer_in(&setup, offer, now(), dialect)?,
+            None => Call::answer(&setup, offer, now())?,
+        };
         let (inbox, arrives) = mpsc::channel(INBOX);
         let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
         {

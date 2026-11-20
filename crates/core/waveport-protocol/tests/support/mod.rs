@@ -50,6 +50,12 @@ pub(crate) fn every_message() -> Vec<Value> {
             }
         }
     }
+    // What a client of another protocol writes, which is a message or
+    // text that is none.
+    for line in lines("rtvi/from_client.jsonl") {
+        all.extend(value(&line).get("given").cloned());
+    }
+    all.extend(lines("rtvi/to_client.jsonl").iter().map(|line| value(line)));
     let views = value(&fixture("client-v1/views.json"));
     for case in views.as_array().into_iter().flatten() {
         all.extend(case["messages"].as_array().into_iter().flatten().cloned());

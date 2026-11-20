@@ -24,6 +24,7 @@ use waveport_domain::time::MediaDur;
 use waveport_protocol::client::v1::{ErrorCode, FromClient, FromServer};
 
 use crate::crypto::Certificate;
+use crate::dialect::{Dialect, Meant};
 use crate::engine::{AGAIN, Core, Engine, Stepped, TURNS};
 use crate::media::{CLOCK, In, Kinds, Media};
 use crate::sent::Sent;
@@ -68,6 +69,13 @@ pub enum Client {
     /// played is worked out from the pace, and what it holds cannot be
     /// discarded. A data channel it opens is not read.
     Plain,
+    /// One that speaks another protocol, on a data channel it opens
+    /// itself: what it says there is put into client protocol v1, and
+    /// what it is told into its own, by the
+    /// [`Dialect`](crate::Dialect) its call was answered with. It does
+    /// not say what it has played, and nothing it holds can be
+    /// discarded: both are as for [`Plain`](Self::Plain).
+    Other,
 }
 
 /// Why an offer was not answered. It says nothing of what the offer
@@ -81,6 +89,9 @@ pub enum Unanswered {
     /// It asks for no data channel, and the client is one that speaks
     /// on one.
     NoChannel,
+    /// The call is to be one of a client that speaks another protocol,
+    /// and nothing says which.
+    NoDialect,
     /// The call is over.
     Over,
 }
@@ -93,6 +104,7 @@ impl core::fmt::Display for Unanswered {
             Self::NoChannel => {
                 "the offer asks for no data channel, which the protocol is spoken on"
             }
+            Self::NoDialect => "nothing says what the far end speaks on its data channel",
             Self::Over => "the call is over",
         })
     }
@@ -162,6 +174,8 @@ pub(crate) struct Call {
     engine: Engine,
     client: Client,
     media: Option<Media>,
+    /// What the far end speaks on its channel, if not the protocol.
+    dialect: Option<Box<dyn Dialect>>,
     /// The channel the protocol is spoken on.
     channel: Option<ChannelId>,
     open: bool,
@@ -215,11 +229,38 @@ impl Call {
         offer: &str,
         now: Instant,
     ) -> Result<(Self, String), Unanswered> {
+        if setup.client == Client::Other {
+            return Err(Unanswered::NoDialect);
+        }
+        Self::answered(setup, offer, now, None)
+    }
+
+    /// Answers the `offer` of a far end that speaks `dialect` on a
+    /// data channel it opens. Returns the call and the answer.
+    pub(crate) fn answer_in(
+        setup: &Setup<'_>,
+        offer: &str,
+        now: Instant,
+        dialect: Box<dyn Dialect>,
+    ) -> Result<(Self, String), Unanswered> {
+        let setup = Setup {
+            client: Client::Other,
+            ..setup.clone()
+        };
+        Self::answered(&setup, offer, now, Some(dialect))
+    }
+
+    fn answered(
+        setup: &Setup<'_>,
+        offer: &str,
+        now: Instant,
+        dialect: Option<Box<dyn Dialect>>,
+    ) -> Result<(Self, String), Unanswered> {
         let offered = Offered::read(offer);
         if !offered.audio {
             return Err(Unanswered::NoAudio);
         }
-        if setup.client == Client::V1 && !offered.channel {
+        if setup.client != Client::Plain && !offered.channel {
             return Err(Unanswered::NoChannel);
         }
         let mut engine = Engine::new(
@@ -257,6 +298,7 @@ impl Call {
             engine,
             client: setup.client,
             media: None,
+            dialect,
             channel,
             open: false,
             early: VecDeque::new(),
@@ -450,7 +492,14 @@ impl Call {
                     self.media = self.engine.with(|rtc| Media::of(rtc, added.mid)).flatten();
                 }
             }
-            Event::ChannelOpen(id, _) => {
+            Event::ChannelOpen(id, label) => {
+                // A far end that speaks another protocol opens the
+                // channel it is spoken on, and names it: the first of
+                // that name is the one.
+                let named = self.dialect.as_ref().map(|dialect| dialect.channel());
+                if self.channel.is_none() && named == Some(label.as_str()) {
+                    self.channel = Some(id);
+                }
                 if self.channel == Some(id) && !self.open {
                     self.open = true;
                     while let Some(early) = self.early.pop_front() {
@@ -540,12 +589,28 @@ impl Call {
     /// Takes what the far end said on the data channel.
     fn said(&mut self, binary: bool, said: &[u8]) {
         let text = core::str::from_utf8(said).ok().filter(|_| !binary);
-        let Some(Ok(said)) = text.map(read::<FromClient>) else {
-            self.refuse(
-                ErrorCode::Malformed,
-                "that is not a message of the protocol",
-            );
-            return;
+        let said = if let Some(dialect) = &mut self.dialect {
+            // What is no text is nothing in a protocol that is written.
+            let Some(text) = text else {
+                return;
+            };
+            let Meant { means, answers } = dialect.heard(text);
+            for answer in answers {
+                self.says(answer);
+            }
+            let Some(said) = means else {
+                return;
+            };
+            said
+        } else {
+            let Some(Ok(said)) = text.map(read::<FromClient>) else {
+                self.refuse(
+                    ErrorCode::Malformed,
+                    "that is not a message of the protocol",
+                );
+                return;
+            };
+            said
         };
         if !matches!(said, FromClient::Hello { .. })
             && let Err(refusal) = said.check()
@@ -647,17 +712,31 @@ impl Call {
         waiting.unwrap_or(0) == 0
     }
 
-    /// Tells the far end `message`, if it is one that is told things.
-    /// Returns whether it will be.
+    /// Tells the far end `message`, if it is one that is told things:
+    /// as it is, or as the far end's own protocol says it, which may
+    /// be in several messages or in none. Returns whether it will be.
     pub(crate) fn tell(&mut self, message: &FromServer) -> bool {
-        if self.client != Client::V1 || self.engine.is_over() {
+        if self.client == Client::Plain || self.engine.is_over() {
             return false;
         }
-        let text = write(message);
+        let Some(dialect) = &mut self.dialect else {
+            return self.says(write(message));
+        };
+        let mut all = true;
+        for text in dialect.told(message) {
+            all &= self.says(text);
+        }
+        all
+    }
+
+    /// Says `text` on the channel, or keeps it for a channel that is
+    /// not open yet. Returns whether it will be said.
+    fn says(&mut self, text: String) -> bool {
         if self.open {
             return self.write(&text);
         }
-        // The channel opens with the call. What is said before waits.
+        // The channel opens with the call, or a moment after it where
+        // the far end opens it. What is said before waits.
         if self.early.len() >= EARLY {
             return false;
         }

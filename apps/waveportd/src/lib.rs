@@ -19,8 +19,11 @@
 //!   connection drops comes back and is on the line again. Or the far
 //!   end is on a WebRTC call (`POST /v1/webrtc`), which carries audio
 //!   as a call does and the protocol on a data channel: such a session
-//!   hears and speaks. A session stays on the kind of line it was
-//!   started on while it runs.
+//!   hears and speaks. A client of Pipecat's is on such a call too
+//!   (`POST /api/offer`, as it asks a Pipecat server): it speaks its own
+//!   protocol, RTVI, on a channel it opens, and the daemon puts that
+//!   into the client protocol and back (decision 0006). A session stays
+//!   on the kind of line it was started on while it runs.
 //! - **On a call.** A carrier asks the daemon what to do with a call
 //!   (`POST /v1/telephony/{carrier}/voice`), and is answered with the
 //!   address of a stream of the daemon's and a ticket that is good once
@@ -154,7 +157,9 @@ mod daemon;
 mod events;
 mod http;
 mod line;
+mod pipecat;
 mod playground;
+mod rtvi;
 mod serve;
 mod threads;
 mod webrtc;

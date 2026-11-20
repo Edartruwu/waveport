@@ -48,6 +48,10 @@ pub(crate) struct Offers {
     pub(crate) like: Like,
     /// Whether it offers the data channel of the protocol.
     pub(crate) speaks: bool,
+    /// The data channel it opens itself, to speak another protocol on,
+    /// if it does: one that offers the channel of the protocol does
+    /// not.
+    pub(crate) opens: Option<&'static str>,
     /// Whether it reaches its server over a connection it makes, and
     /// not with datagrams.
     pub(crate) tcp: bool,
@@ -71,6 +75,9 @@ pub(crate) enum PeerHeard {
     Key(Key),
     /// The other end said something in the protocol.
     Said(FromServer),
+    /// The other end said something on the channel this end opened,
+    /// in whatever is spoken there.
+    Text(String),
     /// The call is over.
     Over,
 }
@@ -92,6 +99,9 @@ pub(crate) struct Peer {
     moves_to: Option<SocketAddr>,
     media: Option<Media>,
     channel: Option<ChannelId>,
+    /// Whether the channel is one it opened to speak another protocol
+    /// on.
+    strange: bool,
     open: bool,
     connected: bool,
     up: bool,
@@ -122,6 +132,7 @@ impl Peer {
         let Offers {
             like,
             speaks,
+            opens,
             tcp,
             dtls13,
         } = offers;
@@ -146,13 +157,17 @@ impl Peer {
             rtc.add_local_candidate(candidate);
             let mut changes = rtc.sdp_api();
             let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
-            let channel = speaks.then(|| {
-                changes.add_channel_with_config(ChannelConfig {
+            let channel = if speaks {
+                Some(changes.add_channel_with_config(ChannelConfig {
                     label: CHANNEL_LABEL.to_owned(),
                     negotiated: Some(CHANNEL),
                     ..ChannelConfig::default()
-                })
-            });
+                }))
+            } else {
+                // One it opens itself, as a browser does that was not
+                // told of a channel agreed on in advance.
+                opens.map(|label| changes.add_channel(label.to_owned()))
+            };
             let (offer, pending) = changes.apply()?;
             Some((mid, channel, offer.to_sdp_string(), pending))
         });
@@ -164,6 +179,7 @@ impl Peer {
             moves_to: None,
             media: None,
             channel,
+            strange: !speaks && opens.is_some(),
             open: false,
             connected: false,
             up: false,
@@ -335,7 +351,11 @@ impl Peer {
             }
             Event::ChannelData(data) => {
                 let text = core::str::from_utf8(&data.data).ok();
-                if let Some(Ok(said)) = text.map(read::<FromServer>) {
+                if self.strange {
+                    if let Some(text) = text.filter(|_| !data.binary) {
+                        self.heard.push_back(PeerHeard::Text(text.to_owned()));
+                    }
+                } else if let Some(Ok(said)) = text.map(read::<FromServer>) {
                     self.heard.push_back(PeerHeard::Said(said));
                 }
             }
@@ -397,6 +417,20 @@ impl Peer {
     /// that is open.
     pub(crate) fn say(&mut self, message: &FromClient) -> bool {
         self.say_raw(false, write(message).as_bytes())
+    }
+
+    /// Opens another data channel than the one it has, called `label`,
+    /// as a far end may at any time.
+    #[cfg(test)]
+    pub(crate) fn opens_another(&mut self, label: &str) {
+        let config = ChannelConfig {
+            label: label.to_owned(),
+            ..ChannelConfig::default()
+        };
+        self.engine.with(|rtc| {
+            rtc.direct_api().create_data_channel(config);
+        });
+        self.drain();
     }
 
     /// Says `said` on the data channel, as text or as what is none.

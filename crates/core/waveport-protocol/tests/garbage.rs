@@ -31,8 +31,17 @@ use waveport_protocol::client::v1::{FromClient, FromServer, State, View};
 use waveport_protocol::control::v1::{
     CreateSession, Input, Problem, SessionCreated, SessionInfo, Sessions,
 };
-use waveport_protocol::journal;
+use waveport_protocol::{journal, rtvi};
 use waveport_sim::{SeedPlan, SimContext, SimRng, run};
+
+/// JSON as `serde_json` reads it, for the one parser that is told how.
+struct Serde;
+
+impl rtvi::Json for Serde {
+    fn read<T: DeserializeOwned>(text: &str) -> Option<T> {
+        serde_json::from_str(text).ok()
+    }
+}
 
 /// What damaged text is patched with: what means something to JSON, and
 /// what means something to nothing.
@@ -260,6 +269,22 @@ fn one(context: &mut SimContext, all: &[Value], taken: &mut Taken) -> Result<(),
     if let Ok(state) = serde_json::from_slice::<journal::State<'_>>(&text) {
         let _ = state.since();
         by_some = true;
+    }
+
+    // What a client of Pipecat's writes is read in passes, each of
+    // which takes or leaves the same text. What is read holds an id
+    // whenever it is something that can be answered by one.
+    if let Ok(text) = core::str::from_utf8(&text) {
+        match rtvi::read::<Serde>(text) {
+            rtvi::Written::Said(said) => {
+                if !text.contains(&said.id) && !text.contains('\\') {
+                    return Err(format!("an id that was not written: {:?}", said.id));
+                }
+                by_some = true;
+            }
+            rtvi::Written::Unreadable => by_some = true,
+            rtvi::Written::Foreign => {}
+        }
     }
 
     taken.texts += 1;

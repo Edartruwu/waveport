@@ -13,6 +13,9 @@
 //! | `POST /v1/webrtc` | a client token or a resume token | 201, the answer to an offer, and where the call is |
 //! | `PATCH /v1/webrtc/{call}` | whoever made the offer, with the token they made it with | 204 for where the far end is, 200 and a fragment for checks that begin anew |
 //! | `DELETE /v1/webrtc/{call}` | the same | 200, and the far end has hung up |
+//! | `POST /start` | a client token, a control key, or anyone where the daemon has no key | a name to make an offer under, as a client of Pipecat's asks for one |
+//! | `POST /api/offer`, `POST /sessions/{name}/api/offer` | the same, or whoever holds the name | the answer to the offer of a client of Pipecat's |
+//! | `PATCH` on the same | whoever made the offer | that it was heard |
 //! | `POST /v1/telephony/{carrier}/voice` | the carrier, which signs what it asks | the document that connects its call to a stream |
 //! | `GET /v1/telephony/{carrier}/stream` | the carrier, with what the answer gave its stream to say | a WebSocket that carries the call |
 //! | `GET /healthz` | anyone | 200, or 503 while the daemon stops |
@@ -54,7 +57,7 @@ use waveport_protocol::control::v1::{Context, CreateSession, Input, Problem, Ses
 use crate::auth::From;
 use crate::daemon::{Shared, failed};
 use crate::events::Following;
-use crate::{calls, line, playground, webrtc};
+use crate::{calls, line, pipecat, playground, webrtc};
 use waveport_assembly::shown::{Asked, Position};
 
 /// The daemon, for a request.
@@ -100,7 +103,7 @@ fn written(status: StatusCode, kind: &'static str, body: &impl Serialize) -> Res
     response
 }
 
-fn json(status: StatusCode, body: &impl Serialize) -> Response {
+pub(crate) fn json(status: StatusCode, body: &impl Serialize) -> Response {
     written(status, "application/json", body)
 }
 
@@ -161,6 +164,16 @@ pub(crate) fn router(daemon: &Arc<Shared>) -> Router {
                 .delete(webrtc::ends)
                 .get(webrtc::there)
                 .options(webrtc::fragments),
+        )
+        // What a client of Pipecat's asks, where it asks it.
+        .route("/start", post(pipecat::start))
+        .route(
+            "/api/offer",
+            post(pipecat::offer).patch(pipecat::candidates),
+        )
+        .route(
+            "/sessions/{name}/api/offer",
+            post(pipecat::offer_of).patch(pipecat::candidates_of),
         )
         .route("/v1/telephony/{carrier}/voice", post(calls::voice))
         .route("/v1/telephony/{carrier}/stream", get(calls::stream))
@@ -278,7 +291,7 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Result<Option<&str>, Problem> {
 
 /// Whether whoever asks holds a control key. A daemon that has none
 /// lets in whoever says nothing of who they are.
-fn control(daemon: &Shared, headers: &HeaderMap) -> Result<(), Problem> {
+pub(crate) fn control(daemon: &Shared, headers: &HeaderMap) -> Result<(), Problem> {
     match bearer(headers)? {
         None if daemon.keys.is_empty() => Ok(()),
         None => Err(not_admitted("a control key is needed to ask this")),
@@ -348,7 +361,7 @@ async fn who(
 }
 
 /// The session a path names.
-fn session(written: &str) -> Result<SessionId, Problem> {
+pub(crate) fn session(written: &str) -> Result<SessionId, Problem> {
     let plain = written.len() == 32 && written.bytes().all(|byte| byte.is_ascii_hexdigit());
     plain
         .then(|| u128::from_str_radix(written, 16).ok())
@@ -358,7 +371,7 @@ fn session(written: &str) -> Result<SessionId, Problem> {
 }
 
 /// The body of a request, as the JSON of a `T`.
-async fn read<T: DeserializeOwned>(
+pub(crate) async fn read<T: DeserializeOwned>(
     daemon: &Shared,
     headers: &HeaderMap,
     body: Body,
@@ -394,7 +407,10 @@ async fn read<T: DeserializeOwned>(
 
 /// The values a query gives `name`: each time it is named, and each
 /// part between commas.
-fn values<'a>(query: Option<&'a str>, name: &'a str) -> impl Iterator<Item = String> + 'a {
+pub(crate) fn values<'a>(
+    query: Option<&'a str>,
+    name: &'a str,
+) -> impl Iterator<Item = String> + 'a {
     query
         .unwrap_or_default()
         .split('&')

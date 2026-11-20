@@ -260,14 +260,17 @@ const GATES: &[Gate] = &[
         tool: Some(Tool::Node),
         // The JavaScript client: its types, its tests, and a browser on
         // the page a daemon serves. The daemon is the real one, so the
-        // models that listen are fetched for it.
+        // models that listen are fetched for it. Then the same daemon
+        // with the stock client of Pipecat's on a page.
         run: |env| {
             Ok(within(env, js::DIR, js::INSTALL)?
                 && within(env, js::DIR, js::CHECK)?
                 && within(env, js::DIR, js::TEST)?
                 && shell(env, js::STAND_IN)?
                 && assets::run(&[])?
-                && within(env, js::DIR, js::BROWSER)?)
+                && within(env, js::DIR, js::BROWSER)?
+                && within(env, js::STOCK_DIR, js::INSTALL)?
+                && within(env, js::STOCK_DIR, js::STOCK)?)
         },
     },
 ];
@@ -507,6 +510,9 @@ mod tests {
                 js::STAND_IN,
                 js::BROWSER,
                 &format!("working-directory: {}", js::DIR),
+                // And the stock client of Pipecat's, in its own.
+                js::STOCK,
+                &format!("working-directory: {}", js::STOCK_DIR),
                 // Settings the local runner applies to its child processes.
                 "CARGO_BUILD_WARNINGS: deny",
                 "RUSTDOCFLAGS: -D warnings",
@@ -536,6 +542,11 @@ mod tests {
                 // Without this the measurement is printed and held to
                 // nothing.
                 "WAVEPORT_PERF_GATE:",
+                // The stock client of Pipecat's at its newest, against
+                // the daemon as it is.
+                js::STOCK_NEWEST,
+                js::STOCK,
+                &format!("working-directory: {}", js::STOCK_DIR),
             ],
         );
     }
