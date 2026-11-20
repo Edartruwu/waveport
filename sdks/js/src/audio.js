@@ -42,10 +42,17 @@ import { HEARS, PLAYS } from "./worklet.js";
 
 /**
  * @typedef {object} VoiceOptions
- * @property {MediaStream} [microphone] What is heard, in place of the
- *   microphone the browser would be asked for.
+ * @property {MediaStream | null} [microphone] What is heard, in place
+ *   of the microphone the browser would be asked for. `null` is none:
+ *   the browser is asked for nothing, and the voice hears nothing until
+ *   it is given something to hear (`hears`).
  * @property {boolean} [owned] Whether a microphone that was given is
  *   the voice's to let go of when it stops.
+ * @property {"speakers" | "stream"} [output] Where what the agent says
+ *   goes: to what the browser plays on (`speakers`, if left out), or
+ *   into a stream that the page plays itself (`stream`, read from
+ *   `output`), as a page does that shows the sound or chooses what it
+ *   is played on.
  * @property {MediaTrackConstraints} [constraints] What is asked of the
  *   microphone, beside and in place of one channel with the echo of
  *   what is played, the noise around and the level of the voice seen
@@ -105,7 +112,16 @@ export class Voice {
   /** @type {AudioWorkletNode} */
   #plays;
 
-  /** @type {MediaStream} */
+  /** What takes what the microphone hears. @type {AudioWorkletNode} */
+  #hears;
+
+  /** The microphone, as the audio thread has it. @type {MediaStreamAudioSourceNode | undefined} */
+  #source;
+
+  /** What the agent says, where the page plays it itself. @type {MediaStream | undefined} */
+  #output;
+
+  /** @type {MediaStream | undefined} */
   #microphone;
 
   /** Whether the microphone is the voice's own to let go of. */
@@ -153,7 +169,7 @@ export class Voice {
    * @param {AudioContext} context
    * @param {AudioWorkletNode} plays
    * @param {AudioWorkletNode} hears
-   * @param {MediaStream} microphone
+   * @param {MediaStream | undefined} microphone
    * @param {boolean} owns
    * @param {VoiceOptions} options
    */
@@ -161,8 +177,9 @@ export class Voice {
     this.#format = format;
     this.#context = context;
     this.#plays = plays;
+    this.#hears = hears;
     this.#microphone = microphone;
-    this.#owns = owns;
+    this.#owns = owns && microphone !== undefined;
     this.#failed = options.onerror ?? (() => {});
     if (format.codec === "opus") {
       this.#decoder = new AudioDecoder({
@@ -228,9 +245,9 @@ export class Voice {
   /**
    * Makes a voice that writes audio as `format` says, which is what
    * `Voice.format` answered and what the client says hello with: asks
-   * for the microphone, and is ready to play. It is on no line until
-   * it is attached to a client, and what the microphone hears until
-   * then goes nowhere.
+   * for the microphone, unless it is given one or told that there is
+   * none, and is ready to play. It is on no line until it is attached
+   * to a client, and what the microphone hears until then goes nowhere.
    *
    * @param {AudioFormat} format
    * @param {VoiceOptions} [options]
@@ -247,13 +264,23 @@ export class Voice {
       const worklet = options.worklet ?? new URL("./worklet.js", import.meta.url);
       await context.audioWorklet.addModule(worklet);
       const owns = options.microphone === undefined || options.owned === true;
-      const heard = options.microphone ?? (await microphone(options.constraints));
+      const given = options.microphone;
+      const heard = given === null ? undefined : (given ?? (await microphone(options.constraints)));
       const plays = new AudioWorkletNode(context, PLAYS, {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [1],
       });
-      plays.connect(context.destination);
+      /** @type {MediaStream | undefined} */
+      let output;
+      if (options.output === "stream") {
+        // The page plays it: nothing of it goes to the speakers here.
+        const into = context.createMediaStreamDestination();
+        plays.connect(into);
+        output = into.stream;
+      } else {
+        plays.connect(context.destination);
+      }
       const hears = new AudioWorkletNode(context, HEARS, {
         numberOfInputs: 1,
         numberOfOutputs: 1,
@@ -262,14 +289,16 @@ export class Voice {
         outputChannelCount: [1],
         processorOptions: { frame: format.rate / 50 },
       });
-      context.createMediaStreamSource(heard).connect(hears);
       // What hears is asked for what it has only while something
       // listens to it: its silence goes to the output.
       const silent = context.createGain();
       silent.gain.value = 0;
       hears.connect(silent).connect(context.destination);
       await context.resume();
-      return new Voice(format, context, plays, hears, heard, owns, options);
+      const voice = new Voice(format, context, plays, hears, heard, owns, options);
+      voice.#output = output;
+      voice.#listen();
+      return voice;
     } catch (error) {
       await context.close();
       throw error;
@@ -316,6 +345,24 @@ export class Voice {
   }
 
   /**
+   * What the agent says, as a stream for the page to play, where the
+   * voice was asked for one (`output: "stream"`). Nothing where the
+   * voice plays by itself. What plays the stream takes a while of its
+   * own over it, which the voice does not know of: what it says was
+   * played is early by that much.
+   *
+   * @returns {MediaStream | undefined}
+   */
+  get output() {
+    return this.#output;
+  }
+
+  /** The microphone, if the voice has one. */
+  get microphone() {
+    return this.#microphone;
+  }
+
+  /**
    * What the microphone was given of what it was asked for: whether
    * the echo of what is played is taken out of it, and how much of it
    * (`echoCancellation`), among the rest.
@@ -323,7 +370,43 @@ export class Voice {
    * @returns {MediaTrackSettings}
    */
   get settings() {
-    return this.#microphone.getAudioTracks()[0]?.getSettings() ?? {};
+    return this.#microphone?.getAudioTracks()[0]?.getSettings() ?? {};
+  }
+
+  /**
+   * Hears `microphone` from here on, in place of the one it heard: a
+   * page's user chose another, or none (`null`). The one before is let
+   * go of if it was the voice's.
+   *
+   * @param {MediaStream | null} microphone
+   * @param {boolean} [owned] Whether it is the voice's to let go of
+   *   when it stops or is given another. It is, if left out.
+   * @returns {Promise<void>}
+   * @throws {Error} The voice was stopped.
+   */
+  async hears(microphone, owned = true) {
+    if (this.#stopped) {
+      throw new Error("the voice was stopped");
+    }
+    const before = this.#owns ? this.#microphone : undefined;
+    this.#microphone = microphone ?? undefined;
+    this.#owns = owned && microphone !== null;
+    this.#listen();
+    if (before !== undefined && before !== microphone) {
+      for (const track of before.getTracks()) {
+        track.stop();
+      }
+    }
+  }
+
+  /** Gives the audio thread the microphone there is, in place of the one it had. */
+  #listen() {
+    this.#source?.disconnect();
+    this.#source = undefined;
+    if (this.#microphone !== undefined) {
+      this.#source = this.#context.createMediaStreamSource(this.#microphone);
+      this.#source.connect(this.#hears);
+    }
   }
 
   /** Whether silence is sent in place of what the microphone hears. */
@@ -348,7 +431,7 @@ export class Voice {
       stop();
     }
     if (this.#owns) {
-      for (const track of this.#microphone.getTracks()) {
+      for (const track of this.#microphone?.getTracks() ?? []) {
         track.stop();
       }
     }

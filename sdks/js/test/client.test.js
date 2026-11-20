@@ -407,6 +407,17 @@ test("a client ends the session, or lets go of the line", async () => {
   assert.deepEqual(client.resume, { token: "wpr1_madeup", life: 1, seen: 0 });
 });
 
+test("a client on a WebSocket that is given a microphone says nothing of it: its voice sends what it hears", async () => {
+  const { client, socket } = await welcomed();
+  const sent = socket.sent.length;
+  const track = /** @type {MediaStreamTrack} */ (/** @type {unknown} */ ({ kind: "audio" }));
+  await client.hears(track);
+  await client.hears(undefined);
+  assert.equal(client.call, undefined);
+  assert.equal(socket.sent.length, sent);
+  assert.equal(client.status, "open");
+});
+
 test("a client that is told to comes back on another connection", async () => {
   const { client, socket, told } = await welcomed();
   client.reconnect();

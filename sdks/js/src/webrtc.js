@@ -736,15 +736,26 @@ export function playedBy(stats) {
 }
 
 /**
+ * What plays a call, as far as its voice asks: an element of a page
+ * does, and so does anything else that takes a stream to play and can
+ * be told to keep it from being heard.
+ *
+ * @typedef {Pick<HTMLMediaElement, "autoplay" | "muted" | "srcObject" | "play">} Plays
+ */
+
+/**
  * @typedef {object} CallVoiceOptions
- * @property {MediaStream} [microphone] What is heard, in place of the
- *   microphone the browser would be asked for.
+ * @property {MediaStream | null} [microphone] What is heard, in place
+ *   of the microphone the browser would be asked for. `null` is none:
+ *   the browser is asked for nothing, and the call sends nothing until
+ *   its voice is given something to hear (`hears`).
  * @property {boolean} [owned] Whether a microphone that was given is
  *   the voice's to let go of when it stops.
  * @property {MediaTrackConstraints} [constraints] What is asked of the
  *   microphone, as for `Voice`.
- * @property {HTMLMediaElement} [element] What plays the call, in place
- *   of an element the voice makes for itself.
+ * @property {Plays} [element] What plays the call, in place of an
+ *   element the voice makes for itself: an element of the page's, or
+ *   what stands in for one where the page plays the call itself.
  * @property {(error: Error) => void} [onerror] Told what went wrong
  *   with the audio once it was started.
  */
@@ -760,12 +771,12 @@ export class CallVoice {
   /** @type {Call | undefined} */
   #call;
 
-  /** @type {MediaStream} */
+  /** @type {MediaStream | undefined} */
   #microphone;
 
   #owns;
 
-  /** @type {HTMLMediaElement} */
+  /** @type {Plays} */
   #element;
 
   #playing = new Playing();
@@ -795,22 +806,23 @@ export class CallVoice {
   #failed;
 
   /**
-   * @param {MediaStream} microphone
+   * @param {MediaStream | undefined} microphone
    * @param {boolean} owns
    * @param {CallVoiceOptions} options
    */
   constructor(microphone, owns, options) {
     this.#microphone = microphone;
-    this.#owns = owns;
+    this.#owns = owns && microphone !== undefined;
     this.#failed = options.onerror ?? (() => {});
     this.#element = options.element ?? new Audio();
     this.#element.autoplay = true;
   }
 
   /**
-   * Makes a voice for a call: asks for the microphone, and is ready to
-   * play. It is on no call until it is attached to a client, which is
-   * given `track` to call with.
+   * Makes a voice for a call: asks for the microphone, unless it is
+   * given one or told that there is none, and is ready to play. It is
+   * on no call until it is attached to a client, which is given `track`
+   * to call with.
    *
    * @param {CallVoiceOptions} [options]
    * @returns {Promise<CallVoice>}
@@ -818,18 +830,58 @@ export class CallVoice {
    */
   static async open(options = {}) {
     const given = options.microphone;
-    const heard = given ?? (await microphone(options.constraints));
+    const heard = given === null ? undefined : (given ?? (await microphone(options.constraints)));
     return new CallVoice(heard, given === undefined || options.owned === true, options);
   }
 
-  /** What the microphone hears: what a client calls with (`microphone`). */
+  /**
+   * What the microphone hears: what a client calls with (`microphone`).
+   * Nothing for a voice that has no microphone.
+   *
+   * @returns {MediaStreamTrack | undefined}
+   */
   get track() {
-    return this.#microphone.getAudioTracks()[0];
+    return this.#microphone?.getAudioTracks()[0];
   }
 
-  /** The microphone, for a voice of another kind that takes this one's place. */
+  /** The microphone, if the voice has one. */
   get microphone() {
     return this.#microphone;
+  }
+
+  /**
+   * Hears `microphone` from here on, in place of the one it heard: a
+   * page's user chose another, or none (`null`). The call sends it at
+   * once, muted if the voice is, and the calls its client comes back on
+   * are made with it. The one before is let go of if it was the
+   * voice's.
+   *
+   * @param {MediaStream | null} microphone
+   * @param {boolean} [owned] Whether it is the voice's to let go of
+   *   when it stops or is given another. It is, if left out.
+   * @returns {Promise<void>}
+   * @throws {Error} The voice was stopped, or the call does not take
+   *   the track: the voice hears what it heard.
+   */
+  async hears(microphone, owned = true) {
+    if (this.#stopped) {
+      throw new Error("the voice was stopped");
+    }
+    const track = microphone?.getAudioTracks()[0];
+    if (track !== undefined) {
+      // What is muted stays muted, whatever is heard.
+      track.enabled = !this.#muted;
+    }
+    // The call takes it first: one it does not take changes nothing.
+    await this.#client?.hears(track);
+    const before = this.#owns ? this.#microphone : undefined;
+    this.#microphone = microphone ?? undefined;
+    this.#owns = owned && microphone !== null;
+    if (before !== undefined && before !== microphone) {
+      for (const one of before.getTracks()) {
+        one.stop();
+      }
+    }
   }
 
   /**
@@ -915,7 +967,7 @@ export class CallVoice {
     clearInterval(this.#timer);
     this.#lets();
     if (this.#owns) {
-      for (const track of this.#microphone.getTracks()) {
+      for (const track of this.#microphone?.getTracks() ?? []) {
         track.stop();
       }
     }
@@ -923,9 +975,10 @@ export class CallVoice {
 
   /**
    * Gives the microphone to whoever asks, and stops: for a voice of
-   * another kind that takes this one's place.
+   * another kind that takes this one's place. Nothing where the voice
+   * has none.
    *
-   * @returns {MediaStream}
+   * @returns {MediaStream | undefined}
    */
   release() {
     this.#owns = false;

@@ -229,7 +229,9 @@ class Firefox extends Browser {
     const { contexts } = await this.ask("browsingContext.getTree");
     this.#page = contexts[0].context;
     const wav = readFileSync(this.#microphone).toString("base64");
-    const before = `() => { ${first}; ${hearsARecording(wav)}; }`;
+    // The recording first: what the page is given for a microphone is
+    // what `first` counts the asking of.
+    const before = `() => { ${hearsARecording(wav)}; ${first}; }`;
     await this.ask("script.addPreloadScript", { functionDeclaration: before });
   }
 
@@ -336,6 +338,17 @@ const KEEPS_WHAT_IS_SAID = `(() => {
   window.said = [];
   window.calls = [];
   window.asked = [];
+  // How often the page asked for a microphone. A page that is none
+  // yet has none to ask for.
+  window.microphones = 0;
+  const devices = navigator.mediaDevices;
+  if (devices !== undefined) {
+    const microphone = devices.getUserMedia;
+    devices.getUserMedia = function (asked) {
+      window.microphones += 1;
+      return microphone.call(this, asked);
+    };
+  }
   const asks = window.fetch;
   window.fetch = async function (at, how) {
     const answered = await asks.call(this, at, how);
@@ -468,6 +481,36 @@ const ENDED = "window.playground.ended !== undefined";
 /** The page is on the line of a session. */
 const OPEN = `window.playground.client?.status === "open"`;
 
+/** The page shows what the agent says first. */
+const GREETED_ON_THE_PAGE = `[...document.querySelectorAll("#conversation li")].some(
+  (item) => item.dataset.kind === "utterance" && item.firstChild.textContent === ${JSON.stringify(GREETING)},
+)`;
+
+/**
+ * A call that began with no microphone is given one: the page asked
+ * the browser for none until its user pressed for it, and its session
+ * hears the question from then on.
+ *
+ * @param {Browser} browser
+ */
+async function isGivenItsMicrophone(browser) {
+  // The agent is heard first, by a page that hears nobody.
+  await browser.until(GREETED_ON_THE_PAGE, "the greeting");
+  const pressed = `document.getElementById("mute").getAttribute("aria-pressed")`;
+  assert.equal(await browser.does("window.microphones"), 0);
+  assert.equal(await browser.does("window.playground.voice.microphone === undefined"), true);
+  assert.equal(await browser.does(pressed), "true");
+  await browser.does(`document.getElementById("mute").click()`);
+  await browser.until(
+    "window.playground.voice.microphone !== undefined || window.playground.problem !== undefined",
+    "the microphone",
+  );
+  assert.equal(await browser.does("window.playground.problem"), undefined);
+  assert.equal(await browser.does("window.microphones"), 1);
+  assert.equal(await browser.does(pressed), "false");
+  assert.equal(await browser.does("window.playground.voice.muted"), false);
+}
+
 /**
  * A call that is spoken over a WebSocket: the browser hears the
  * question from its recording, sends it as `line` says, and plays the
@@ -477,13 +520,16 @@ const OPEN = `window.playground.client?.status === "open"`;
  * @param {string} line How the audio is to be written, and over what.
  * @param {"none"} [ways] The ways a call over WebRTC is left, where
  *   one is tried first.
+ * @param {boolean} [later] Whether the call begins with no microphone
+ *   and is given one once the agent has greeted.
  */
-async function spoken(browser, line, ways) {
+async function spoken(browser, line, ways, later = false) {
   await browser.until(READY, "a page that is ready");
   await browser.does(`(() => {
     window.said = [];
     window.calls = [];
     window.asked = [];
+    window.microphones = 0;
     window.ways = ${JSON.stringify(ways)};
   })()`);
   await browser.does(`document.getElementById("talk").click()`);
@@ -491,6 +537,9 @@ async function spoken(browser, line, ways) {
   assert.equal(await browser.does("window.playground.problem"), undefined);
   const about = await browser.does(`document.getElementById("about").textContent`);
   assert.ok(about.includes(line), `the line is ${line}: ${about}`);
+  if (later) {
+    await isGivenItsMicrophone(browser);
+  }
   // The page says what it played as it plays it, and the session takes
   // the answer as heard to its end by that: it is not cut off.
   await browser.until(ENDED, "the end of the call");
@@ -597,6 +646,8 @@ function responses(call) {
  * @param {"udp" | "tcp"} how.way What it is to go over.
  * @param {boolean} [how.drops] Whether the call drops once the agent
  *   has greeted, and the page comes back on another.
+ * @param {boolean} [how.later] Whether the call begins with no
+ *   microphone and is given one once the agent has greeted.
  */
 async function called(browser, how) {
   await browser.until(READY, "a page that is ready");
@@ -604,6 +655,7 @@ async function called(browser, how) {
     window.said = [];
     window.calls = [];
     window.asked = [];
+    window.microphones = 0;
     window.ways = ${JSON.stringify(how.ways)};
   })()`);
   await browser.does(`document.getElementById("talk").click()`);
@@ -613,13 +665,13 @@ async function called(browser, how) {
   const about = await browser.does(`document.getElementById("about").textContent`);
   assert.ok(about.includes(line), `the line is ${line}: ${about}`);
   assert.equal(await browser.does(WAY), how.way);
+  if (how.later === true) {
+    await isGivenItsMicrophone(browser);
+  }
   if (how.drops === true) {
     // The agent is heard out first: a session cuts what it is saying
     // where it was heard when its call drops, and says it again.
-    const greeted = `[...document.querySelectorAll("#conversation li")].some(
-      (item) => item.dataset.kind === "utterance" && item.firstChild.textContent === ${JSON.stringify(GREETING)},
-    )`;
-    await browser.until(greeted, "the greeting");
+    await browser.until(GREETED_ON_THE_PAGE, "the greeting");
     await browser.does(`(() => {
       window.before = window.playground.client.welcome;
       window.playground.client.reconnect();
@@ -808,6 +860,19 @@ async function main() {
         "?mic=raw&within=800",
         "a call that does not get through, and is made over a WebSocket",
         () => spoken(page, "opus at 48 kHz, over a WebSocket", "none"),
+      ],
+      // `?listen=first`: the page asks for no microphone until its
+      // user presses for one. The recording begins when it is asked
+      // for, and the question is in it three seconds on.
+      [
+        "?mic=raw&listen=first",
+        "a call over WebRTC that listens first, and is given its microphone",
+        () => called(page, { way: "udp", later: true }),
+      ],
+      [
+        "?mic=raw&listen=first&over=websocket",
+        "a call over a WebSocket that listens first, and is given its microphone",
+        () => spoken(page, "opus at 48 kHz, over a WebSocket", undefined, true),
       ],
     ];
     await page.open(KEEPS_WHAT_IS_SAID);

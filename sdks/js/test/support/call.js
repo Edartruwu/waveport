@@ -97,8 +97,18 @@ export class Peer {
   /** @type {Channel | undefined} */
   channel = undefined;
   receiver = new Receiver();
-  sender = {};
-  /** What the call sends: a track, or the kind of one. @type {unknown} */
+  /** What a browser that does not take a track says. @type {Error | undefined} */
+  refusesTracks = undefined;
+  sender = {
+    replaceTrack: async (/** @type {unknown} */ track) => {
+      if (this.refusesTracks !== undefined) {
+        throw this.refusesTracks;
+      }
+      this.sends = track;
+      this.did.push("another track");
+    },
+  };
+  /** What the call sends: a track, the kind of one, or nothing (`null`). @type {unknown} */
   sends = undefined;
   /** @type {{ type: string, sdp: string } | undefined} */
   remote = undefined;

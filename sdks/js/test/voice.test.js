@@ -52,9 +52,36 @@ class WorkletNode {
     context.nodes.push(this);
   }
 
+  /** What it was connected to, in order. @type {unknown[]} */
+  to = [];
+
   /** @param {unknown} to */
   connect(to) {
+    this.to.push(to);
     return to;
+  }
+}
+
+/** A microphone, as the audio thread has one. */
+class Source {
+  /** What hears it. @type {unknown[]} */
+  to = [];
+
+  disconnected = false;
+
+  /** @param {unknown} stream */
+  constructor(stream) {
+    this.stream = stream;
+  }
+
+  /** @param {unknown} to */
+  connect(to) {
+    this.to.push(to);
+    return to;
+  }
+
+  disconnect() {
+    this.disconnected = true;
   }
 }
 
@@ -98,8 +125,21 @@ class Context {
     return { contextTime: 0.97, performanceTime: 0 };
   }
 
-  createMediaStreamSource() {
-    return { connect: (/** @type {unknown} */ to) => to };
+  /** Every microphone the audio thread was given, in order. @type {Source[]} */
+  sources = [];
+
+  /** What takes what is played, where the page plays it itself. */
+  into = { stream: { plays: "what the agent says" } };
+
+  /** @param {unknown} stream */
+  createMediaStreamSource(stream) {
+    const source = new Source(stream);
+    this.sources.push(source);
+    return source;
+  }
+
+  createMediaStreamDestination() {
+    return this.into;
   }
 
   createGain() {
@@ -295,6 +335,11 @@ test("what the microphone hears is sent as it is heard, and silence in its place
   const { calling, socket } = await spoken();
   const { voice } = await calling;
   assert.ok(voice !== undefined);
+  // The microphone the voice was made with is what the audio thread
+  // hears, and nothing else is.
+  assert.equal(context().sources.length, 1);
+  assert.equal(context().sources[0]?.stream, given);
+  assert.deepEqual(context().sources[0]?.to, [context().hears]);
   const heard = () => Float32Array.of(0, 0.5, -0.5, 1, -1, 2, -2);
   context().hears.port.says(heard());
   assert.deepEqual(socket.sent.at(-1), Int16Array.of(0, 16_384, -16_383, 32_767, -32_767, 32_767, -32_767));
@@ -437,6 +482,76 @@ test("a page that may not have the microphone, or cannot play at the rate, makes
   // No session was made for either, and nothing was connected to.
   assert.ok(!order.includes("a token is asked for"));
   assert.equal(Socket.made.length, 0);
+});
+
+test("a voice that is told there is no microphone asks for none, and hears the one it is given last", async () => {
+  const voice = await Voice.open(PCM, { microphone: null });
+  assert.ok(!order.includes("the microphone is there"));
+  assert.deepEqual(context().sources, []);
+  assert.equal(voice.microphone, undefined);
+  assert.deepEqual(voice.settings, {});
+
+  // It is given one, which is what the audio thread hears.
+  const first = new Microphone();
+  await voice.hears(/** @type {any} */ (first));
+  assert.equal(voice.microphone, first);
+  assert.equal(context().sources.length, 1);
+  assert.equal(context().sources[0]?.stream, first);
+  assert.deepEqual(context().sources[0]?.to, [context().hears]);
+  assert.equal(voice.settings.echoCancellation, true);
+
+  // Another takes its place. The one before is heard no more, and is
+  // let go of, since it was the voice's.
+  const second = new Microphone();
+  await voice.hears(/** @type {any} */ (second), false);
+  assert.equal(context().sources[0]?.disconnected, true);
+  assert.equal(first.stopped, true);
+  assert.equal(context().sources[1]?.stream, second);
+  assert.equal(context().sources[1]?.disconnected, false);
+
+  // None again. One that is the page's is the page's to let go of.
+  await voice.hears(null);
+  assert.equal(context().sources[1]?.disconnected, true);
+  assert.equal(second.stopped, false);
+  assert.equal(context().sources.length, 2);
+  assert.equal(voice.microphone, undefined);
+
+  // One that is given again where it already is, is not let go of.
+  const third = new Microphone();
+  await voice.hears(/** @type {any} */ (third));
+  await voice.hears(/** @type {any} */ (third));
+  assert.equal(third.stopped, false);
+  // It is the voice's, and goes with it. A voice that was stopped
+  // hears nothing more.
+  voice.stop();
+  assert.equal(third.stopped, true);
+  assert.equal(second.stopped, false);
+  await assert.rejects(voice.hears(/** @type {any} */ (first)), /stopped/);
+});
+
+test("a voice that is the page's to play gives what the agent says as a stream, and plays none of it", async () => {
+  const voice = await Voice.open(PCM, { microphone: own(), output: "stream" });
+  assert.equal(voice.output, context().into.stream);
+  assert.deepEqual(context().plays.to, [context().into]);
+  voice.stop();
+  // One that plays by itself gives none.
+  const other = await Voice.open(PCM, { microphone: own() });
+  assert.equal(other.output, undefined);
+  assert.deepEqual(context().plays.to, [context().destination]);
+  other.stop();
+});
+
+test("a call that is spoken with no microphone asks for none and sends nothing of its own", async () => {
+  const { calling, socket } = await spoken({ microphone: null });
+  const { voice } = await calling;
+  assert.ok(voice instanceof Voice);
+  assert.ok(!order.includes("the microphone is there"));
+  assert.deepEqual(context().sources, []);
+  // What the agent says is played all the same.
+  socket.says({ type: "mark", run: 0, generation: 1 });
+  socket.onmessage?.({ data: Int16Array.of(0, 16_384).buffer });
+  assert.equal(told().at(-1)?.type, "audio");
+  voice.stop();
 });
 
 test("audio is written as Opus where the browser codes it at the rate, and as plain samples elsewhere", async () => {

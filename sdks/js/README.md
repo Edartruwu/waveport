@@ -64,6 +64,7 @@ const client = await Client.connect("https://agents.example", { token, features:
 | `client.bye()` | Ends the session |
 | `client.detach()` | Lets go of the line and does not come back. The session waits, and `client.resume`, read before, is what another `Client.connect(address, { resume })` comes back to it with, from this page or the next |
 | `client.reconnect()` | Lets go of the connection and comes back on another, for a page that knows its network changed before the connection does |
+| `client.hears(track)` | What a call carries of this end from here on: the track of another microphone, or nothing. A voice calls it (`voice.hears`), and a page that has no voice may |
 | `client.view` | What the session has come to, as far as the client was told: `view.state.items` is the conversation, `view.state.speech` what the agent is saying and how much of it was heard |
 | `client.status` | `open`, `away` while the client comes back, `closed` |
 | `client.on(type, listener)` | Listens, and returns what stops listening |
@@ -105,6 +106,34 @@ The browser carries the audio of a call both ways and plays what arrives, so the
 
 `voice.silenced` says whether what the browser plays is being kept from being heard, and `voice.settings` what the microphone was given, as for `Voice`.
 
+### Another microphone, or none
+
+```js
+const voice = await CallVoice.open({ microphone: null });   // the browser is asked for nothing
+// ... the call is made, and hears and sends nothing of this end ...
+const chosen = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: id } } });
+await voice.hears(chosen);                                  // the call sends it from here on
+await voice.hears(null);                                    // and nothing again
+```
+
+`voice.hears(stream)` gives a voice another microphone in the place of the one it has, as a page does whose user chose another, and `voice.hears(null)` takes it away. Both kinds of voice have it, and `call` passes `microphone: null` to whichever the call comes to.
+
+- The call sends the new one at once, with nothing agreed anew, and **the calls the client comes back on are made with it**.
+- A voice that is muted stays muted.
+- The one before is let go of if it was the voice's: one the voice asked the browser for, or one it was given as its own (`owned`, which `hears` takes as its second argument and takes for `true`). One the page gave and kept is the page's to stop.
+- A call that does not take the track changes nothing, and `hears` says why.
+
+### A page that plays the call itself
+
+A voice plays what the agent says. A page that wants to play it itself, to show the sound as it plays or to choose what it is played on, is given the audio instead:
+
+| Voice | Asked with | The page is given |
+|---|---|---|
+| `CallVoice` | `element`: an element of the page's, or anything that has `srcObject`, `muted`, `autoplay` and `play()` | A stream with the track of the call as `srcObject`, again for each call the client comes back on, and `muted` while a response that was discarded is still coming out of the browser |
+| `Voice` | `output: "stream"` | `voice.output`, a stream that nothing else plays |
+
+What stands in for an element has to keep the call from being heard while it is `muted`: by not playing it, or by switching the track off (`track.enabled`). A voice of a WebSocket discards by itself, and what it says was played is what it gave to the stream: **whatever plays the stream takes a while of its own over it, and what the session takes for heard is early by that much.**
+
 ## The voice of a WebSocket
 
 ```js
@@ -121,7 +150,8 @@ voice.stop();                                  // the client goes on
 - **How audio is written.** As Opus at 48 kHz where the browser codes and decodes Opus itself (WebCodecs), and as plain samples of 16 bits otherwise. A browser's Opus decoder gives 48 kHz whatever it is asked, so Opus is at that rate or not used.
 - **What was played.** Audio is played on the audio thread (`worklet.js`), which counts each sample as heard once the output has had the time to sound it: the longest of what the browser says that time is. It says what was played of a run a few times a second, ten at 48 kHz, and when the run has been played to its end, and the client tells the session. That is how the session knows what its far end heard when it is interrupted. When the session discards a run (`clear`), nothing more of it is played, and what had been given to the output by then is said at once.
 - **The microphone** is sent 20 ms at a time, silence too: the session hears at the pace it is sent.
-- **Echo.** The microphone is asked for with the echo of what is played taken out of it (`echoCancellation: true`), which leaves how much is taken out to the browser. `voice.settings` says what the browser gave. `constraints` in the options of `Voice.open` asks for something else, and `microphone` gives a stream in place of the browser's.
+- **Echo.** The microphone is asked for with the echo of what is played taken out of it (`echoCancellation: true`), which leaves how much is taken out to the browser. `voice.settings` says what the browser gave. `constraints` in the options of `Voice.open` asks for something else, and `microphone` gives a stream in place of the browser's, or none (`null`). [`voice.hears`](#another-microphone-or-none) gives it another while it is on the line.
+- **A voice with no microphone sends nothing**, where one that is muted sends silence: its session hears nobody.
 
 `worklet.js` is loaded by its address, beside `audio.js`. Where a bundler moves it, `Voice.open(format, { worklet })` says where it is.
 
@@ -129,11 +159,11 @@ voice.stop();                                  // the client goes on
 
 | Browser | Tested here | A call over WebRTC | Opus through WebCodecs, on a WebSocket |
 |---|---|---|---|
-| Chrome 157 on Linux, headless | In every test run, the eight steps below | Over datagrams and over a connection alone. It says where it is in the stream to the packet, and how long its output takes | Yes |
-| Firefox 158 on Linux, headless | By hand on 20 November 2026 (`--firefox`), the same eight steps, all passing | Over datagrams and over a connection alone, to an address that is not `127.0.0.1`. It says where it is in the stream and stops short of the end, which the voice allows for; it does not say how long its output takes, which is then taken as nothing | Yes |
+| Chrome 157 on Linux, headless | In every test run, the ten steps below | Over datagrams and over a connection alone. It says where it is in the stream to the packet, and how long its output takes | Yes |
+| Firefox 158 on Linux, headless | By hand on 20 November 2026 (`--firefox`), the same ten steps, all passing | Over datagrams and over a connection alone, to an address that is not `127.0.0.1`. It says where it is in the stream and stops short of the end, which the voice allows for; it does not say how long its output takes, which is then taken as nothing | Yes |
 | Safari | **Not tested: there is none on Linux** | Not known. It is the browser the count of what came out of the buffer is for, by its documentation | In its documentation from version 26. Plain samples before |
 
-The eight steps: a spoken call over a WebSocket as Opus and as plain samples, a session in writing, one whose line drops, a spoken call over WebRTC by datagrams, one that only a connection carries, one that drops and is come back to, and one that does not get through and is made over a WebSocket. Every step is one machine talking to itself: no network was lost, slow or in the way.
+The ten steps: a spoken call over a WebSocket as Opus and as plain samples, a session in writing, one whose line drops, a spoken call over WebRTC by datagrams, one that only a connection carries, one that drops and is come back to, one that does not get through and is made over a WebSocket, and a call over each that begins with no microphone and is given one once the agent has greeted. Every step is one machine talking to itself: no network was lost, slow or in the way. **No step changes one microphone for another**: a machine that runs these has one stand-in for a microphone, so that is held with a browser stood in for (`test/callvoice.test.js`, `test/voice.test.js`), and so is a page that plays the call itself.
 
 The row that is not tested is a reading of the browser's documentation on 17 November 2026. A browser that cannot do what its row says falls back by itself: to a WebSocket where it makes no call, and to plain samples where it codes no Opus, which every browser with an audio worklet plays.
 
@@ -151,7 +181,7 @@ That is a daemon whose agent has stand-ins for its providers, and needs no key: 
 
 Where the daemon has a control key, the page asks for it and sends it to the daemon it came from and nowhere else. It is a page for whoever runs the daemon. An application's own page is given a client token by its server, as above.
 
-`?mic=raw` in the page's address asks for the microphone as it is, without the browser's echo cancellation, noise suppression and gain: for someone with headphones on. `?over=webrtc` and `?over=websocket` say what a spoken call is made over, where the page would otherwise try the first and go over the second, and `?within=1500` how many milliseconds a call over WebRTC is given to be there. The page says under "Line" what its call came to.
+`?mic=raw` in the page's address asks for the microphone as it is, without the browser's echo cancellation, noise suppression and gain: for someone with headphones on. `?over=webrtc` and `?over=websocket` say what a spoken call is made over, where the page would otherwise try the first and go over the second, and `?within=1500` how many milliseconds a call over WebRTC is given to be there. `?listen=first` begins a spoken call with no microphone: the agent is heard, "Mute" is pressed, and pressing it is what asks for the microphone and gives it to the call. The page says under "Line" what its call came to.
 
 The page and the client are read into the daemon when it is built. A change to either is seen after the daemon is built again.
 
