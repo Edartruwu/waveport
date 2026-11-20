@@ -37,6 +37,7 @@ const HTML: &str = "text/html; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
 const JS: &str = "text/javascript; charset=utf-8";
 const JSON: &str = "application/json";
+const SVG: &str = "image/svg+xml; charset=utf-8";
 
 /// Brings in a file of the JavaScript client's folder.
 macro_rules! file {
@@ -47,22 +48,26 @@ macro_rules! file {
 
 /// What is served under `/playground/`: the name, what kind of thing it
 /// is, and the thing.
-const FILES: [(&str, &str, &str); 8] = [
+const FILES: [(&str, &str, &str); 10] = [
     ("", HTML, file!("playground/index.html")),
     ("playground.css", CSS, file!("playground/playground.css")),
+    // A browser that is given no icon asks for one where there is
+    // none, and says that the page's policy refused it.
+    ("icon.svg", SVG, file!("playground/icon.svg")),
     ("playground.js", JS, file!("playground/playground.js")),
     ("sdk/index.js", JS, file!("src/index.js")),
     ("sdk/client.js", JS, file!("src/client.js")),
     ("sdk/protocol.js", JS, file!("src/protocol.js")),
     ("sdk/audio.js", JS, file!("src/audio.js")),
+    ("sdk/webrtc.js", JS, file!("src/webrtc.js")),
     ("sdk/worklet.js", JS, file!("src/worklet.js")),
 ];
 
 /// What a page from here may do: run and show what is from here, talk
 /// to where it is from, and nothing else. It is shown in no other page.
 const POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-                      connect-src 'self'; worker-src 'self'; base-uri 'none'; \
-                      form-action 'none'; frame-ancestors 'none'";
+                      img-src 'self'; connect-src 'self'; worker-src 'self'; \
+                      base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// Something of the page, as it is answered.
 fn served(kind: &'static str, body: String) -> Response {
@@ -141,7 +146,7 @@ mod tests {
         let named = |name: &str| FILES.iter().any(|(known, _, _)| *known == name);
         let (_, _, page) = FILES[0];
         // What the page itself brings in.
-        for brought in ["playground.css", "playground.js"] {
+        for brought in ["playground.css", "playground.js", "icon.svg"] {
             assert!(page.contains(&format!("\"{brought}\"")), "{brought}");
             assert!(named(brought), "{brought}");
         }

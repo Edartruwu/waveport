@@ -308,6 +308,77 @@ fn played(tag: OpTag, millis: u32) -> Told {
 }
 
 #[test]
+fn what_came_out_of_a_far_ends_buffer_is_heard_when_its_time_has_passed() {
+    let mut pair = Pair::fresh(Like::Chrome, Client::V1);
+    for n in 0..5 {
+        pair.server_sends(tag(1), n, n == 4);
+    }
+    let marks = pair.heard_said();
+    let [
+        FromServer::Mark {
+            ts: Some(first), ..
+        },
+        FromServer::Mark { ts: Some(end), .. },
+    ] = marks[..]
+    else {
+        panic!("{marks:?}");
+    };
+    assert_eq!(end, first.wrapping_add(4_800));
+    // All of the response came out, and its output takes 40 ms over
+    // it: 60 ms of it are heard.
+    pair.client_tells(&played_at(end, 40));
+    assert_eq!(pair.told, [played(tag(1), 60)]);
+    pair.told.clear();
+    // The call asks to be asked again when that time has come: nothing
+    // else has it asked then.
+    let now = pair.now();
+    let Step::Wait(due) = pair.call.poll(now) else {
+        panic!("the call has more to say or to send");
+    };
+    assert!(due <= now + Duration::from_millis(40), "{:?}", due - now);
+    // The far end has nothing more to say of it. The rest is heard
+    // when the 40 ms have passed, and is said once.
+    pair.run_for(Duration::from_millis(30));
+    assert_eq!(pair.told, []);
+    pair.run_for(Duration::from_millis(10));
+    assert_eq!(pair.told, [played(tag(1), 100)]);
+    pair.told.clear();
+    pair.run_for(Duration::from_secs(2));
+    assert_eq!(pair.told, []);
+
+    // What the far end says next is what holds: the time of what it
+    // said before is not waited for.
+    for n in 0..5 {
+        pair.server_sends(tag(2), n, false);
+    }
+    let marks = pair.heard_said();
+    let [
+        FromServer::Mark {
+            ts: Some(second), ..
+        },
+    ] = marks[..]
+    else {
+        panic!("{marks:?}");
+    };
+    // 40 ms out and 30 ms to go, and 60 ms out a moment later.
+    pair.client_tells(&played_at(second.wrapping_add(1_920), 30));
+    assert_eq!(pair.told, [played(tag(2), 10)]);
+    pair.told.clear();
+    pair.client_tells(&played_at(second.wrapping_add(2_880), 0));
+    assert_eq!(pair.told, [played(tag(2), 60)]);
+    pair.told.clear();
+    pair.run_for(Duration::from_secs(1));
+    assert_eq!(pair.told, []);
+    // An output that says it takes longer than any does is held to a
+    // second: what came out of it is heard then.
+    pair.client_tells(&played_at(second.wrapping_add(4_800), 3_600_000));
+    pair.run_for(Duration::from_millis(900));
+    assert!(!pair.told.contains(&played(tag(2), 100)), "{:?}", pair.told);
+    pair.run_for(Duration::from_millis(100));
+    assert_eq!(pair.told.last(), Some(&played(tag(2), 100)));
+}
+
+#[test]
 fn where_the_far_end_is_in_the_stream_says_how_much_of_which_response_it_played() {
     let mut pair = Pair::fresh(Like::Chrome, Client::V1);
     for n in 0..5 {

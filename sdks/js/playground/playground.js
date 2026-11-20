@@ -11,7 +11,7 @@ const sdk = /** @type {typeof import("../src/index.js")} */ (
 
 /**
  * @typedef {import("../src/index.js").Client} Client
- * @typedef {import("../src/index.js").Voice} Voice
+ * @typedef {import("../src/index.js").Voice | import("../src/index.js").CallVoice} Voice
  * @typedef {import("../src/protocol.js").Item} Item
  * @typedef {import("../src/protocol.js").FromServer} FromServer
  */
@@ -166,10 +166,11 @@ function described(client, voice) {
     ["Life", String(client.welcome.life)],
   ];
   const audio = client.audio;
+  const over = client.over === "webrtc" ? "on a call over WebRTC" : "over a WebSocket";
   if (audio === undefined) {
-    facts.push(["Line", "text"]);
+    facts.push(["Line", `text, ${over}`]);
   } else {
-    facts.push(["Line", `${audio.codec} at ${audio.rate / 1000} kHz`]);
+    facts.push(["Line", `${audio.codec} at ${audio.rate / 1000} kHz, ${over}`]);
   }
   if (voice !== undefined) {
     facts.push(["Echo taken out", String(voice.settings.echoCancellation ?? "not said")]);
@@ -241,14 +242,24 @@ async function begins(spoken) {
   try {
     // `?mic=raw` asks for the microphone as it is: for a page that is
     // driven by a recording, and for someone with headphones on.
-    const raw = new URLSearchParams(location.search).get("mic") === "raw";
+    const asked = new URLSearchParams(location.search);
+    const raw = asked.get("mic") === "raw";
     const processing = { echoCancellation: !raw, noiseSuppression: !raw, autoGainControl: !raw };
+    // `?over=websocket` and `?over=webrtc` say what a spoken call is
+    // made over. Left out, it is a call over WebRTC where one gets
+    // through, and a WebSocket where none does.
+    const carried = asked.get("over");
+    // `?within=1500` says how long a call over WebRTC may take to be
+    // there, in milliseconds, before a WebSocket is gone over instead.
+    const within = Number(asked.get("within") ?? "");
     const { client, voice } = await sdk.call(location.origin, {
       // The session is made once the microphone is there: its token is
       // good for a minute.
       token: () => made(agent.value),
       features: ["said", "hearing", "tools"],
       voice: spoken ? { constraints: processing, onerror: (error) => fails(error.message) } : false,
+      over: carried === "websocket" || carried === "webrtc" ? carried : undefined,
+      callWithinMs: Number.isInteger(within) && within > 0 ? within : undefined,
     });
     playground.client = client;
     playground.voice = voice;

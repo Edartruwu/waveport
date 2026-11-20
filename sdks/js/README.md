@@ -1,10 +1,10 @@
 # Waveport client for JavaScript
 
-A client of a Waveport session for a page in a browser. It speaks [client protocol v1](../../docs/architecture.md#86-the-client-protocol) over a WebSocket, to `waveportd` or to anything else that serves the protocol, and it has a voice: what the agent says is played, what the microphone hears is sent, and the session is told what was played, by the sample.
+A client of a Waveport session for a page in a browser. It speaks [client protocol v1](../../docs/architecture.md#86-the-client-protocol) to `waveportd` or to anything else that serves the protocol, on a call over WebRTC where one gets through and over a WebSocket where none does, and it has a voice: what the agent says is played, what the microphone hears is sent, and the session is told what was played, by the sample.
 
 It is ES modules that a browser runs as they are written. Nothing is bundled and nothing is installed for it to run, so a daemon serves it as part of itself, beside the [playground](#the-playground). Its types are in its comments and are checked by the TypeScript compiler.
 
-**Status: experimental.** It is not published to a registry yet (`"private": true`): serve the files of `src/` together, or import them from a checkout. A call is on a WebSocket. A call over WebRTC comes with the WebRTC transport.
+**Status: experimental.** It is not published to a registry yet (`"private": true`): serve the files of `src/` together, or import them from a checkout. A spoken call is made over WebRTC, and over a WebSocket where that does not get through; a call in writing is on a WebSocket.
 
 ## A call
 
@@ -25,11 +25,23 @@ button.addEventListener("click", async () => {
 
 A spoken call does things in an order that matters, and `call` keeps to it:
 
-1. It asks what the browser can do (`Voice.format`), then for the microphone, and has what plays ready (`Voice.open`).
+1. It asks for the microphone, and has what plays ready (`CallVoice.open`, or `Voice.format` and `Voice.open` for a WebSocket).
 2. Only then does it ask for the token, when `token` is a function. A client token is good for a minute, and a person can take longer than that to allow a microphone.
 3. It connects (`Client.connect`), and puts the voice on the line the moment it is welcomed (`voice.attach`). An agent that greets speaks as soon as its far end is on the line. A voice that was not there for it would not play the greeting and would not say that it had, and the session would have it on record as never heard.
 
-Whoever uses `Client` and `Voice` by themselves keeps to the same order.
+Whoever uses `Client` and a voice by themselves keeps to the same order.
+
+### Over WebRTC, and over a WebSocket where that does not get through
+
+A spoken call is offered to the server as a call over WebRTC first, where the browser makes such calls and the server is named by where it is (`https://agents.example`, and not the address of its line for clients). The server answers the offer or turns it away, and a call that was answered has five seconds to be there (`callWithinMs`).
+
+When no call comes about, the same call is made over a WebSocket: the server takes no calls, or neither datagrams nor a connection get through to it from where the page is. The microphone that was asked for goes to the voice of the WebSocket, and the token is the one the call was offered with: an offer does not use a token up, and nothing was said on a call that was not made. `client.over` says which it came to, `"webrtc"` or `"websocket"`.
+
+`over: "webrtc"` or `over: "websocket"` in the options of `call` says which it is to be, and nothing else is tried. A call that was asked for over WebRTC and cannot be made throws `Unreached`, with what the server answered (`status`, `code`) if it answered. Left to itself, `call` goes over a WebSocket whatever kept the call from being made: a server that turned the offer away for who made it turns the hello away too, and that is what `call` then throws.
+
+A client that is on a call comes back on a call when its call drops, and one on a WebSocket on a WebSocket: a session stays on the kind of line it was started on. **A client whose call drops does not go over to a WebSocket**: if no call can be made again in the time its session waits for it, the client is closed as gone.
+
+**Firefox makes no call to `127.0.0.1`.** It pairs none of its own addresses with one that only the machine itself reaches, so a page in Firefox that calls a daemon on the same machine waits out the five seconds and is on a WebSocket. A daemon that is told an address of the machine on its network (`[webrtc] udp = "192.0.2.7:7071"`, or `reached_at`) is called by Firefox from the same machine too. Chrome calls either.
 
 ### Where the token comes from
 
@@ -72,7 +84,28 @@ const client = await Client.connect("https://agents.example", { token, features:
 
 `protocol.js` can be used by itself, by a client that is not this one: `read` and `write`, the writers, and `View`, which applies messages as the Rust `View` does. Both are held to the same fixtures (`crates/core/waveport-protocol/tests/fixtures/client-v1/`).
 
-## The voice
+## The voice of a call over WebRTC
+
+```js
+import { CallVoice } from "./src/webrtc.js";
+
+const voice = await CallVoice.open();          // asks for the microphone
+const client = await Client.connect(address, { token, over: "webrtc", microphone: voice.track });
+voice.attach(client);                          // at once
+voice.muted = true;                            // silence is sent in place of the microphone
+voice.stop();                                  // the client goes on
+```
+
+The browser carries the audio of a call both ways and plays what arrives, so there is nothing to code, to decode or to count here. `CallVoice` is what a browser does not do by itself:
+
+- **Saying what was played.** A browser knows nothing of responses. It can say which part of the call's audio it gave to be played last (`getSynchronizationSources`), and the voice says that to the session fifty times a second while it changes, as a place in the stream (`played_rtp`), with how long the output takes to sound it where the browser says so. The server knows which response is where in the stream. A browser that cannot say which part says how much has come out of its buffer, ten times a second, and one that can say neither says nothing: its session then works out what was played from the pace of what it sent.
+- **The end of a response.** One browser stops 40 to 60 ms short of what it was sent last in what it says, though it played all of it. A response that was sent whole (`mark` with `end`) is taken as played to its end when the browser has stood within a tenth of a second of its end for 120 ms.
+- **Discarding.** Nothing empties the buffer a browser holds of a call. When the session says that the rest of a response is not to be heard (`clear`), the voice mutes what the browser plays until the browser is at a response that is to be heard, or has played nothing new for a quarter of a second, and says nothing of what was muted as played. A browser that cannot say where it is is muted for four tenths of a second.
+- **A call that drops.** What the browser held of it is not played. The voice plays the call the client comes back on.
+
+`voice.silenced` says whether what the browser plays is being kept from being heard, and `voice.settings` what the microphone was given, as for `Voice`.
+
+## The voice of a WebSocket
 
 ```js
 import { Voice } from "./src/audio.js";
@@ -94,13 +127,15 @@ voice.stop();                                  // the client goes on
 
 ### Browsers
 
-| Browser | Tested here | Opus through WebCodecs |
-|---|---|---|
-| Chrome 157 on Linux, headless | In every test run: spoken calls as Opus and as plain samples, a written session, a line that drops | Yes |
-| Firefox | Not tested | In its documentation from version 130 on desktop. Not on Android, where audio is plain samples |
-| Safari | Not tested | In its documentation from version 26. Plain samples before |
+| Browser | Tested here | A call over WebRTC | Opus through WebCodecs, on a WebSocket |
+|---|---|---|---|
+| Chrome 157 on Linux, headless | In every test run, the eight steps below | Over datagrams and over a connection alone. It says where it is in the stream to the packet, and how long its output takes | Yes |
+| Firefox 158 on Linux, headless | By hand on 20 November 2026 (`--firefox`), the same eight steps, all passing | Over datagrams and over a connection alone, to an address that is not `127.0.0.1`. It says where it is in the stream and stops short of the end, which the voice allows for; it does not say how long its output takes, which is then taken as nothing | Yes |
+| Safari | **Not tested: there is none on Linux** | Not known. It is the browser the count of what came out of the buffer is for, by its documentation | In its documentation from version 26. Plain samples before |
 
-The two rows that are not tested are a reading of the browsers' documentation on 17 November 2026. A browser that cannot do what its row says falls back to plain samples by itself, which every browser with an audio worklet plays.
+The eight steps: a spoken call over a WebSocket as Opus and as plain samples, a session in writing, one whose line drops, a spoken call over WebRTC by datagrams, one that only a connection carries, one that drops and is come back to, and one that does not get through and is made over a WebSocket. Every step is one machine talking to itself: no network was lost, slow or in the way.
+
+The row that is not tested is a reading of the browser's documentation on 17 November 2026. A browser that cannot do what its row says falls back by itself: to a WebSocket where it makes no call, and to plain samples where it codes no Opus, which every browser with an audio worklet plays.
 
 ## The playground
 
@@ -116,7 +151,7 @@ That is a daemon whose agent has stand-ins for its providers, and needs no key: 
 
 Where the daemon has a control key, the page asks for it and sends it to the daemon it came from and nowhere else. It is a page for whoever runs the daemon. An application's own page is given a client token by its server, as above.
 
-`?mic=raw` in the page's address asks for the microphone as it is, without the browser's echo cancellation, noise suppression and gain: for someone with headphones on.
+`?mic=raw` in the page's address asks for the microphone as it is, without the browser's echo cancellation, noise suppression and gain: for someone with headphones on. `?over=webrtc` and `?over=websocket` say what a spoken call is made over, where the page would otherwise try the first and go over the second, and `?within=1500` how many milliseconds a call over WebRTC is given to be there. The page says under "Line" what its call came to.
 
 The page and the client are read into the daemon when it is built. A change to either is seen after the daemon is built again.
 
@@ -130,9 +165,10 @@ npm run check      # the types the comments give
 npm test           # the tests that need no browser
 cargo build -p waveportd --example stand_in
 node test/browser/run.js --daemon ../../target/debug/examples/stand_in
+node test/browser/run.js --daemon ../../target/debug/examples/stand_in --firefox /usr/bin/firefox
 ```
 
-`cargo xtask ci --only js` runs all of it, as CI does.
+`cargo xtask ci --only js` runs all of it but the last line, as CI does. The last is for whoever has a Firefox: it is started with a profile of its own under `target/tmp`, hears a recording and plays to nothing, and takes nothing from a Firefox that is open on the same machine.
 
 | Tests | What they hold |
 |---|---|
@@ -140,6 +176,9 @@ node test/browser/run.js --daemon ../../target/debug/examples/stand_in
 | `test/client.test.js` | The connection, with a server that is the test: the hello, what is told, coming back and when not to |
 | `test/worklet.test.js` | What is played and what is said to have been played, sample by sample |
 | `test/voice.test.js` | The voice, with a browser's sound stood in for: that it is ready before the client connects and on the line as it is welcomed, what it tells the audio thread, what it sends |
-| `test/browser/run.js` | A headless Chrome on the playground of the stand-in daemon, driven over the pipe Chrome offers, with nothing installed to drive it. It is given a recording for a microphone and plays to nothing: no sound is made and no microphone is opened |
+| `test/webrtc.test.js` | A call, with a browser's calls and a daemon stood in for: where offers are taken, the offer and what is made of its answer, the servers a far end is told of, a call that does not come about and what is let go of then, coming back on another call, and hanging up |
+| `test/playing.test.js` | Where a call is in what it plays, from what a browser says: what is said to the session, the end of a response, and what is muted and not said when a response is discarded |
+| `test/callvoice.test.js` | The voice of a call, with a browser's sound stood in for: what it plays, what it asks the browser and how often, what it says of it, and a call that drops |
+| `test/browser/run.js` | A headless Chrome on the playground of the stand-in daemon, driven over the pipe Chrome offers, with nothing installed to drive it. It is given a recording for a microphone and plays to nothing: no sound is made and no microphone is opened. For a call over WebRTC it takes the ways the call is not to go out of the answer before the browser reads it: every way but a connection, or every way, and it keeps what the page asks the daemon about its calls. `--firefox` runs the same in a Firefox, over WebDriver BiDi |
 
 A rule of the repository holds every `package.json` under `sdks/` to this: Apache-2.0, nothing to run with, the two tools to check with at exact versions, a lock file whose every entry has its hash, and an `.npmrc` that installs nothing younger than seven days and runs nothing as it installs (`xtask/src/js.rs`).

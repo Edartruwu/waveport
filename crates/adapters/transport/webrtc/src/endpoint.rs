@@ -19,8 +19,16 @@
 //! A call that is behind is not waited for: a datagram that finds its
 //! call with too many waiting is dropped, as a network would drop it.
 //!
-//! A call that is over hands its connection to the pump, which lets go
-//! of it as one that is closed and not as one that broke. What a call
+//! A far end that sends no datagrams makes connections, and makes more
+//! than one. A browser makes one from every address its machine has,
+//! says its checks on each, sends on one of them, and keeps the others
+//! for as long as the call lasts. A call therefore keeps every
+//! connection its far end made, and says a thing on the one it is to
+//! go over. One that is kept in place of another, and not beside it,
+//! closes the connection the far end is using.
+//!
+//! A call that is over hands its connections to the pump, which lets go
+//! of each as one that is closed and not as one that broke. What a call
 //! says last is its goodbye, and its far end sends all the time: a
 //! connection that is closed while something is unread is reset by the
 //! system, and a reset can take what was just said with it.
@@ -55,6 +63,13 @@ const INBOX: usize = 256;
 /// How many addresses a call may be reached from at once: a far end
 /// tries every way it has.
 const PEERS: usize = 8;
+
+/// How many connections a call may have at once. A far end makes one
+/// from every address it has, so it is as many as the addresses a call
+/// may be reached from. One that comes when a call has as many takes
+/// the place of the one the call has heard nothing on for longest: the
+/// one the far end sends on is never that one.
+const CONNECTIONS: usize = PEERS;
 
 /// How many names a call may have at once: it gets another each time
 /// its far end begins its checks anew, and checks to the one before
@@ -403,15 +418,7 @@ impl Endpoint {
             table.calls.insert(id, known);
             table.name(id, call.name());
         }
-        let line = Line {
-            shared: Arc::clone(&self.shared),
-            id,
-            arrives,
-            connection: None,
-            offered: None,
-            unknown: None,
-            deaf: false,
-        };
+        let line = Line::of(Arc::clone(&self.shared), id, arrives);
         let (knock, signals) = Knock::of(Driven::new(call, line));
         Ok(Answered {
             answer,
@@ -439,13 +446,26 @@ impl Endpoint {
     }
 }
 
+/// A connection the far end of a call made.
+struct Held {
+    connection: Box<Framed>,
+    /// When something last arrived on it, by the call's count of what
+    /// arrived over its connections.
+    heard: u64,
+}
+
 /// The sockets of one call of a server.
 pub(crate) struct Line {
     shared: Arc<Shared>,
     id: u64,
     arrives: mpsc::Receiver<Inbound>,
-    /// The connection the far end made, if it made one.
-    connection: Option<Box<Framed>>,
+    /// The connections the far end made, if it made any.
+    connections: Vec<Held>,
+    /// How much has arrived over them, and how many of them were made.
+    heard: u64,
+    /// The connection that is asked first for what arrived, so that
+    /// none of them is asked last every time.
+    first: usize,
     /// A connection that somebody made and addressed to the call, which
     /// the call has not said is the far end's yet.
     offered: Option<Box<Framed>>,
@@ -457,9 +477,93 @@ pub(crate) struct Line {
 }
 
 impl Line {
+    /// The sockets of the call `id`, which is given what arrives for it
+    /// through `arrives`.
+    fn of(shared: Arc<Shared>, id: u64, arrives: mpsc::Receiver<Inbound>) -> Self {
+        Self {
+            shared,
+            id,
+            arrives,
+            connections: Vec::new(),
+            heard: 0,
+            first: 0,
+            offered: None,
+            unknown: None,
+            deaf: false,
+        }
+    }
+
     /// The far end's checks are addressed to `name` from here on.
     pub(crate) fn named(&self, name: &str) {
         self.shared.table().name(self.id, name);
+    }
+
+    /// Keeps a connection the far end made, beside the ones it made
+    /// before.
+    fn keep(&mut self, connection: Box<Framed>) {
+        self.heard += 1;
+        let held = Held {
+            connection,
+            heard: self.heard,
+        };
+        let from = held.connection.peer();
+        // One from where another came from is that one made again.
+        let again = self
+            .connections
+            .iter()
+            .position(|one| one.connection.peer() == from);
+        let goes = again.or_else(|| {
+            // With as many as a call may have, the one that nothing
+            // has arrived on for longest goes.
+            (self.connections.len() >= CONNECTIONS)
+                .then(|| {
+                    let quietest = self.connections.iter().enumerate();
+                    quietest.min_by_key(|(_, one)| one.heard).map(|(at, _)| at)
+                })
+                .flatten()
+        });
+        if let Some(at) = goes {
+            let gone = self.connections.swap_remove(at);
+            self.let_go(gone);
+        }
+        self.connections.push(held);
+    }
+
+    /// Lets go of a connection as one that is closed, and not as one
+    /// that broke: it is handed to what carries the server's arrivals.
+    /// With nothing to hand it to, it is closed where it stands.
+    fn let_go(&self, held: Held) {
+        let _ = self.shared.leaving.try_send(held.connection);
+    }
+
+    /// The next datagram that arrived over a connection of the far
+    /// end's, from the first that has one. A connection that has ended
+    /// is let go of.
+    fn poll_connections(&mut self, cx: &mut Context<'_>) -> Poll<(SocketAddr, Bytes)> {
+        let mut at = self.first;
+        let mut asked = 0;
+        while asked < self.connections.len() {
+            at %= self.connections.len();
+            let Some(one) = self.connections.get_mut(at) else {
+                break;
+            };
+            match one.connection.poll_next(cx) {
+                Poll::Ready(Some(datagram)) => {
+                    self.heard += 1;
+                    one.heard = self.heard;
+                    // The one after it is asked first the next time.
+                    self.first = at + 1;
+                    return Poll::Ready((one.connection.peer(), datagram));
+                }
+                // Those after it move up: the next is where it was.
+                Poll::Ready(None) => drop(self.connections.remove(at)),
+                Poll::Pending => {
+                    at += 1;
+                    asked += 1;
+                }
+            }
+        }
+        Poll::Pending
     }
 }
 
@@ -496,30 +600,21 @@ impl Wire for Line {
                 Poll::Pending => {}
             }
         }
-        if let Some(connection) = &mut self.connection {
-            match connection.poll_next(cx) {
-                Poll::Ready(Some(datagram)) => {
-                    return Poll::Ready(Arrived {
-                        protocol: Protocol::Tcp,
-                        from: connection.peer(),
-                        to: self.shared.tcp_at.unwrap_or(self.shared.udp_at),
-                        datagram,
-                    });
-                }
-                Poll::Ready(None) => self.connection = None,
-                Poll::Pending => {}
-            }
-        }
-        Poll::Pending
+        self.poll_connections(cx).map(|(from, datagram)| Arrived {
+            protocol: Protocol::Tcp,
+            from,
+            to: self.shared.tcp_at.unwrap_or(self.shared.udp_at),
+            datagram,
+        })
     }
 
     fn judged(&mut self, from: SocketAddr, taken: bool) {
         if let Some(offered) = self.offered.take() {
-            // A connection whose first word was the far end's takes the
-            // place of one the far end made before, which it has given
-            // up. Any other is let go of.
+            // A connection whose first word was the far end's is kept
+            // beside the ones the far end made before: it may be using
+            // any of them. Any other is let go of.
             if taken && offered.peer() == from {
-                self.connection = Some(offered);
+                self.keep(offered);
             }
             return;
         }
@@ -539,10 +634,15 @@ impl Wire for Line {
                     .try_send_to(&transmit.contents, transmit.destination);
             }
             Protocol::Tcp => {
-                if let Some(connection) = &mut self.connection
-                    && connection.peer() == transmit.destination
-                {
-                    connection.send(&transmit.contents);
+                // It goes over the connection it is addressed to. What
+                // is addressed to one that is gone is dropped, as a
+                // network would drop it.
+                let to = self
+                    .connections
+                    .iter_mut()
+                    .find(|one| one.connection.peer() == transmit.destination);
+                if let Some(one) = to {
+                    one.connection.send(&transmit.contents);
                 }
             }
             _ => {}
@@ -550,8 +650,8 @@ impl Wire for Line {
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) {
-        if let Some(connection) = &mut self.connection {
-            connection.poll_flush(cx);
+        for one in &mut self.connections {
+            one.connection.poll_flush(cx);
         }
     }
 }
@@ -559,12 +659,11 @@ impl Wire for Line {
 impl Drop for Line {
     fn drop(&mut self) {
         self.shared.table().forget(self.id);
-        // The connection of a call is not closed under what was said
-        // on it last, which is the goodbye: it is handed to what
-        // carries the server's arrivals, and let go of there. With
-        // nothing to hand it to, it is closed where it stands.
-        if let Some(connection) = self.connection.take() {
-            let _ = self.shared.leaving.try_send(connection);
+        // A connection of a call is not closed under what was said on
+        // it last, which is the goodbye: each is handed to what carries
+        // the server's arrivals, and let go of there.
+        for held in core::mem::take(&mut self.connections) {
+            self.let_go(held);
         }
     }
 }
@@ -696,8 +795,18 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::Instant;
 
-    use super::{Config, Endpoint, Known, LEAVES_WITHIN, Line, NAMES, PEERS, Table};
+    use core::future::poll_fn;
+    use core::task::Poll;
+
+    use bytes::Bytes;
+    use str0m::net::{Protocol, Transmit};
+
+    use super::{
+        CONNECTIONS, Config, Endpoint, Inbound, Known, LEAVES_WITHIN, Line, NAMES, PEERS, Table,
+    };
+    use crate::net::Wire as _;
     use crate::rtp::forged_check as check;
+    use crate::tcp::Framed;
     use crate::tcp::testing::{connection, has_something_unread, next, says, sends_no_more};
 
     #[tokio::test]
@@ -717,15 +826,8 @@ mod tests {
         has_something_unread(&near).await;
         says(&mut near, b"goodbye").await;
         let (_inbox, arrives) = mpsc::channel(1);
-        let line = Line {
-            shared: Arc::clone(&endpoint.shared),
-            id: 7,
-            arrives,
-            connection: Some(Box::new(near)),
-            offered: None,
-            unknown: None,
-            deaf: false,
-        };
+        let mut line = Line::of(Arc::clone(&endpoint.shared), 7, arrives);
+        line.keep(Box::new(near));
         drop(line);
         // Nothing refuses what the far end sends next, as a connection
         // that was closed with something unread would.
@@ -745,6 +847,259 @@ mod tests {
             says(&mut far, b"still there").await;
         }
         assert!(since.elapsed() > LEAVES_WITHIN / 2, "{:?}", since.elapsed());
+    }
+
+    /// A server that takes connections, and its pump, which is not run:
+    /// what a call lets go of goes nowhere.
+    async fn listening() -> (Endpoint, super::Pump) {
+        let local = "127.0.0.1:0".parse().unwrap();
+        let config = Config {
+            tcp: Some(local),
+            ..Config::at(local)
+        };
+        Endpoint::bind(config).await.unwrap()
+    }
+
+    /// A connection somebody made and said `first` on, as the pump
+    /// gives it to its call. Returns the other end of it, and where the
+    /// call sees it come from.
+    async fn knocks(inbox: &mpsc::Sender<Inbound>, first: &'static [u8]) -> (Framed, SocketAddr) {
+        let (near, far) = connection().await;
+        let from = near.peer();
+        let first = Bytes::from_static(first);
+        let given = Inbound::Connection(Box::new(near), first);
+        assert!(inbox.send(given).await.is_ok());
+        (far, from)
+    }
+
+    /// The next thing that arrives for a call: where from, and what.
+    async fn arrives(line: &mut Line) -> (SocketAddr, Bytes) {
+        let wait = Duration::from_secs(10);
+        let arrived = tokio::time::timeout(wait, poll_fn(|cx| line.poll_arrived(cx)));
+        let arrived = arrived.await.unwrap();
+        assert_eq!(arrived.protocol, Protocol::Tcp);
+        (arrived.from, arrived.datagram)
+    }
+
+    /// The call says `said` to `to`, and what it says is on its way.
+    async fn tells(line: &mut Line, to: SocketAddr, said: &[u8]) {
+        line.send(&Transmit {
+            proto: Protocol::Tcp,
+            source: line.shared.tcp_at.unwrap(),
+            destination: to,
+            contents: said.to_vec().into(),
+        });
+        poll_fn(|cx| {
+            line.poll_flush(cx);
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// A call that has the `connections` its far end made, each with
+    /// the other end of it and where the call sees it come from.
+    async fn called(
+        endpoint: &Endpoint,
+        connections: usize,
+    ) -> (Line, mpsc::Sender<Inbound>, Vec<(Framed, SocketAddr)>) {
+        let (inbox, arrives_at) = mpsc::channel(4);
+        let mut line = Line::of(Arc::clone(&endpoint.shared), 7, arrives_at);
+        let mut made = Vec::new();
+        for _ in 0..connections {
+            let (far, from) = knocks(&inbox, b"a check").await;
+            assert_eq!(
+                arrives(&mut line).await,
+                (from, Bytes::from_static(b"a check"))
+            );
+            line.judged(from, true);
+            made.push((far, from));
+        }
+        (line, inbox, made)
+    }
+
+    #[tokio::test]
+    async fn a_call_keeps_every_connection_its_far_end_made() {
+        // A browser makes a connection from every address it has, says
+        // its checks on each, and then sends on one of them: which, it
+        // does not say.
+        let (endpoint, _pump) = listening().await;
+        let (mut line, _inbox, mut made) = called(&endpoint, 3).await;
+        assert_eq!(line.connections.len(), 3);
+        // What the call says goes over the connection it is addressed
+        // to, the first as well as the last.
+        for (n, (far, from)) in made.iter_mut().enumerate() {
+            let said = format!("an answer to {n}");
+            tells(&mut line, *from, said.as_bytes()).await;
+            assert_eq!(next(far).await.unwrap(), said.as_bytes());
+        }
+        // And what the far end says on any of them arrives, from where
+        // it was said.
+        for (n, (far, from)) in made.iter_mut().enumerate().rev() {
+            let said = format!("audio over {n}");
+            says(far, said.as_bytes()).await;
+            assert_eq!(arrives(&mut line).await, (*from, Bytes::from(said)));
+        }
+        // None of them was closed for another.
+        for (far, _) in &mut made {
+            says(far, b"more").await;
+            assert!(!sends_no_more(far));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_is_not_the_far_ends_is_not_kept() {
+        let (endpoint, _pump) = listening().await;
+        let (mut line, inbox, mut made) = called(&endpoint, 1).await;
+        // Somebody who knows the name of the call and not its password.
+        let (mut other, from) = knocks(&inbox, b"no check of this call").await;
+        assert_eq!(arrives(&mut line).await.0, from);
+        line.judged(from, false);
+        assert_eq!(line.connections.len(), 1);
+        assert_eq!(next(&mut other).await, None);
+        // The far end's own goes on.
+        let (far, from) = &mut made[0];
+        tells(&mut line, *from, b"still here").await;
+        assert_eq!(next(far).await.unwrap(), b"still here"[..]);
+        // What is addressed to where no connection comes from is
+        // dropped.
+        tells(&mut line, peer(9), b"to nobody").await;
+        tells(&mut line, *from, b"and here").await;
+        assert_eq!(next(far).await.unwrap(), b"and here"[..]);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_ended_is_let_go_of_and_the_others_go_on() {
+        let (endpoint, _pump) = listening().await;
+        let (mut line, _inbox, mut made) = called(&endpoint, 3).await;
+        // The far end closes the one in the middle, as a browser does
+        // with one it has no more use for.
+        let (gone, _) = made.remove(1);
+        drop(gone);
+        for (n, (far, from)) in made.iter_mut().enumerate() {
+            let said = format!("audio over {n}");
+            says(far, said.as_bytes()).await;
+            assert_eq!(arrives(&mut line).await, (*from, Bytes::from(said)));
+        }
+        // Asked again, the call has found the one that ended.
+        let nothing = poll_fn(|cx| Poll::Ready(line.poll_arrived(cx).is_pending())).await;
+        assert!(nothing);
+        let left: Vec<SocketAddr> = line
+            .connections
+            .iter()
+            .map(|one| one.connection.peer())
+            .collect();
+        assert_eq!(left, [made[0].1, made[1].1]);
+        for (far, from) in &mut made {
+            tells(&mut line, *from, b"an answer").await;
+            assert_eq!(next(far).await.unwrap(), b"an answer"[..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_call_has_no_more_connections_than_it_may() {
+        let (endpoint, pump) = listening().await;
+        tokio::spawn(pump.run());
+        let (mut line, inbox, mut made) = called(&endpoint, CONNECTIONS).await;
+        // The far end sends on all but the third: that is the one
+        // nothing has arrived on for longest.
+        for (n, (far, from)) in made.iter_mut().enumerate() {
+            if n != 2 {
+                says(far, b"audio").await;
+                assert_eq!(arrives(&mut line).await.0, *from);
+            }
+        }
+        let (mut newest, from) = knocks(&inbox, b"a check").await;
+        assert_eq!(arrives(&mut line).await.0, from);
+        // The third says something as it is given up, which the call
+        // does not come to read.
+        says(&mut made[2].0, b"what the microphone hears").await;
+        has_something_unread(&line.connections[2].connection).await;
+        line.judged(from, true);
+        assert_eq!(line.connections.len(), CONNECTIONS);
+        // The newest is the call's, and the third is not any more.
+        tells(&mut line, from, b"an answer").await;
+        assert_eq!(next(&mut newest).await.unwrap(), b"an answer"[..]);
+        let quiet = made[2].1;
+        assert!(
+            line.connections
+                .iter()
+                .all(|one| one.connection.peer() != quiet)
+        );
+        // It was closed, and not broken: nothing refuses what its far
+        // end sends next, as a connection that was closed with
+        // something unread would, and nothing follows on it.
+        says(&mut made[2].0, b"more of it").await;
+        assert!(!sends_no_more(&made[2].0));
+        assert_eq!(next(&mut made[2].0).await, None);
+        for (n, (far, from)) in made.iter_mut().enumerate() {
+            if n != 2 {
+                tells(&mut line, *from, b"an answer").await;
+                assert_eq!(next(far).await.unwrap(), b"an answer"[..]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_connection_of_a_call_that_is_over_is_let_go_of_as_one_that_was_closed() {
+        let local = "127.0.0.1:0".parse().unwrap();
+        let config = Config {
+            tcp: Some(local),
+            ..Config::at(local)
+        };
+        let (endpoint, pump) = Endpoint::bind(config).await.unwrap();
+        tokio::spawn(pump.run());
+        let (mut line, _inbox, mut made) = called(&endpoint, 2).await;
+        // Each far end sends all the time: something of it is unread
+        // when the call says its last, and is over.
+        for (n, (far, from)) in made.iter_mut().enumerate() {
+            says(far, b"what the microphone hears").await;
+            has_something_unread(&line.connections[n].connection).await;
+            tells(&mut line, *from, b"goodbye").await;
+        }
+        drop(line);
+        // Nothing refuses what a far end sends next, on the second as
+        // little as on the first. Each has the goodbye, and then that
+        // nothing follows.
+        for (far, _) in &mut made {
+            says(far, b"more of it").await;
+            assert!(!sends_no_more(far));
+            assert_eq!(next(far).await.unwrap(), b"goodbye"[..]);
+            assert_eq!(next(far).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_always_has_something_keeps_no_other_waiting() {
+        let (endpoint, _pump) = listening().await;
+        let (mut line, _inbox, mut made) = called(&endpoint, 2).await;
+        // The far end sends a lot on one, and a check on the other.
+        for said in [&b"audio 1"[..], b"audio 2", b"audio 3"] {
+            says(&mut made[0].0, said).await;
+        }
+        says(&mut made[1].0, b"a check").await;
+        for held in &line.connections {
+            has_something_unread(&held.connection).await;
+        }
+        // The check does not wait for all of the audio: the connection
+        // after the one that was heard is asked first.
+        let busy = made[0].1;
+        let other = made[1].1;
+        assert_eq!(
+            arrives(&mut line).await,
+            (busy, Bytes::from_static(b"audio 1"))
+        );
+        assert_eq!(
+            arrives(&mut line).await,
+            (other, Bytes::from_static(b"a check"))
+        );
+        assert_eq!(
+            arrives(&mut line).await,
+            (busy, Bytes::from_static(b"audio 2"))
+        );
+        assert_eq!(
+            arrives(&mut line).await,
+            (busy, Bytes::from_static(b"audio 3"))
+        );
     }
 
     fn peer(port: u16) -> SocketAddr {
