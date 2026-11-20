@@ -375,6 +375,28 @@ export class Client {
     }
   }
 
+  /**
+   * What a call carries of this end from here on: the track of another
+   * microphone, or nothing. The call the client is on sends it at
+   * once, and the calls it comes back on are made with it. On a
+   * WebSocket nothing changes: there a voice sends what it hears.
+   *
+   * @param {MediaStreamTrack | undefined} track
+   * @returns {Promise<void>}
+   * @throws {Error} The call does not take the track: nothing changes.
+   */
+  async hears(track) {
+    // A call that is made while this one is asked is made with it.
+    const before = this.#options;
+    this.#options = { ...before, microphone: track };
+    try {
+      await this.call?.sender.replaceTrack(track ?? null);
+    } catch (error) {
+      this.#options = before;
+      throw error;
+    }
+  }
+
   /** Ends the session. */
   bye() {
     if (this.#status === "closed") {

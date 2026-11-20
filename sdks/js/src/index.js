@@ -28,15 +28,17 @@ import { Voice } from "./audio.js";
 import { Client } from "./client.js";
 import { CallVoice, Unreached } from "./webrtc.js";
 
-export { Voice } from "./audio.js";
+export { Voice, microphone } from "./audio.js";
 export { Client, lineOf, Refused } from "./client.js";
 export * as protocol from "./protocol.js";
 export { CallVoice, Unreached, callsOf } from "./webrtc.js";
 
 /**
  * @typedef {object} CallOptions
- * @property {boolean | import("./audio.js").VoiceOptions} [voice]
- *   Whether the call is spoken. Left out or `false`, it is written.
+ * @property {boolean | (import("./audio.js").VoiceOptions & import("./webrtc.js").CallVoiceOptions)} [voice]
+ *   Whether the call is spoken, and what its voice is asked for: what
+ *   both kinds of voice take, and what the one the call comes to takes.
+ *   Left out or `false`, it is written.
  * @property {string | (() => string | Promise<string>)} [token] The
  *   token the client connects with, or what asks for one. A token is
  *   good for a short while, and a page's user can take longer than
@@ -87,7 +89,7 @@ export async function call(address, options = {}) {
   if (spoken === false) {
     return { client: await Client.connect(address, { ...rest, token: await token() }) };
   }
-  /** @type {import("./audio.js").VoiceOptions} */
+  /** @type {import("./audio.js").VoiceOptions & import("./webrtc.js").CallVoiceOptions} */
   let asked = spoken === true ? {} : spoken;
   /** The token, once it was asked for. @type {{ token: string | undefined } | undefined} */
   let said;
@@ -116,8 +118,11 @@ export async function call(address, options = {}) {
         throw error;
       }
       // No call came about. The microphone is there already, and goes
-      // to the voice of a WebSocket.
-      asked = { ...asked, microphone: voice.release(), owned: true };
+      // to the voice of a WebSocket: one that had none has none there,
+      // and one the page gave stays the page's to let go of, unless it
+      // said otherwise.
+      const owned = asked.microphone === undefined || asked.owned === true;
+      asked = { ...asked, microphone: voice.release() ?? null, owned };
     }
   }
   const audio = await Voice.format();

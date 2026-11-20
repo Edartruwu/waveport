@@ -65,7 +65,7 @@ const MOST_LOGGED = 200;
 /**
  * What is going on, for whoever drives the page from outside it.
  *
- * @type {{ client?: Client, voice?: Voice, problem?: string, ended?: string }}
+ * @type {{ client?: Client, voice?: Voice, problem?: string, ended?: string, processing?: MediaTrackConstraints }}
  */
 const playground = {};
 Object.assign(window, { playground });
@@ -252,12 +252,23 @@ async function begins(spoken) {
     // `?within=1500` says how long a call over WebRTC may take to be
     // there, in milliseconds, before a WebSocket is gone over instead.
     const within = Number(asked.get("within") ?? "");
+    // `?listen=first` begins a spoken call with no microphone: the
+    // page's user hears the agent, and is asked for the microphone
+    // when they press "Mute", which is pressed until then.
+    const listens = asked.get("listen") === "first";
+    playground.processing = processing;
     const { client, voice } = await sdk.call(location.origin, {
       // The session is made once the microphone is there: its token is
       // good for a minute.
       token: () => made(agent.value),
       features: ["said", "hearing", "tools"],
-      voice: spoken ? { constraints: processing, onerror: (error) => fails(error.message) } : false,
+      voice: spoken
+        ? {
+            constraints: processing,
+            microphone: listens ? null : undefined,
+            onerror: (/** @type {Error} */ error) => fails(error.message),
+          }
+        : false,
       over: carried === "websocket" || carried === "webrtc" ? carried : undefined,
       callWithinMs: Number.isInteger(within) && within > 0 ? within : undefined,
     });
@@ -267,7 +278,8 @@ async function begins(spoken) {
     session.hidden = false;
     controls.hidden = false;
     mute.hidden = voice === undefined;
-    mute.setAttribute("aria-pressed", "false");
+    // A voice with no microphone is one nobody is heard through.
+    mute.setAttribute("aria-pressed", String(voice !== undefined && voice.microphone === undefined));
     log.replaceChildren();
     conversation.replaceChildren();
     stands("open", spoken ? "On the line, listening" : "On the line");
@@ -323,11 +335,24 @@ say.addEventListener("submit", (event) => {
   }
 });
 
-mute.addEventListener("click", () => {
+mute.addEventListener("click", async () => {
   const voice = playground.voice;
-  if (voice !== undefined) {
+  if (voice === undefined) {
+    return;
+  }
+  if (voice.microphone !== undefined) {
     voice.muted = !voice.muted;
     mute.setAttribute("aria-pressed", String(voice.muted));
+    return;
+  }
+  // The call began with no microphone: this is where the page's user
+  // is asked for it, and the call hears it from here on.
+  try {
+    await voice.hears(await sdk.microphone(playground.processing));
+    voice.muted = false;
+    mute.setAttribute("aria-pressed", "false");
+  } catch (error) {
+    fails(error instanceof Error ? error.message : String(error));
   }
 });
 
