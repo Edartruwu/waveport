@@ -2,12 +2,15 @@
 //!
 //! Stability: experimental
 //!
-//! **This transport has not been held against a browser yet.** It has
-//! been run against its own client ([`Dialer`]), over real sockets and
-//! in memory, and that client offers what Chrome 157 and Firefox 158
-//! offered when they were measured (decision 0005). What the two
-//! browsers then do with the answers is tried when a server answers
-//! their calls with it.
+//! Its own tests run it against its own client ([`Dialer`]), over real
+//! sockets and in memory, and that client offers what Chrome 157 and
+//! Firefox 158 offered when they were measured (decision 0005). **A
+//! browser is on a call with it in the tests of the client for a page**
+//! (`sdks/js`): a headless Chrome in every test run, and a Firefox when
+//! somebody runs one. Two things here are as they are because a browser
+//! showed them: a call keeps every connection its far end made, and
+//! what came out of a far end's buffer is taken as heard when the time
+//! its output takes has passed.
 //!
 //! The call itself is `str0m`'s: the checks of ICE, the handshake, the
 //! keys the audio is sealed with and the data channel. What is here is
@@ -136,6 +139,12 @@
 //! seconds each, and one more takes the place of the one that has
 //! waited longest. **Nothing limits how many one address makes**: that
 //! is for whatever stands before the server.
+//!
+//! A far end that sends no datagrams makes a connection from every
+//! address its machine has, and keeps them: a browser says its checks
+//! on each and sends on one. A call keeps every connection its far end
+//! made, eight at most, and one more takes the place of the one nothing
+//! has arrived on for longest.
 //!
 //! # The ciphers
 //!

@@ -45,6 +45,7 @@ async fn a_daemon_on_this_machine_serves_a_page_to_try_its_agents_on() {
     for rule in [
         "default-src 'none'",
         "script-src 'self'",
+        "img-src 'self'",
         "connect-src 'self'",
         "frame-ancestors 'none'",
     ] {
@@ -68,7 +69,9 @@ async fn a_daemon_on_this_machine_serves_a_page_to_try_its_agents_on() {
             "text/javascript",
         ),
         ("playground.css", "playground/playground.css", "text/css"),
+        ("icon.svg", "playground/icon.svg", "image/svg+xml"),
         ("sdk/index.js", "src/index.js", "text/javascript"),
+        ("sdk/webrtc.js", "src/webrtc.js", "text/javascript"),
         ("sdk/client.js", "src/client.js", "text/javascript"),
         ("sdk/protocol.js", "src/protocol.js", "text/javascript"),
         ("sdk/audio.js", "src/audio.js", "text/javascript"),

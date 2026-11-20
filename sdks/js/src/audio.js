@@ -44,6 +44,8 @@ import { HEARS, PLAYS } from "./worklet.js";
  * @typedef {object} VoiceOptions
  * @property {MediaStream} [microphone] What is heard, in place of the
  *   microphone the browser would be asked for.
+ * @property {boolean} [owned] Whether a microphone that was given is
+ *   the voice's to let go of when it stops.
  * @property {MediaTrackConstraints} [constraints] What is asked of the
  *   microphone, beside and in place of one channel with the echo of
  *   what is played, the noise around and the level of the voice seen
@@ -68,6 +70,26 @@ const OPUS_RATE = 48_000;
  * @param {number} rate
  */
 const opus = (rate) => ({ codec: "opus", sampleRate: rate, numberOfChannels: 1 });
+
+/**
+ * Asks the browser for the microphone: one channel, with the echo of
+ * what is played, the noise around and the level of the voice seen to,
+ * unless `constraints` say otherwise.
+ *
+ * @param {MediaTrackConstraints} [constraints]
+ * @returns {Promise<MediaStream>}
+ */
+export function microphone(constraints) {
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      ...constraints,
+    },
+  });
+}
 
 /** The voice of a client. */
 export class Voice {
@@ -224,18 +246,8 @@ export class Voice {
       }
       const worklet = options.worklet ?? new URL("./worklet.js", import.meta.url);
       await context.audioWorklet.addModule(worklet);
-      const owns = options.microphone === undefined;
-      const microphone =
-        options.microphone ??
-        (await navigator.mediaDevices.getUserMedia({
-          audio: {
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            ...options.constraints,
-          },
-        }));
+      const owns = options.microphone === undefined || options.owned === true;
+      const heard = options.microphone ?? (await microphone(options.constraints));
       const plays = new AudioWorkletNode(context, PLAYS, {
         numberOfInputs: 0,
         numberOfOutputs: 1,
@@ -250,14 +262,14 @@ export class Voice {
         outputChannelCount: [1],
         processorOptions: { frame: format.rate / 50 },
       });
-      context.createMediaStreamSource(microphone).connect(hears);
+      context.createMediaStreamSource(heard).connect(hears);
       // What hears is asked for what it has only while something
       // listens to it: its silence goes to the output.
       const silent = context.createGain();
       silent.gain.value = 0;
       hears.connect(silent).connect(context.destination);
       await context.resume();
-      return new Voice(format, context, plays, hears, microphone, owns, options);
+      return new Voice(format, context, plays, hears, heard, owns, options);
     } catch (error) {
       await context.close();
       throw error;

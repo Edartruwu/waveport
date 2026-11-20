@@ -1,6 +1,6 @@
 // @ts-check
 /**
- * A client of one session, over a WebSocket.
+ * A client of one session, over a WebSocket or on a call over WebRTC.
  *
  * `Client.connect` opens the connection, says hello and waits to be
  * welcomed. From then on the client holds what the session has come to
@@ -15,12 +15,19 @@
  * again. `bye` ends the session.
  *
  * Nothing here knows of audio beyond carrying it: `audio.js` plays and
- * records.
+ * records. On a call (`over: "webrtc"`) not even that: the call carries
+ * its audio by itself, and the client says and is told the rest on the
+ * call's channel (`webrtc.js`). A client that comes back does so on
+ * the kind of line it was on, which is what its session waits for.
  *
  * @module
  */
 
 import * as protocol from "./protocol.js";
+import { Refused } from "./protocol.js";
+import { Call, FORMAT, Unreached, callsOf, dial } from "./webrtc.js";
+
+export { Refused };
 
 /**
  * @typedef {import("./protocol.js").FromServer} FromServer
@@ -91,25 +98,22 @@ import * as protocol from "./protocol.js";
  *   back where the welcome names no time. 30 s if left out.
  * @property {number} [welcomeWithinMs] How long a hello may go
  *   unanswered. 10 s if left out.
+ * @property {"websocket" | "webrtc"} [over] What the client is on its
+ *   session over: a WebSocket if left out, or a call over WebRTC, which
+ *   carries its audio by itself (`audio` is of no account then).
+ * @property {MediaStreamTrack} [microphone] What a call sends: the
+ *   track of a microphone. A call without one hears and sends nothing.
+ * @property {number} [callWithinMs] How long a call may take to be
+ *   there, from its offer on. 5 s if left out.
  * @property {typeof WebSocket} [WebSocket] What connections are made
  *   with, where it is not the one the platform has.
+ * @property {typeof RTCPeerConnection} [RTCPeerConnection] What calls
+ *   are made with, where it is not the one the platform has.
+ * @property {typeof fetch} [fetch] What offers are posted with, where
+ *   it is not the one the platform has.
  * @property {() => number} [random] A number from 0 up to 1, for the
  *   spread of the waits between tries.
  */
-
-/** A hello that the server turned away. */
-export class Refused extends Error {
-  /**
-   * @param {ErrorCode} code
-   * @param {string} message
-   */
-  constructor(code, message) {
-    super(message);
-    this.name = "Refused";
-    /** Why, as the protocol names it. */
-    this.code = code;
-  }
-}
 
 /** How long the client waits before each try to come back, in order. */
 const WAITS = [0, 250, 500, 1000, 2000];
@@ -156,7 +160,7 @@ export class Client {
   /** @type {typeof WebSocket} */
   #WebSocket;
 
-  /** @type {WebSocket | undefined} */
+  /** What the client says and is told on. @type {WebSocket | Call | undefined} */
   #socket;
 
   /** @type {"open" | "away" | "closed"} */
@@ -188,7 +192,7 @@ export class Client {
    * @param {string} address
    * @param {Options} options
    * @param {Welcome} welcome
-   * @param {WebSocket} socket
+   * @param {WebSocket | Call} socket
    */
   constructor(address, options, welcome, socket) {
     this.#address = address;
@@ -208,14 +212,19 @@ export class Client {
    * @param {Options} [options]
    * @returns {Promise<Client>}
    * @throws {Refused} The server turned the hello away.
+   * @throws {Unreached} A call was asked for (`over: "webrtc"`) and
+   *   could not be made. Nothing was said on it: its token is as good
+   *   as it was.
    * @throws {Error} The server could not be reached, or did not answer.
    */
   static async connect(address, options = {}) {
-    const line = lineOf(address);
+    const calls = options.over === "webrtc";
+    const line = calls ? callsOf(address) : lineOf(address);
     const { token, audio, features, resume } = options;
-    // Said here, so that what cannot be said is not tried.
-    const first = protocol.hello({ token, audio, features, resume });
-    const { socket, welcome } = await greet(line, first, options);
+    // Said here, so that what cannot be said is not tried. The audio
+    // of a call is what its offer and its answer agree on.
+    const first = protocol.hello({ token, audio: calls ? undefined : audio, features, resume });
+    const { socket, welcome } = await reach(line, first, options);
     return new Client(line, options, welcome, socket);
   }
 
@@ -249,7 +258,27 @@ export class Client {
    * @returns {AudioFormat | undefined}
    */
   get audio() {
+    if (this.#options.over === "webrtc") {
+      return FORMAT;
+    }
     return this.#welcome.audio ?? this.#options.audio;
+  }
+
+  /** What the client is on its session over. */
+  get over() {
+    return this.#options.over ?? "websocket";
+  }
+
+  /**
+   * The call the client is on, which carries its audio. Nothing for a
+   * client on a WebSocket, and for one whose call dropped until it is
+   * back on another.
+   *
+   * @returns {Call | undefined}
+   */
+  get call() {
+    const socket = this.#socket;
+    return socket instanceof Call ? socket : undefined;
   }
 
   /**
@@ -324,8 +353,19 @@ export class Client {
   }
 
   /**
+   * Says what a call has played, as its browser can say it
+   * (`protocol.playedRtp`). The voice of a call does.
+   *
+   * @param {Parameters<typeof protocol.playedRtp>[0]} played
+   */
+  playedRtp(played) {
+    this.#say(protocol.playedRtp(played), false);
+  }
+
+  /**
    * Sends audio, as the hello said it is written. Audio for a line that
-   * is away is not kept.
+   * is away is not kept, and a call takes none: it carries what its
+   * microphone hears by itself.
    *
    * @param {ArrayBuffer | ArrayBufferView} audio
    */
@@ -342,6 +382,11 @@ export class Client {
     }
     if (this.#status === "open") {
       this.#write(protocol.bye());
+      // A goodbye on a call can be lost with the call: it is said
+      // where the call was offered too.
+      if (this.#socket instanceof Call) {
+        this.#socket.hangUp();
+      }
     }
     this.#close("ended");
   }
@@ -407,12 +452,12 @@ export class Client {
   /**
    * Takes a connection that was welcomed.
    *
-   * @param {WebSocket} socket
+   * @param {WebSocket | Call} socket
    */
   #attach(socket) {
     this.#socket = socket;
     this.#status = "open";
-    socket.onmessage = (event) => {
+    socket.onmessage = (/** @type {{ data: unknown }} */ event) => {
       if (socket === this.#socket) {
         this.#heard(event.data);
       }
@@ -554,8 +599,9 @@ export class Client {
     const { audio, features } = this.#options;
     const resume = { token, life: this.#welcome.life, seen: this.#view.seen };
     try {
-      const again = protocol.hello({ audio, features, resume });
-      const { socket, welcome } = await greet(this.#address, again, this.#options);
+      const calls = this.#options.over === "webrtc";
+      const again = protocol.hello({ audio: calls ? undefined : audio, features, resume });
+      const { socket, welcome } = await reach(this.#address, again, this.#options);
       if (this.#status !== "away") {
         // It was let go of while it came back.
         socket.close();
@@ -570,10 +616,14 @@ export class Client {
         return;
       }
       // A server that is busy is one that is stopping or starting: the
-      // next try may find the one that follows it.
-      const final = error instanceof Refused && error.code !== "busy";
-      if (final) {
+      // next try may find the one that follows it. An offer that was
+      // turned away for what it is or for who made it is turned away
+      // again.
+      if (error instanceof Refused && error.code !== "busy") {
         this.#close("refused", error);
+      } else if (error instanceof Unreached && error.final) {
+        const code = /** @type {ErrorCode} */ (error.code ?? "unknown");
+        this.#close("refused", new Refused(code, error.message));
       } else if (Date.now() >= until) {
         this.#close("gone");
       } else {
@@ -599,6 +649,27 @@ export class Client {
     this.#release();
     this.#tell("closed", error === undefined ? { reason } : { reason, error });
   }
+}
+
+/**
+ * Reaches the session where `line` says, over what `options` say, and
+ * says `first` there.
+ *
+ * @param {string} line
+ * @param {FromClient} first The hello.
+ * @param {Options} options
+ * @returns {Promise<{ socket: WebSocket | Call, welcome: Welcome }>}
+ */
+async function reach(line, first, options) {
+  if (options.over !== "webrtc") {
+    return greet(line, first, options);
+  }
+  // An offer is made with the token its hello says.
+  const bearer = first.type === "hello" ? (first.resume?.token ?? first.token) : undefined;
+  if (bearer === undefined) {
+    throw new Unreached("a call is offered with the token of its session, and there is none");
+  }
+  return dial(line, first, bearer, options);
 }
 
 /**

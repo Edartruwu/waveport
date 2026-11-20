@@ -51,6 +51,11 @@ const EARLY: usize = 32;
 /// seconds, which is a long time to talk to nobody.
 const SILENT: Duration = Duration::from_secs(5);
 
+/// The longest the output of a far end is taken to need to sound what
+/// it was given, in milliseconds. One that says it takes longer is held
+/// to this.
+const SLOWEST_OUTPUT_MS: u32 = 1_000;
+
 /// What the far end of a call is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Client {
@@ -167,6 +172,11 @@ pub(crate) struct Call {
     up: bool,
     /// When something last arrived from the far end.
     heard_at: Instant,
+    /// When the call was last given something or asked what it wants.
+    asked_at: Instant,
+    /// The place in what was sent that came out of the far end's buffer
+    /// last, and when it is heard, while that is still to come.
+    to_be_heard: Option<(u64, Instant)>,
     /// Whether `str0m` has given the far end up, until its checks
     /// succeed again.
     fell: bool,
@@ -253,6 +263,8 @@ impl Call {
             connected: false,
             up: false,
             heard_at: now,
+            asked_at: now,
+            to_be_heard: None,
             fell: false,
             told: VecDeque::new(),
             sent: Sent::default(),
@@ -325,6 +337,7 @@ impl Call {
         to: SocketAddr,
         datagram: &[u8],
     ) -> bool {
+        self.asked_at = now;
         if !self.engine.receive(now, protocol, from, to, datagram) {
             // Somebody else's: it does not make a far end that fell
             // silent one that was heard.
@@ -345,6 +358,7 @@ impl Call {
         let keys = self.media.as_ref().and_then(Media::keys_due);
         let wake = self.engine.wake(now);
         let wake = keys.map_or(wake, |keys| wake.min(keys));
+        let wake = self.to_be_heard.map_or(wake, |(_, when)| wake.min(when));
         if self.up {
             wake.min(self.heard_at + SILENT)
         } else {
@@ -362,6 +376,7 @@ impl Call {
 
     /// What the call wants next, at `now`.
     pub(crate) fn poll(&mut self, now: Instant) -> Step {
+        self.asked_at = now;
         let mut turns = 0;
         loop {
             if let Some(transmit) = self.engine.transmit() {
@@ -369,6 +384,15 @@ impl Call {
             }
             if let Some(told) = self.told.pop_front() {
                 return Step::Told(told);
+            }
+            if let Some((place, when)) = self.to_be_heard
+                && now >= when
+            {
+                // What came out of the far end's buffer has been heard
+                // by now, whether or not the far end says more.
+                self.to_be_heard = None;
+                self.hears(place);
+                continue;
             }
             if self.engine.is_over() {
                 if self.said_over {
@@ -565,14 +589,26 @@ impl Call {
         let Some(place) = place else {
             return;
         };
-        // What came out of the buffer is heard this much later.
+        // What came out of the buffer is heard this much later: so
+        // much less is heard now, and all of it when that time has
+        // passed. It is not left to the far end to say so then. One
+        // that has played a response to its end has nothing new to
+        // say, and its response would stay short of its end by what
+        // its output holds.
+        let delay_ms = delay_ms.min(SLOWEST_OUTPUT_MS);
         let unheard = u64::from(delay_ms) * u64::from(CLOCK / 1_000);
+        self.hears(place.saturating_sub(unheard));
+        let when = self.asked_at + Duration::from_millis(u64::from(delay_ms));
+        self.to_be_heard = (unheard > 0).then_some((place, when));
+    }
+
+    /// The far end has heard what was sent as far as `place`.
+    fn hears(&mut self, place: u64) {
         let told = &mut self.told;
-        self.sent
-            .played(place.saturating_sub(unheard), |tag, played| {
-                let played = MediaDur::from_ticks(played);
-                told.push_back(Told::Played { tag, played });
-            });
+        self.sent.played(place, |tag, played| {
+            let played = MediaDur::from_ticks(played);
+            told.push_back(Told::Played { tag, played });
+        });
     }
 
     /// Tells the far end that something it said was not taken.

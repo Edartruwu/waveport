@@ -7,9 +7,9 @@
  * in it that this version does not know: a field it does not know is
  * left out, and a message, a fact or a piece of news of a kind it does
  * not know is given as `unknown`, so a server can say more than this
- * client understands. The writers (`hello`, `played`, `text`, `dtmf`,
- * `interrupt`, `bye`) make what a client says, and refuse to make what
- * a server would refuse.
+ * client understands. The writers (`hello`, `played`, `playedRtp`,
+ * `text`, `dtmf`, `interrupt`, `bye`) make what a client says, and
+ * refuse to make what a server would refuse.
  *
  * A `View` is what the facts a client was sent add up to.
  *
@@ -148,11 +148,26 @@ export const KEYS = "0123456789*#ABCD";
  *
  * @typedef {{ type: "hello", v: number, token?: string, audio?: AudioFormat, features?: string[], resume?: Resume }
  *   | { type: "played", run: number, samples: number }
+ *   | { type: "played_rtp", ts?: number, emitted?: number, concealed?: number, delay_ms: number }
  *   | { type: "text", text: string }
  *   | { type: "dtmf", keys: string }
  *   | { type: "interrupt" }
  *   | { type: "bye" }} FromClient
  */
+
+/** A hello that the server turned away. */
+export class Refused extends Error {
+  /**
+   * @param {ErrorCode} code
+   * @param {string} message
+   */
+  constructor(code, message) {
+    super(message);
+    this.name = "Refused";
+    /** Why, as the protocol names it. */
+    this.code = code;
+  }
+}
 
 /** A message that does not say what a message of its kind says. */
 export class Malformed extends Error {
@@ -543,6 +558,50 @@ export function played(run, samples) {
     }
   }
   return { type: "played", run, samples };
+}
+
+/**
+ * What a call over WebRTC has played, as its browser can say it: where
+ * in the server's stream the audio is that was played last (`ts`), or
+ * how much audio has come out of its buffer since the call began
+ * (`emitted`, of which `concealed` was made up), and how long what
+ * came out takes to be heard.
+ *
+ * @param {object} of
+ * @param {number} [of.ts]
+ * @param {number} [of.emitted]
+ * @param {number} [of.concealed]
+ * @param {number} [of.delay_ms]
+ * @returns {FromClient}
+ * @throws {RangeError} It says neither where nor how much, or says
+ *   either with what is no whole number.
+ */
+export function playedRtp({ ts, emitted, concealed, delay_ms = 0 }) {
+  if (ts === undefined && emitted === undefined) {
+    throw new RangeError("what was played is a place in the stream, or how much came out");
+  }
+  /** @type {FromClient} */
+  const message = { type: "played_rtp", delay_ms };
+  for (const count of [ts, delay_ms]) {
+    if (count !== undefined && (!Number.isInteger(count) || count < 0 || count > 0xffff_ffff)) {
+      throw new RangeError("a place in a stream and a delay have whole numbers");
+    }
+  }
+  for (const count of [emitted, concealed]) {
+    if (count !== undefined && (!Number.isSafeInteger(count) || count < 0)) {
+      throw new RangeError("what came out is counted in whole numbers");
+    }
+  }
+  if (ts !== undefined) {
+    message.ts = ts;
+  }
+  if (emitted !== undefined) {
+    message.emitted = emitted;
+    if (concealed !== undefined) {
+      message.concealed = concealed;
+    }
+  }
+  return message;
 }
 
 /**
